@@ -106,7 +106,10 @@ class PGCFMSequenceDataset(kai_utils.ClimateNetCDFDataset):
         file_idx, t = self._locate_sample(idx)
         with nc.Dataset(self.files_paths[file_idx], "r") as ds:
             seq = np.array(ds["fields"][t:t + self.horizon + 1], dtype=np.float32)
-            doy = np.array(ds["time"][t:t + self.horizon + 1], dtype=np.int64)
+            time = ds["time"]
+            dates = nc.num2date(time[t:t + self.horizon + 1], units=time.units,
+                                calendar=getattr(time, "calendar", "standard"))
+            doy = np.array([d.timetuple().tm_yday - 1 for d in dates], dtype=np.int64)
 
         seq = kai_utils._apply_normalization(
             seq,

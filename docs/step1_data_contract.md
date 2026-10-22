@@ -6,17 +6,17 @@
 
 | 파일 | 내용 |
 | --- | --- |
-| `third_party/kai/` | KAI-Atmos 원본 코드 (commit `b1fb02d6`, BSD-3 라이선스 유지, 수정 없음) |
+| `third_party/kai/` | KAI-Atmos 원본 코드 (commit `b1fb02d6`, BSD-3 라이선스 유지; `inference.py` lead 버그 1건 수정, `UPSTREAM.md` 참고) |
 | `pgcfm/contract.py` | 67채널 순서, 단위, KAI 정규화 통계, 1.5° 격자, 동적 66 / 정적 1(orog) 분리, 지하 기압면 mask, 물리 상수 |
 | `pgcfm/data.py` | KAI `ClimateNetCDFDataset`을 상속한 `PGCFMSequenceDataset` (K-step 시퀀스, 달력 조건, 지형 분리) |
 | `scripts/make_synthetic_era5.py` | KAI와 똑같은 NetCDF 형식의 소형 합성 자료 (파이프라인 테스트 전용) |
-| `tests/` | 계약·로더 테스트 9개 |
+| `tests/` | 계약·로더·vendored KAI 테스트 11개 |
 
 `horizon=1`일 때 `PGCFMSequenceDataset`은 KAI 로더와 같은 샘플을 같은 순서로 돌려준다 (`test_horizon1_matches_kai_loader`에서 텐서 단위로 일치 확인).
 
 ## 테스트 결과
 
-합성 자료(2개 연도 × 6일, 25×48 격자)와 KAI 원격자(121×240, 2일)로 실행. 9개 모두 통과.
+합성 자료(2개 연도 × 6일, 25×48 격자)와 KAI 원격자(121×240, 2일)로 실행. 11개 모두 통과.
 
 - 정규화 왕복: `std + 1e-8`로 되돌리면 상대오차 1e-12 이하로 정확히 복원된다.
 - 연도 경계: K=4 시퀀스에서 12/31 → 1/1을 넘는 샘플이 없고, 각 시퀀스의 day-of-year가 1씩 증가한다.
@@ -44,6 +44,8 @@
 
 ### D. 계산 및 I/O
 11. KAI 로더는 샘플마다 NetCDF 파일을 열고 닫는다. 학습 자료는 약 91 GB(32년 × 2.84 GB)이고, K-step 시퀀스는 샘플당 읽기량이 K+1배다. ODE 적분이 들어가는 결합 학습 전에 zarr/memmap 캐시를 고려해야 한다.
+
+12. **KAI 원본 `inference.py`의 lead 어긋남**: 원본은 `lead_time=1`에 2일 예측을 저장하고 1일 예측을 빠뜨렸다(모든 lead가 라벨보다 하루 앞선다). 이 PR에서 고쳤다. `evaluator.py`는 올바르므로 보고된 RMSE/ACC는 영향이 없지만, 원본 코드로 이미 만든 `forecast.nc` 파일은 lead가 하루씩 밀려 있다.
 
 ## 다음 단계로 넘길 결정
 - 극점 처리 방식(제외, 면적 가중, tangent chart) — 3단계 착수 전에 정한다.

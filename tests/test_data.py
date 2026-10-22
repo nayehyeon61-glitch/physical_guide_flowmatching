@@ -71,3 +71,21 @@ def test_full_kai_grid(tmp_path):
     assert s["x0"].shape == (66, contract.N_LAT, contract.N_LON)
     assert s["x0"].dtype == torch.float32
     assert torch.isfinite(s["x0"]).all()
+
+
+def test_doy_decoded_from_time_units(tmp_path):
+    """Absolute or sub-daily time origins must still give 0-based day-of-year."""
+    import netCDF4 as nc
+
+    make_synthetic(["--out", str(tmp_path), "--years", "2012", "--days", "3",
+                    "--n-lat", "25", "--n-lon", "48"])
+    path = tmp_path / "2012.nc"
+    with nc.Dataset(path, "a") as ds:
+        base = nc.date2num(nc.num2date(0, "days since 2012-03-01"), "hours since 1900-01-01")
+        ds["time"].units = "hours since 1900-01-01"
+        ds["time"][:] = base + 24 * np.arange(3)
+    stats = tmp_path / "stats"
+    cfg = kai_data_config(str(stats / "global_mean.npy"), str(stats / "global_std.npy"))
+    ds = PGCFMSequenceDataset(cfg, str(tmp_path), horizon=2)
+    # 2012 is a leap year: 1 March is day 60 (0-based).
+    assert ds[0]["doy"].tolist() == [60, 61, 62]

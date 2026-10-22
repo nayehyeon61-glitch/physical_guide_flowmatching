@@ -240,16 +240,12 @@ class AutoregressiveInference:
                     pred = first                           # Day 0 = initial condition
                     future_pred = self.model(first)        # first forecast
                 else:
+                    pred = future_pred                     # Day i forecast
                     future_pred = self.model(future_pred)  # autoregressive
-                    pred = future_pred
 
                 # De-normalize and store
                 denorm = pred * stds + means
                 forecasts.append(denorm.squeeze(0).cpu().numpy())  # [C, H, W]
-
-                # After step 0, advance to model output
-                if i == 0:
-                    pred = future_pred
 
         return np.stack(forecasts, axis=0)  # [prediction_length, C, H, W]
 
