@@ -1,0 +1,28 @@
+{
+  "figures": [
+    "figures/fig1_scores_vs_lead.png",
+    "figures/fig2_scorecard_crps_vs_persistence.png",
+    "figures/fig3_scorecard_rmse_vs_climatology.png",
+    "figures/fig4_rank_histograms.png",
+    "figures/fig5_z500_spectra.png",
+    "figures/fig6_physical_consistency.png",
+    "figures/fig7_maps.png"
+  ],
+  "models": [
+    "perfect",
+    "zero-noise",
+    "underdispersive",
+    "quasi-static",
+    "unbalanced",
+    "blurry"
+  ],
+  "n_init": 3,
+  "leads": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ]
+}
