@@ -5,3 +5,7 @@ xarray
 tqdm
 ruamel.yaml
 pytest
+scipy
+pandas
+fsspec
+matplotlib
