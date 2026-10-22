@@ -29,6 +29,7 @@ is the normalized gradient flow of the frozen PINN loss, dy/ds = -eta g/|g|.
 It shows what "project onto the physics manifold" does with no data term.
 """
 
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -145,7 +146,7 @@ def train_pinn(model, loader, val_batches: Sequence[Dict[str, torch.Tensor]], ma
                device="cpu", log=print) -> List[Dict[str, float]]:
     """Bridge h_psi + closure C_chi on observed pairs (``PGCFM.pretrain_loss``) until the
     held-out physics loss improves by less than ``tol`` (relative) for ``patience``
-    consecutive windows; then the guide is frozen. ``model`` is a ``coupling.PGCFM``.
+    consecutive windows; then the best held-out guide is restored and frozen. ``model`` is a ``coupling.PGCFM``.
     Returns the per-window history."""
     from .train import _allreduce_grads, _cycle, _to
     g = model.guide
@@ -164,6 +165,7 @@ def train_pinn(model, loader, val_batches: Sequence[Dict[str, torch.Tensor]], ma
         return float(np.mean(v))
 
     hist, best, bad, it = [], held_out(), 0, 0
+    best_state = copy.deepcopy(g.state_dict())
     hist.append({"it": 0, "val_phys": best})
     log(f"  [pinn] it      0 val_phys {best:.4g}")
     batches = _cycle(loader)
@@ -184,9 +186,11 @@ def train_pinn(model, loader, val_batches: Sequence[Dict[str, torch.Tensor]], ma
         hist.append({"it": it, "train_phys": float(np.mean(tr)), "val_phys": v, "rel_improvement": rel})
         log(f"  [pinn] it {it:6d} train_phys {np.mean(tr):.4g} val_phys {v:.4g} rel {rel:+.3f}")
         bad = bad + 1 if rel < tol else 0
-        best = min(best, v)
+        if v < best:
+            best, best_state = v, copy.deepcopy(g.state_dict())
         if bad >= patience:
             break
+    g.load_state_dict(best_state)  # freeze the best held-out guide, not the last window's
     freeze(g)
     return hist
 
@@ -241,6 +245,20 @@ def sequence_terms(proj: ODEProjection, guide: PhysicsGuide, batch, horizon: int
     return terms, logs
 
 
+def _rank_mean(grads, params):
+    """Average a gradient list over DDP ranks (None -> zeros so every rank joins)."""
+    from .train import _ddp
+    if not _ddp():
+        return grads
+    ws = torch.distributed.get_world_size()
+    out = []
+    for g, p in zip(grads, params):
+        g = torch.zeros_like(p) if g is None else g.clone()
+        torch.distributed.all_reduce(g)
+        out.append(g / ws)
+    return out
+
+
 def curriculum_horizon(pcfg: ProjectionConfig, it: int, iters: int) -> int:
     stages = list(pcfg.curriculum)
     return stages[min(len(stages) - 1, it * len(stages) // max(1, iters))]
@@ -266,6 +284,8 @@ def train_projection(proj: ODEProjection, guide: PhysicsGuide, loader, iters: in
         if "phys" in terms:
             g_c = torch.autograd.grad(terms["crps"], params, retain_graph=True, allow_unused=True)
             g_p = torch.autograd.grad(terms["phys"], params, allow_unused=True)
+            # average each gradient over ranks BEFORE the cap, so the cap holds globally
+            g_c, g_p = _rank_mean(g_c, params), _rank_mean(g_p, params)
             n_c, n_p = norm(g_c), norm(g_p)
             c = 1.0
             if proj.pcfg.grad_ratio > 0:
@@ -276,7 +296,7 @@ def train_projection(proj: ODEProjection, guide: PhysicsGuide, loader, iters: in
             logs.update(grad_crps=n_c.item(), grad_phys=n_p.item(), phys_scale=c)
         else:
             terms["crps"].backward()
-        _allreduce_grads(params)
+            _allreduce_grads(params)
         torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
         sched.step()
