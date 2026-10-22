@@ -7,6 +7,9 @@ built on the KAI-α ERA5 data contract (1.5°, 121×240, 67 channels).
 | --- | --- |
 | `pgcfm/contract.py` | Channel order, units, normalization stats, grid, below-ground mask, constants |
 | `pgcfm/data.py` | K-step sequence dataset on top of the KAI loader (dynamic/static split, day-of-year) |
+| `pgcfm/cfm.py` | Step 2: one-step conditional flow matching on torchcfm, Heun sampler, member-wise rollout |
+| `pgcfm/metrics.py` | Area-weighted CRPS, RMSE, spread, spread–skill |
+| `scripts/run_step2_cfm.py` | Step 2 synthetic experiment (tisr generated vs forcing, oracle ensemble) |
 | `third_party/kai/` | Vendored KAI-Atmos code (BSD-3) |
 | `scripts/make_synthetic_era5.py` | Small synthetic files in the KAI NetCDF layout, for tests only |
 | `docs/` | Per-step implementation notes and weakness analysis |

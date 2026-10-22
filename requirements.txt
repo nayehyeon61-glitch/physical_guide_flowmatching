@@ -1,5 +1,6 @@
 numpy
 torch
+torchcfm==1.0.7
 netCDF4
 xarray
 tqdm

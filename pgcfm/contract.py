@@ -47,7 +47,7 @@ UNITS: Dict[str, str] = {
     "v": "m s-1",
     "t2m": "K",
     "sp": "Pa",
-    "tisr": "J m-2",  # daily accumulated
+    "tisr": "J m-2",  # 1 h accumulation, mean of 00/06/12/18 UTC (not a 24 h integral)
     "tcwv": "kg m-2",
     "orog": "m2 s-2",  # surface geopotential
     "msl": "Pa",
