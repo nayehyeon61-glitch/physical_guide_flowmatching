@@ -12,6 +12,7 @@ Protocol on the balanced synthetic data of step 4 (same grid, same CFM recipe):
       proj_smooth  projection ODE, rollout CRPS + lambda x Laplacian control (no physics)
       proj_k1      proj_crps with horizon 1 only (what the sequence loss adds)
       gradflow     no training: normalized gradient flow of the frozen PINN loss
+      gradflow_smooth  same flow on the Laplacian energy (non-physical control)
 Scores (``run_step4_pgcfm.evaluate``) on held-out 2020 starts, normalized units.
 
     python scripts/run_step6_projection.py --out runs/step6 [--quick]
@@ -180,8 +181,9 @@ def main(argv=None):
                 q.requires_grad_(True)
             run_phase(m, "cfm", loader, a.iters_proj, 5e-5, log_every=max(1, a.iters_proj // 5))
             model = m
-        elif name == "gradflow":
-            model = PGCFM(GradientFlowProjection(m.cfm, m.guide), m.guide)
+        elif name in ("gradflow", "gradflow_smooth"):
+            model = PGCFM(GradientFlowProjection(m.cfm, m.guide, control="smooth" if "smooth" in name else "physics"),
+                          m.guide)
         else:
             pc = ProjectionConfig(curriculum=(1,) if name == "proj_k1" else tuple(a.curriculum),
                                   cfm_steps=a.steps,

@@ -1,0 +1,81 @@
+b_j: {'mom': 0.00015274818729468532, 'T': 0.00015388742912716779, 'mass': 1.0000000000000002e-06, 'hyd': 0.1, 'q': 6.804819182418776e-08}
+  [cfm] it    120 cfm 1.88 loss 1.88 sec 38.22
+  [cfm] it    240 cfm 1.587 loss 1.587 sec 76.02
+  [cfm] it    360 cfm 1.494 loss 1.494 sec 114.9
+  [cfm] it    480 cfm 1.452 loss 1.452 sec 153.2
+  [cfm] it    600 cfm 1.412 loss 1.412 sec 193.6
+  [cfm] it    720 cfm 1.397 loss 1.397 sec 236.9
+  [cfm] it    840 cfm 1.378 loss 1.378 sec 275.4
+  [cfm] it    960 cfm 1.357 loss 1.357 sec 316.2
+  [cfm] it   1080 cfm 1.364 loss 1.364 sec 358.2
+  [cfm] it   1200 cfm 1.356 loss 1.356 sec 398.2
+  [pinn] it      0 val_phys 3.473
+  [pinn] it    100 train_phys 2.207 val_phys 1.658 rel +0.523
+  [pinn] it    200 train_phys 1.309 val_phys 1.188 rel +0.283
+  [pinn] it    300 train_phys 0.9309 val_phys 0.7968 rel +0.330
+  [pinn] it    400 train_phys 0.7684 val_phys 0.7035 rel +0.117
+  [pinn] it    500 train_phys 0.6141 val_phys 0.6805 rel +0.033
+  [pinn] it    600 train_phys 0.622 val_phys 0.5794 rel +0.149
+  [pinn] it    700 train_phys 0.4928 val_phys 0.5285 rel +0.088
+  [pinn] it    800 train_phys 0.4555 val_phys 0.4745 rel +0.102
+  [pinn] it    900 train_phys 0.4275 val_phys 0.4101 rel +0.136
+  [pinn] it   1000 train_phys 0.4107 val_phys 0.4234 rel -0.032
+  [pinn] it   1100 train_phys 0.3728 val_phys 0.3909 rel +0.047
+  [pinn] it   1200 train_phys 0.3516 val_phys 0.3932 rel -0.006
+  [pinn] it   1300 train_phys 0.3382 val_phys 0.3814 rel +0.024
+  [pinn] it   1400 train_phys 0.3686 val_phys 0.4027 rel -0.056
+  [pinn] it   1500 train_phys 0.3251 val_phys 0.4008 rel -0.051
+observed-pair residual, linear vs frozen PINN: {"linear": {"u": 0.9271886279460417, "v": 1.064252480475283, "T": 1.0146485861744963, "mass": 0.6547957382469666, "hyd": 0.002108897786563614, "q": 1.1011846662770766}, "frozen_pinn": {"u": 0.31726885171564295, "v": 0.2758716033886537, "T": 0.26653774938985075, "mass": 0.2757877845601854, "hyd": 0.2764638531633089, "q": 0.3507846408910817}}
+  [cfm] it     48 cfm 1.359 loss 1.359 sec 18.58
+  [cfm] it     96 cfm 1.346 loss 1.346 sec 37.9
+  [cfm] it    144 cfm 1.346 loss 1.346 sec 55.54
+  [cfm] it    192 cfm 1.35 loss 1.35 sec 72.41
+  [cfm] it    240 cfm 1.352 loss 1.352 sec 90.44
+[cfm] 90s 1-day {"crps": 0.4847, "rmse": 0.9613, "spread": 1.129, "tendency_ratio": 1.7865, "res_gen_u": 6.7992, "res_gen_v": 2.73, "res_gen_T": 1.2717, "res_gen_mass": 4.1457, "res_gen_hyd": 76.1412, "res_gen_q": 1.027, "ssr": 1.2457}
+  [proj] it     40 crps 0.4355 crps_d1 0.4355 horizon 1
+  [proj] it     80 crps 0.4353 crps_d1 0.4353 horizon 1
+  [proj] it    120 crps 0.4669 crps_d1 0.4308 crps_d2 0.503 horizon 2
+  [proj] it    160 crps 0.4715 crps_d1 0.4289 crps_d2 0.5141 horizon 2
+  [proj] it    200 crps 0.4945 crps_d1 0.4293 crps_d2 0.5071 crps_d3 0.547 horizon 3
+  [proj] it    240 crps 0.4912 crps_d1 0.4287 crps_d2 0.5011 crps_d3 0.5439 horizon 3
+[proj_crps] 1704s 1-day {"crps": 0.4643, "rmse": 0.9209, "spread": 1.1075, "tendency_ratio": 1.7076, "res_gen_u": 6.7891, "res_gen_v": 2.7203, "res_gen_T": 1.2953, "res_gen_mass": 4.1635, "res_gen_hyd": 76.144, "res_gen_q": 1.1194, "ssr": 1.2755}
+[proj_crps] compression {"spread_raw": 1.1265, "spread_proj": 1.107, "rmse_raw": 0.9626, "rmse_proj": 0.9242, "displacement": 0.1895, "mean_shift": 0.1684}
+  [proj] it     40 crps 0.4353 crps_d1 0.4353 phys 5810 grad_crps 0.08423 grad_phys 276.4 phys_scale 0.0001563 horizon 1
+  [proj] it     80 crps 0.4349 crps_d1 0.4349 phys 4799 grad_crps 0.1005 grad_phys 548.1 phys_scale 9.307e-05 horizon 1
+  [proj] it    120 crps 0.4677 crps_d1 0.4315 crps_d2 0.5039 phys 5331 grad_crps 0.1406 grad_phys 854.5 phys_scale 8.452e-05 horizon 2
+  [proj] it    160 crps 0.4727 crps_d1 0.4297 crps_d2 0.5156 phys 4454 grad_crps 0.1566 grad_phys 706.6 phys_scale 0.0001129 horizon 2
+  [proj] it    200 crps 0.4957 crps_d1 0.4303 crps_d2 0.5082 crps_d3 0.5485 phys 4781 grad_crps 0.2036 grad_phys 652.1 phys_scale 0.0001593 horizon 3
+  [proj] it    240 crps 0.4927 crps_d1 0.4293 crps_d2 0.5032 crps_d3 0.5456 phys 4679 grad_crps 0.2084 grad_phys 572.2 phys_scale 0.0001852 horizon 3
+[proj_phys_gr] 2840s 1-day {"crps": 0.4668, "rmse": 0.9259, "spread": 1.1093, "tendency_ratio": 1.7166, "res_gen_u": 6.67, "res_gen_v": 2.6966, "res_gen_T": 1.2936, "res_gen_mass": 4.1615, "res_gen_hyd": 51.274, "res_gen_q": 1.1205, "ssr": 1.2708}
+[proj_phys_gr] compression {"spread_raw": 1.1265, "spread_proj": 1.1084, "rmse_raw": 0.9626, "rmse_proj": 0.9296, "displacement": 0.1829, "mean_shift": 0.1413}
+[gradflow] 0s 1-day {"crps": 0.4816, "rmse": 0.9567, "spread": 1.0791, "tendency_ratio": 1.7196, "res_gen_u": 4.7867, "res_gen_v": 2.2957, "res_gen_T": 1.2833, "res_gen_mass": 4.0496, "res_gen_hyd": 34.2446, "res_gen_q": 1.059, "ssr": 1.1964}
+[gradflow] compression {"spread_raw": 1.1265, "spread_proj": 1.077, "rmse_raw": 0.9626, "rmse_proj": 0.9554, "displacement": 0.2563, "mean_shift": 0.0909}
+
+lead: RMSE / spread / CRPS / SSR / det(eps=0) RMSE / member amp   (truth amp, persistence)
+ d1: truth amp 1.211  persistence 0.753
+   cfm           0.979 / 1.137 / 0.486 / 1.23 / 0.927 / 1.432
+   proj_crps     0.946 / 1.112 / 0.469 / 1.25 / 0.884 / 1.414
+   proj_phys_gr  0.952 / 1.114 / 0.472 / 1.24 / 0.893 / 1.417
+   gradflow      0.976 / 1.084 / 0.484 / 1.18 / 0.932 / 1.390
+ d3: truth amp 1.202  persistence 1.232
+   cfm           1.250 / 1.275 / 0.623 / 1.08 / 1.380 / 1.448
+   proj_crps     1.237 / 1.239 / 0.619 / 1.06 / 1.345 / 1.412
+   proj_phys_gr  1.241 / 1.250 / 0.620 / 1.07 / 1.350 / 1.426
+   gradflow      1.245 / 1.236 / 0.624 / 1.05 / 1.374 / 1.420
+ d5: truth amp 1.117  persistence 1.320
+   cfm           1.247 / 1.326 / 0.622 / 1.13 / 1.437 / 1.445
+   proj_crps     1.219 / 1.290 / 0.610 / 1.12 / 1.374 / 1.411
+   proj_phys_gr  1.224 / 1.301 / 0.612 / 1.13 / 1.379 / 1.425
+   gradflow      1.235 / 1.294 / 0.618 / 1.11 / 1.425 / 1.424
+ d10: truth amp 1.098  persistence 1.548
+   cfm           1.267 / 1.360 / 0.635 / 1.14 / 1.542 / 1.435
+   proj_crps     1.236 / 1.319 / 0.619 / 1.13 / 1.499 / 1.397
+   proj_phys_gr  1.242 / 1.329 / 0.623 / 1.13 / 1.505 / 1.408
+   gradflow      1.251 / 1.326 / 0.627 / 1.12 / 1.524 / 1.415
+
+independent residual of member transitions (normalized by b_j), lead 1 / last
+   truth         u 0.91/0.82  v 1.05/0.80  T 1.01/0.86  mass 0.76/0.68  hyd 0.00/0.00  q 1.10/0.97
+   cfm           u 6.86/9.81  v 2.74/3.91  T 1.26/1.56  mass 4.20/5.97  hyd 68.46/90.78  q 0.99/0.96
+   proj_crps     u 6.85/9.78  v 2.72/3.88  T 1.27/1.51  mass 4.19/5.96  hyd 68.58/91.01  q 1.04/0.93
+   proj_phys_gr  u 6.74/9.65  v 2.70/3.85  T 1.27/1.52  mass 4.19/5.96  hyd 50.58/72.46  q 1.04/0.94
+   gradflow      u 4.83/6.80  v 2.30/3.26  T 1.26/1.51  mass 4.10/5.79  hyd 28.71/32.85  q 0.99/0.93

@@ -102,15 +102,17 @@ class GradientFlowProjection(nn.Module):
 
     Each Euler step moves the generated channels by ``eta / steps`` (normalized
     units, RMS), in the direction that lowers the residual the frozen bridge and
-    closure see. ``doy`` of x_k is taken as doy_next - 1 (the residual needs
+    closure see (``control="smooth"``: the same flow on the grid Laplacian
+    energy, no physics). ``doy`` of x_k is taken as doy_next - 1 (the residual needs
     the calendar of x_k; only the closure uses it).
     """
 
-    def __init__(self, cfm: CFMTransition, guide: PhysicsGuide, eta: float = 0.5, steps: int = 8):
+    def __init__(self, cfm: CFMTransition, guide: PhysicsGuide, eta: float = 0.5, steps: int = 8,
+                 control: str = "physics"):
         super().__init__()
         self.cfm, self.guide = freeze(cfm), freeze(guide)
         self.cfg, self.gen_idx, self.w_area = cfm.cfg, cfm.gen_idx, cfm.w_area
-        self.eta, self.steps = eta, steps
+        self.eta, self.steps, self.control = eta, steps, control
 
     def project(self, x, y, static, doy_next, tisr_next=None):
         doy0 = (doy_next - 1) % 366
@@ -121,8 +123,12 @@ class GradientFlowProjection(nn.Module):
             with torch.enable_grad():
                 z = z.detach().requires_grad_(True)
                 yy = self.cfm._assemble(x, z, tisr_next)
-                R, _ = self.guide.residuals(x, yy, static, doy0)
-                g, = torch.autograd.grad(self.guide.loss(R, m), z)
+                if self.control == "smooth":  # non-physical control: same flow on ||lap y||^2
+                    L = (laplacian(yy) ** 2).mean()
+                else:
+                    R, _ = self.guide.residuals(x, yy, static, doy0)
+                    L = self.guide.loss(R, m)
+                g, = torch.autograd.grad(L, z)
             g = g / g.pow(2).mean(dim=(1, 2, 3), keepdim=True).sqrt().clamp_min(1e-20)
             z = z - h * g
         return self.cfm._assemble(x, z.detach(), tisr_next)
