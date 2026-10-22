@@ -67,11 +67,26 @@ def daily_climatology(obs: xr.Dataset, window_size: int = 61, years: Optional[sl
 
 
 def climatology_from_kai_dir(data_dir: str, years: Sequence[int], out_path: str, window_size: int = 61) -> str:
+    """Same result as ``daily_climatology`` over ``years``, holding one year in memory at a time.
+
+    32 years x 67 channels at 121x240 is ~90 GB, so the day-of-year sums and counts
+    are accumulated per file and only the 366-day mean is smoothed (WB2 rolling window).
+    """
     paths = [os.path.join(data_dir, f"{y}.nc") for y in years]
     missing = [p for p in paths if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(missing)
-    clim = daily_climatology(kai_years_to_dataset(paths), window_size)
+    total = count = None
+    for p in paths:
+        grouped = kai_years_to_dataset([p]).groupby("time.dayofyear")
+        s, n = grouped.sum(), grouped.count()
+        if total is None:
+            total, count = s, n
+        else:
+            total = sum(xr.align(total, s, join="outer", fill_value=0.0))
+            count = sum(xr.align(count, n, join="outer", fill_value=0))
+    mean = total / count
+    clim = _wb2_utils().smooth_dayofyear_variable_with_rolling_window(mean, window_size)
     clim.to_netcdf(out_path)
     return out_path
 

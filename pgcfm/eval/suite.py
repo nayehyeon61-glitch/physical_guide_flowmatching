@@ -51,6 +51,7 @@ def run_suite(
     maps = None
     truth_phys = truth_ds
     hydro["truth"] = physics.hydrostatic_residual(truth_phys).mean(LEAD)
+    truth_sp = truth_ds["surface_pressure"]
     geo["truth"] = physics.geostrophic_balance(truth_phys).mean(LEAD)
     spec["truth"] = physics.zonal_spectrum(truth_h["z500"].isel({LEAD: -1}))
 
@@ -77,7 +78,7 @@ def run_suite(
         smallscale[name] = physics.spectral_ratio(fh["z500"], truth_h["z500"])
         tr = physics.tendency_amplitude_ratio(fc[TEND_VARS], truth_ds[TEND_VARS], ic_full[TEND_VARS])
         tend[name] = tr.to_array().mean("variable")
-        hydro[name] = physics.hydrostatic_residual(fc).mean(LEAD)
+        hydro[name] = physics.hydrostatic_residual(fc, truth_sp).mean(LEAD)
         geo[name] = physics.geostrophic_balance(fc).mean(LEAD)
         drift[name] = physics.budget_drift(fc, truth_ds)["mean_sp_Pa"]
         del fc, fh

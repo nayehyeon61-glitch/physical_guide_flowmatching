@@ -78,7 +78,7 @@ def test_spectral_ratio_detects_blur(world):
     assert float(physics.spectral_ratio(b, truth).mean()) < 0.5
 
 
-def _write_forecast(path, x, ic_index, member):
+def _write_forecast(path, x, ic_index, member, channel=None):
     with nc.Dataset(path, "w") as d:
         d.createDimension("initial_condition", x.shape[0])
         d.createDimension("lead_time", x.shape[1])
@@ -90,7 +90,7 @@ def _write_forecast(path, x, ic_index, member):
             d.createDimension(n, s)
         d.createVariable("initial_condition", "i4", ("initial_condition",))[:] = ic_index
         d.createVariable("lead_time", "i4", ("lead_time",))[:] = np.arange(x.shape[1])
-        d.createVariable("channel", "i4", ("channel",))[:] = np.arange(x.shape[-3])
+        d.createVariable("channel", "i4", ("channel",))[:] = np.arange(x.shape[-3]) if channel is None else channel
         d.createVariable("forecast", "f4", tuple(dims) + ("channel", "lat", "lon"))[:] = x
 
 
@@ -107,13 +107,41 @@ def test_cli_on_kai_format_files(tmp_path):
     ens = pers[:, :, None] + 0.1 * contract.REFERENCE_STD[:, None, None] * rng.standard_normal((2, 4, 3) + f.shape[1:])
     _write_forecast(tmp_path / "det.nc", pers, ic, False)
     _write_forecast(tmp_path / "ens.nc", ens.astype(np.float32), ic, True)
+    perm = np.random.default_rng(1).permutation(contract.N_CHANNELS)  # KAI out_channels in another order
+    _write_forecast(tmp_path / "shuffled.nc", pers[:, :, perm], ic, False, channel=perm)
     out = str(tmp_path / "eval")
     evaluate(["score", "--data-dir", data, "--year", "2020", "--forecast", f"det={tmp_path / 'det.nc'}",
-              "--forecast", f"ens={tmp_path / 'ens.nc'}", "--climatology", clim, "--out", out])
+              "--forecast", f"ens={tmp_path / 'ens.nc'}", "--forecast", f"shuffled={tmp_path / 'shuffled.nc'}", "--climatology", clim, "--out", out])
     df = pd.read_csv(os.path.join(out, "scores.csv"))
     # A forecast that equals persistence must score exactly like the persistence baseline.
     a = df[(df.model == "det") & (df.metric == "rmse")].value.values
     b = df[(df.model == "persistence") & (df.metric == "rmse")].value.values
     assert np.allclose(a, b)
+    c = df[(df.model == "shuffled") & (df.metric == "rmse")].value.values
+    assert np.allclose(a, c)
     assert {"acc", "crps", "ssr", "rmsb"} <= set(df.metric)
     assert len(os.listdir(os.path.join(out, "figures"))) >= 6
+
+
+def test_streamed_climatology_matches_wb2_on_all_years(tmp_path):
+    from pgcfm.eval import baselines
+
+    data = str(tmp_path / "era5")
+    make_synthetic(["--out", data, "--years", "2018", "2019", "--days", "5"])
+    out = str(tmp_path / "clim.nc")
+    baselines.climatology_from_kai_dir(data, [2018, 2019], out, window_size=3)
+    paths = [os.path.join(data, f"{y}.nc") for y in (2018, 2019)]
+    ref = baselines.daily_climatology(baselines.kai_years_to_dataset(paths), window_size=3)
+    with xr.open_dataset(out) as got:
+        xr.testing.assert_allclose(got.load(), ref, rtol=1e-5)
+
+
+def test_hydrostatic_mask_drops_below_ground_points(world):
+    truth = _full(world.truth[:, 1:], False)
+    bad = world.truth[:, 1:].copy()
+    bad[:, :, contract.CHANNEL_INDEX["z1000"]] += 1e4  # only the 925-1000 layer is wrong
+    ds = _full(bad, False)
+    everywhere_low_sp = truth["surface_pressure"] * 0 + 95000.0  # 1000 hPa below ground everywhere
+    r = physics.hydrostatic_residual(ds, everywhere_low_sp)
+    assert bool(np.isnan(r.sel(layer=925)).all())  # no valid point: not counted as balanced
+    assert float(r.sel(layer=850).max()) < 1.0

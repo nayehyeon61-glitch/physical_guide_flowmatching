@@ -57,9 +57,11 @@ def cmd_score(a):
             ic_ref = f["ic_index"]
         elif not np.array_equal(ic_ref, f["ic_index"]):
             raise ValueError(f"{name}: initial conditions differ from the first forecast")
-        if len(f["channel"]) != contract.N_CHANNELS:
-            raise ValueError(f"{name}: needs all 67 channels, got {len(f['channel'])}")
-        x = f["forecast"][: a.max_ic]
+        ch = np.asarray(f["channel"])
+        if sorted(ch.tolist()) != list(range(contract.N_CHANNELS)):
+            raise ValueError(f"{name}: needs each of the 67 contract channels once, got {ch.tolist()}")
+        # KAI allows any out_channels order; put channels back in contract order.
+        x = np.take(f["forecast"][: a.max_ic], np.argsort(ch), axis=-3)
         forecasts[name] = x[:, 1:]  # drop lead 0 (= IC)
     ic_index = ic_ref[: a.max_ic]
     n_lead = next(iter(forecasts.values())).shape[1]

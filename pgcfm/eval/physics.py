@@ -5,6 +5,8 @@ Geostrophic winds and zonal spectra use WeatherBench2's ``derived_variables``.
 Inputs are full WB2 datasets (``wb2.to_dataset``) with a ``level`` dim.
 """
 
+from typing import Optional
+
 import numpy as np
 import xarray as xr
 
@@ -18,8 +20,8 @@ def _members_mean(da: xr.DataArray) -> xr.DataArray:
     return da.mean(REALIZATION) if REALIZATION in da.dims else da
 
 
-def _wmean(ds, region=None):
-    return metrics._spatial_average(ds, region=region, skipna=False)
+def _wmean(ds, region=None, skipna=False):
+    return metrics._spatial_average(ds, region=region, skipna=skipna)
 
 
 # ----------------------------------------------------------------------
@@ -49,12 +51,14 @@ def tendency_amplitude_ratio(forecast: xr.Dataset, truth: xr.Dataset, initial: x
 # ----------------------------------------------------------------------
 # Hydrostatic balance (primitive equation 4 in NeuralGCM / PG-CFM eq. 8)
 # ----------------------------------------------------------------------
-def hydrostatic_residual(ds: xr.Dataset) -> xr.DataArray:
+def hydrostatic_residual(ds: xr.Dataset, surface_pressure: Optional[xr.DataArray] = None) -> xr.DataArray:
     """Area-weighted RMS of the discrete hypsometric residual per layer [m2 s-2].
 
     r_i = (Φ_i - Φ_{i+1}) - R_d * (Tv_i + Tv_{i+1})/2 * ln(p_{i+1}/p_i),
-    Tv = T (1 + 0.608 q). Layers whose lower level lies below the surface (p > sp)
-    are masked. Returns dims (..., layer) where layer = upper level in hPa.
+    Tv = T (1 + 0.608 q). Points whose lower level lies below the surface (p > sp)
+    are left out of the mean (numerator and area weights). Pass the truth's
+    ``surface_pressure`` so every model is averaged over the same mask;
+    otherwise ``ds``'s own sp is used. Returns dims (..., layer), layer = upper level in hPa.
     """
     z, T, q = ds["geopotential"], ds["temperature"], ds["specific_humidity"]
     Tv = T * (1 + 0.608 * q)
@@ -65,10 +69,11 @@ def hydrostatic_residual(ds: xr.Dataset) -> xr.DataArray:
     tv = 0.5 * (sel(Tv, up) + sel(Tv, lo))
     log_ratio = xr.DataArray(np.log(lo / up), dims="layer", coords={"layer": up})
     r = dz - C.r_dry * tv * log_ratio
-    if "surface_pressure" in ds:
+    sp = surface_pressure if surface_pressure is not None else ds.get("surface_pressure")
+    if sp is not None:
         p_lo = xr.DataArray(lo * 100.0, dims="layer", coords={"layer": up})
-        r = r.where(p_lo <= ds["surface_pressure"], 0.0)
-    rms = np.sqrt(_wmean(xr.Dataset({"r": r ** 2}))["r"].mean("init_time"))
+        r = r.where(p_lo <= sp)
+    rms = np.sqrt(_wmean(xr.Dataset({"r": r ** 2}), skipna=True)["r"].mean("init_time"))
     return rms.mean(REALIZATION) if REALIZATION in rms.dims else rms
 
 
