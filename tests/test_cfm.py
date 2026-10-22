@@ -101,3 +101,21 @@ def test_scores_on_known_ensembles():
     assert metrics.crps(obs.expand(5, 1, 30, 40).clone(), obs).abs().max() < 1e-7
     c = metrics.crps(torch.randn(200, 1, 30, 40), obs)
     assert abs(c.item() - 0.2337) < 0.02
+
+
+def test_velocity_is_equivariant_to_longitude_roll():
+    """No dateline seam: rolling all inputs in longitude rolls the output."""
+    torch.manual_seed(0)
+    m = CFMTransition(CFMConfig(**SMALL), 24, 48).eval()
+    with torch.no_grad():  # torchcfm zero-initializes output convs; make the map non-trivial
+        for p in m.parameters():
+            p.normal_(0.0, 0.1)
+    x, y, s, d = batch(h=24, w=48)
+    cond = m.condition(x, s, d)
+    tau = torch.tensor([0.3, 0.7])
+    with torch.no_grad():
+        v = m.net(tau, y, cond)
+        v_roll = m.net(tau, y.roll(16, -1), cond.roll(16, -1))
+    # A shift by a multiple of the total downsampling (2) keeps the pooling grid aligned.
+    assert v.abs().mean() > 1e-2
+    assert torch.allclose(v.roll(16, -1), v_roll, atol=1e-4 * v.abs().max().item())

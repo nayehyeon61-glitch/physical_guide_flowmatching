@@ -52,6 +52,31 @@ def area_weights(n_lat: int, device=None) -> torch.Tensor:
     return (w / w.mean())[:, None]
 
 
+def _sphere_pad_hook(module: nn.Conv2d, args):
+    """Pad longitude periodically and latitude by replication before the conv."""
+    (x,) = args
+    ph, pw = module._sphere_pad
+    if pw:
+        x = F.pad(x, (pw, pw, 0, 0), mode="circular")
+    if ph:
+        x = F.pad(x, (0, 0, ph, ph), mode="replicate")
+    return (x,)
+
+
+def make_lon_periodic(net: nn.Module) -> nn.Module:
+    """Replace the zero padding of every Conv2d by circular-in-longitude padding.
+
+    torchcfm's U-Net zero-pads, which would make 0 and 358.5 deg image edges
+    (a dateline seam). Only the padding changes; weights and shapes do not.
+    """
+    for m in net.modules():
+        if isinstance(m, nn.Conv2d) and any(p > 0 for p in m.padding):
+            m._sphere_pad = tuple(m.padding)
+            m.padding = (0, 0)
+            m.register_forward_pre_hook(_sphere_pad_hook)
+    return net
+
+
 class VelocityNet(nn.Module):
     """v_theta(z_tau, tau | x_k, c_k) on the lat-lon grid.
 
@@ -79,6 +104,7 @@ class VelocityNet(nn.Module):
             dropout=cfg.dropout,
             channel_mult=cfg.channel_mult,
         )
+        make_lon_periodic(self.unet)
 
     def forward(self, tau: torch.Tensor, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         H, W = z.shape[-2:]
