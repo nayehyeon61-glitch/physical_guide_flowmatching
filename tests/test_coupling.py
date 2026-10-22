@@ -79,6 +79,12 @@ def test_mask_is_fixed_by_observed_pair():
     assert not torch.equal(m0, m.guide.mask(x, y_low_sp, b["static"]))
 
 
+def test_odd_simpson_count_is_rejected():
+    m, b = _model(n_sub=3), _batch()
+    with pytest.raises(ValueError):
+        m.guide.residuals(b["x0"], b["targets"][:, 0], b["static"], b["doy"][:, 0])
+
+
 def test_scales_are_floored():
     """A constraint the data satisfy exactly must not get b_j -> 0."""
     m, b = _model(), _batch()
@@ -112,4 +118,8 @@ def test_train_and_infer_scripts(tmp_path):
         np.testing.assert_allclose(v[0, 2, 1, o], src["fields"][0, o], rtol=1e-4, atol=1e-2)
     with nc.Dataset(f"{d}/fc_det.nc") as f:
         assert f["forecast"].shape == (2, 3, 67, H, W)
+    # the step 5 reader accepts both files (integer channel ids 0..66)
+    from pgcfm.eval.wb2 import from_kai_forecast_nc
+    for path in (f"{d}/fc.nc", f"{d}/fc_det.nc"):
+        assert sorted(np.asarray(from_kai_forecast_nc(path)["channel"]).tolist()) == list(range(67))
     assert os.path.exists(f"{d}/run/log.jsonl")

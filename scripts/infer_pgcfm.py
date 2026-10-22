@@ -43,9 +43,10 @@ def open_out(path, n_ic, K, M, H, W, lat, lon, ics):
     lt = ds.createVariable("lead_time", "i8", ("lead_time",))
     lt.units = "days"
     lt[:] = np.arange(K + 1)
-    ch = ds.createVariable("channel", str, ("channel",))
-    for i, n in enumerate(contract.CHANNEL_NAMES):
-        ch[i] = n
+    # integer channel ids as in KAI src/inference.py (scripts/evaluate.py requires 0..66)
+    ch = ds.createVariable("channel", "i4", ("channel",))
+    ch[:] = np.arange(contract.N_CHANNELS)
+    ch.names = " ".join(contract.CHANNEL_NAMES)
     ds.createVariable("lat", "f8", ("lat",))[:] = lat
     ds.createVariable("lon", "f8", ("lon",))[:] = lon
     return ds, v

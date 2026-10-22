@@ -213,6 +213,8 @@ class PhysicsGuide(nn.Module):
         linear bridge (step 3's independent diagnostic).
         """
         cfg, g = self.cfg, self.grid(x.device)
+        if cfg.n_sub < 2 or cfg.n_sub % 2:
+            raise ValueError("Simpson rule needs an even n_sub >= 2")
         F0, F1 = self.to_si(x, static), self.to_si(y, static)
         C = self.closures(x, static, doy) if use_closure else None
         keys = ("u", "v", "T", "Phi", "q")
