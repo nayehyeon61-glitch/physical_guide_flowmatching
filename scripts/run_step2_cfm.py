@@ -168,8 +168,17 @@ def main(argv=None):
         print(f"[{mode}] training", flush=True)
         torch.manual_seed(0)
         model = CFMTransition(CFMConfig(tisr_mode=mode), a.n_lat, a.n_lon)
-        hist, secs = train(model, train_ds, a.iters, a.batch, a.lr, seed=0,
-                           log_every=max(1, a.iters // 10))
+        ckpt = os.path.join(a.out, f"cfm_{mode}.pt")
+        if os.path.exists(ckpt):  # resume an interrupted run without retraining
+            saved = torch.load(ckpt)
+            model.load_state_dict(saved["model"])
+            model.eval()
+            hist, secs = saved["hist"], saved["secs"]
+        else:
+            hist, secs = train(model, train_ds, a.iters, a.batch, a.lr, seed=0,
+                               log_every=max(1, a.iters // 10))
+            torch.save({"model": model.state_dict(), "hist": hist, "secs": secs}, ckpt)
+        print(f"[{mode}] rollout", flush=True)
         t0 = time.time()
         tisr = obs[:, :, TISR_DYN:TISR_DYN + 1] if mode == "forcing" else None
         ens = rollout(model, batch["x0"], batch["static"], batch["doy"], a.members, tisr=tisr, steps=a.steps)

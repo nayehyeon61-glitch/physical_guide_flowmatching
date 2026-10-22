@@ -9,6 +9,7 @@ built on the KAI-α ERA5 data contract (1.5°, 121×240, 67 channels).
 | `pgcfm/data.py` | K-step sequence dataset on top of the KAI loader (dynamic/static split, day-of-year) |
 | `pgcfm/cfm.py` | Step 2: CFM transition on torchcfm (path, U-Net, Heun, member-wise rollout) |
 | `pgcfm/physics/` | Step 3: primitive-equation residuals (4 constraint groups), grid diagnostics, PyTorch port of Raissi's PINN |
+| `pgcfm/metrics.py` | Area-weighted CRPS, RMSE, spread, spread–skill |
 | `pgcfm/coupling.py` | Step 4: PG-CFM coupling (bridge B_psi eq. 9, closure, joint loss eq. 12, L_phys -> y_hat -> theta) |
 | `pgcfm/train.py` | Step 4: appendix C training phases (cfm -> guide -> joint) and 1-day validation |
 | `pgcfm/eval/` | Step 5: NeuralGCM / WeatherBench2 evaluation: scores, physical consistency, baselines, figures |
