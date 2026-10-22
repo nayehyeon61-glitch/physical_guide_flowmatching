@@ -78,7 +78,9 @@ dynamics를 학습했다는 증거가 아닙니다. 같은 run의 coverage80 = 0
   10–50%만 재현하며, t2m(일변화가 큰 변수)이 가장 약합니다.
 - validation RMSE는 **1.048로 persistence(0.981)·climatology(1.015)보다 나쁩니다.** coverage80 0.49, spread/skill 0.72.
 - 합성 smoke에서도 recurrent(0.714)가 persistence(0.690)를 못 넘었고, 같은 weights의 **drift-only(0.689)가 recurrent보다
-  RMSE가 낮았습니다.** 학습된 residual FM 성분이 평균 정확도에 기여하지 못하고 noise처럼 작동했다는 뜻입니다.
+  RMSE가 낮았습니다.** 반면 CRPS는 recurrent(0.499)가 drift-only(0.525)보다 낮았습니다. 즉 residual FM은 분포 폭은
+  더했지만 평균 정확도(변화량의 방향과 크기)에는 기여하지 못했습니다. 확률 예측은 RMSE가 아니라 CRPS로 비교해야 하므로,
+  이 결과만으로 residual 성분이 무의미하다고 결론 내리지는 않습니다.
 
 ## 3. 취약점 진단
 
@@ -135,7 +137,7 @@ x̂_{k+1} = x_k + μ_Δ + σ_Δ ⊙ z_1
 | persistence skill | `1 − RMSE_model / RMSE_persistence` (lead별) | 1일차부터 > 0 |
 | tendency 상관 | lead별 `corr(x̂_{k+1} − x̂_k, x_{k+1} − x_k)` | > 0 이고 lead에 따라 완만하게 감소 |
 | spread/skill, coverage80 | 기존과 동일 | spread/skill ≈ 1, coverage ≈ 0.8 |
-| drift-only/zero-noise ablation | ε = 0 단일 경로, 그리고 tendency = 0(persistence) | 생성 경로가 둘 다보다 CRPS·RMSE 우수 |
+| 결정론 기준 비교 | persistence(tendency = 0), matched deterministic 모델, 참고용 ε = 0 단일 경로 | ensemble CRPS가 결정론 기준의 CRPS(=MAE)보다 낮음. RMSE 비교는 **ensemble-mean**으로만 하고, 개별 member RMSE가 결정론 경로보다 높은 것은 실패로 보지 않음 |
 
 state RMSE만으로 "기준선보다 좋다"고 판단하지 않습니다(취약점 5).
 
