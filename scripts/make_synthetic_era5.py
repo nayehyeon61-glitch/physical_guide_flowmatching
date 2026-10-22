@@ -35,14 +35,24 @@ def smooth_noise(rng, shape, n_lat, n_lon, n_modes=6):
     return out / np.sqrt(n_modes / 4.0)
 
 
-def daily_toa_insolation(doy, lat_deg):
-    """Daily accumulated TOA insolation [J m-2] (circular orbit approximation)."""
+def daily_toa_insolation(doy, lat_deg, lon_deg):
+    """KAI daily-mean tisr [J m-2], shape (lat, lon) (circular orbit approximation).
+
+    ERA5 tisr is a 1-hour accumulation; KAI's daily value is the mean of the
+    00/06/12/18 UTC fields (KAI stats: mean 1.07e6, i.e. ~300 W m-2 x 3600 s).
+    So it is NOT the 24 h integral and it depends on longitude: four samples
+    alias the diurnal cycle. Each hourly accumulation is approximated by the
+    flux at the middle of its hour.
+    """
     decl = np.deg2rad(23.44) * np.sin(2 * np.pi * (doy + 284) / 365.0)
-    phi = np.deg2rad(lat_deg)
-    cos_h0 = np.clip(-np.tan(phi) * np.tan(decl), -1.0, 1.0)
-    h0 = np.arccos(cos_h0)
-    q = (SOLAR_CONSTANT / np.pi) * (h0 * np.sin(phi) * np.sin(decl) + np.cos(phi) * np.cos(decl) * np.sin(h0))
-    return q * 86400.0
+    phi = np.deg2rad(np.asarray(lat_deg))[:, None]
+    lon = np.asarray(lon_deg)[None, :]
+    acc = 0.0
+    for utc in (0.0, 6.0, 12.0, 18.0):
+        hour_angle = np.deg2rad(15.0 * (utc - 0.5 + lon / 15.0 - 12.0))
+        cos_z = np.sin(phi) * np.sin(decl) + np.cos(phi) * np.cos(decl) * np.cos(hour_angle)
+        acc = acc + SOLAR_CONSTANT * np.clip(cos_z, 0.0, None) * 3600.0
+    return acc / 4.0
 
 
 def make_year(path, year, n_days, n_lat, n_lon, seed):
@@ -71,7 +81,7 @@ def make_year(path, year, n_days, n_lat, n_lon, seed):
         sp = 101325.0 * np.exp(-orog / (contract.CONST.r_dry * 255.0))
         f[idx["sp"]] = sp + 0.1 * std[idx["sp"]] * anom[idx["sp"]]
         f[idx["orog"]] = orog
-        f[idx["tisr"]] = daily_toa_insolation(d, lat)[:, None]
+        f[idx["tisr"]] = daily_toa_insolation(d, lat, lon)
         fields[d] = f
 
     with nc.Dataset(path, "w") as ds:
