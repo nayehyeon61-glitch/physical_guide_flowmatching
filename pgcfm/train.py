@@ -18,9 +18,41 @@ from .coupling import PGCFM
 
 
 def _cycle(loader) -> Iterable:
+    epoch = 0
     while True:
+        if hasattr(getattr(loader, "sampler", None), "set_epoch"):
+            loader.sampler.set_epoch(epoch)  # DistributedSampler reshuffle
         for b in loader:
             yield b
+        epoch += 1
+
+
+def _ddp() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def is_main() -> bool:
+    return not _ddp() or torch.distributed.get_rank() == 0
+
+
+def broadcast_module(module: torch.nn.Module) -> None:
+    """Rank 0's parameters and buffers to every rank (multi-GPU start / resume)."""
+    if _ddp():
+        for t in list(module.parameters()) + list(module.buffers()):
+            torch.distributed.broadcast(t.data, 0)
+
+
+def _allreduce_grads(params) -> None:
+    """Average gradients over ranks. Used instead of DDP's wrapper because the
+    phases call different methods (cfm.loss, pretrain_loss, joint_loss), not
+    forward(); same arithmetic as DDP, one all-reduce per parameter."""
+    if not _ddp():
+        return
+    ws = torch.distributed.get_world_size()
+    for p in params:
+        if p.grad is not None:
+            torch.distributed.all_reduce(p.grad)
+            p.grad.div_(ws)
 
 
 def _to(batch: Dict[str, torch.Tensor], device) -> Dict[str, torch.Tensor]:
@@ -53,9 +85,16 @@ def run_phase(model: PGCFM, phase: str, loader, iters: int, lr: float, device="c
         elif phase == "guide":
             loss, logs = model.pretrain_loss(b)
         else:
-            loss, logs = model.joint_loss(b, start_iter + it)
+            loss, logs = None, None
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        if phase == "joint" and model.guide.cfg.grad_ratio > 0:
+            loss, logs = balanced_backward(model, b, start_iter + it, params, model.guide.cfg.grad_ratio)
+        elif phase == "joint":
+            loss, logs = model.joint_loss(b, start_iter + it)
+            loss.backward()
+        else:
+            loss.backward()
+        _allreduce_grads(params)
         torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
         sched.step()
@@ -64,11 +103,43 @@ def run_phase(model: PGCFM, phase: str, loader, iters: int, lr: float, device="c
         if (it + 1) % log_every == 0 or it + 1 == iters:
             avg = {k: float(np.mean([h[k] for h in hist[-log_every:] if k in h])) for k in logs}
             avg["sec"] = time.time() - t0
-            print(f"  [{phase}] it {it + 1:6d} " + " ".join(f"{k} {v:.4g}" for k, v in avg.items()), flush=True)
-            if on_log is not None:
+            if is_main():
+                print(f"  [{phase}] it {it + 1:6d} " + " ".join(f"{k} {v:.4g}" for k, v in avg.items()), flush=True)
+            if on_log is not None and is_main():
                 on_log(it + 1, avg)
     model.eval()
     return hist
+
+
+def balanced_backward(model: PGCFM, batch, it: int, params, ratio: float):
+    """Backward of eq. (12) with the physics gradient on theta capped at ``ratio``
+    times the CFM gradient norm (step 4 weakness: with global clipping, once
+    L_phys >> L_CFM the update direction is L_phys alone and lambda_P stops
+    mattering). The bridge psi only receives the physics gradient, uncapped.
+    """
+    terms, logs = model.joint_terms(batch, it)
+    theta = [p for p in model.cfm.parameters() if p.requires_grad]
+    tid = {id(p) for p in theta}
+    g_cfm = torch.autograd.grad(terms["cfm"], theta, retain_graph=True, allow_unused=True)
+    rest = sum(v for k, v in terms.items() if k != "cfm")
+    if not torch.is_tensor(rest):
+        for p, g in zip(theta, g_cfm):
+            p.grad = g
+        return terms["cfm"], logs
+    g_rest = torch.autograd.grad(rest, params, allow_unused=True)
+    norm = lambda gs: torch.sqrt(sum((g.float() ** 2).sum() for g in gs if g is not None))  # noqa: E731
+    n_cfm = norm(g_cfm)
+    n_phys = norm([g for p, g in zip(params, g_rest) if id(p) in tid])
+    c = torch.clamp(ratio * n_cfm / (n_phys + 1e-12), max=1.0)
+    logs.update(grad_cfm=n_cfm.item(), grad_phys=n_phys.item(), phys_scale=c.item())
+    gc = {id(p): g for p, g in zip(theta, g_cfm)}
+    for p, g in zip(params, g_rest):
+        if id(p) in tid:
+            a = gc.get(id(p))
+            g = (c * g if g is not None else None)
+            g = a if g is None else (g if a is None else a + g)
+        p.grad = g
+    return sum(terms.values()), logs
 
 
 def take(loader, n: int) -> List[Dict[str, torch.Tensor]]:

@@ -12,7 +12,7 @@ writes the same files and then rebuilds, for every day,
   * u, v as the geostrophic wind of that z, with f replaced by
     sign(phi) * max(|f|, f(15 deg)) so the equatorial band stays finite.
 
-So the true pairs have a small hydrostatic residual (discretization only)
+So the true pairs have a zero hydrostatic residual (up to round-off)
 and a momentum residual dominated by the AR(1) tendency, advection and the
 equatorial f clamp. T, q and the surface fields keep the AR(1) dynamics.
 It is still NOT a dynamical model: the momentum and T equations are not

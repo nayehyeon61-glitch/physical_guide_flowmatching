@@ -30,3 +30,10 @@ scale_batches: 50          # observed pairs used for b_j
 val_batches: 10
 val_members: 4
 val_every: 2000
+
+# b_j of eq. (10). null = RMS of observed-pair residuals (scale_batches), floored at
+# scale_floor_frac x the synoptic default. To fix them from
+# scripts/step3_era5_residual_stats.py, e.g. scales: {mom: 1.0e-4, T: 5.0e-5, mass: 1.0e-6, hyd: 0.5, q: 1.0e-8}
+scales: null
+scale_floor_frac: 0.1
+grad_ratio: 0.0            # > 0 caps the physics gradient on theta at grad_ratio x the CFM gradient (docs/step4)

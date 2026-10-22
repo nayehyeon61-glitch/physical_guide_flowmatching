@@ -23,7 +23,7 @@ built on the KAI-α ERA5 data contract (1.5°, 121×240, 67 channels).
 | `scripts/make_synthetic_era5.py`, `scripts/make_balanced_era5.py` | Synthetic files in the KAI NetCDF layout (tests / toy experiments) |
 | `scripts/run_step2_cfm.py`, `scripts/step3_residual_experiment.py`, `scripts/run_step4_pgcfm.py`, `scripts/eval_synthetic_demo.py` | Per-step small experiments (docs/) |
 | `docs/RUN_ON_GPU.md` | How to train and evaluate on the GPU server |
-| `docs/` | Per-step implementation notes and weakness analysis |
+| `docs/` | Per-step implementation notes and weakness analysis (`docs/step4_pgcfm.md`: coupling results) |
 
 ```bash
 pip install -r requirements.txt

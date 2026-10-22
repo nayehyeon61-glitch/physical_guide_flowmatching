@@ -59,6 +59,7 @@ class PhysicsConfig:
         "u": 1.0, "v": 1.0, "T": 1.0, "mass": 1.0, "hyd": 1.0, "q": 0.0})  # q > 0: + moisture
     n_sub: int = 4  # Simpson intervals in eq. (18)
     sample_steps: int = 2  # Heun steps of the differentiable endpoint (NFE = 2x)
+    grad_ratio: float = 0.0  # > 0: cap ||grad_theta phys|| at grad_ratio x ||grad_theta cfm|| (step 4 fix)
     pole_cap_deg: float = 85.0  # residual rows poleward are dropped (docs/step3, E5)
     lat_weight: str = "area"
     virtual: bool = True  # T_v = T (1 + 0.608 q)
@@ -322,13 +323,18 @@ class PGCFM(nn.Module):
 
     # -- appendix C, step 4: eq. (12) ---------------------------------------
     def joint_loss(self, batch, it: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        terms, logs = self.joint_terms(batch, it)
+        return sum(terms.values()), logs
+
+    def joint_terms(self, batch, it: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+        """The weighted terms of eq. (12): {"cfm", "phys" (lambda_P L_phys + lambda_H reg), "es"}."""
         cfg = self.guide.cfg
         x, y, st = batch["x0"], batch["targets"][:, 0], batch["static"]
         doy0, doy1 = batch["doy"][:, 0], batch["doy"][:, 1]
         l_cfm = self.cfm.loss(x, y, st, doy1)
         lam = cfg.lambda_p * min(1.0, (it + 1) / max(1, cfg.ramp_iters))
         logs = {"cfm": l_cfm.item(), "lambda_p": lam}
-        loss = l_cfm
+        terms = {"cfm": l_cfm}
         if lam > 0 or cfg.lambda_s > 0:
             # Fresh noise, differentiable endpoint: L_phys -> B_psi -> y_hat -> theta.
             n_mem = 2 if cfg.lambda_s > 0 else 1
@@ -341,13 +347,13 @@ class PGCFM(nn.Module):
                 R, reg = self.guide.residuals(xs, y_hat, sts, doy0.repeat(n_mem))
                 m = self.guide.mask(x, y, st).repeat(n_mem, 1, 1, 1)
                 l_phys = self.guide.loss(R, m)
-                loss = loss + lam * l_phys + cfg.lambda_h * reg
+                terms["phys"] = lam * l_phys + cfg.lambda_h * reg
                 logs.update(phys=l_phys.item(), reg=reg.item())
             if cfg.lambda_s > 0:
                 es = energy_score(y_hat.view(n_mem, *x.shape), y, self.cfm.w_area)
-                loss = loss + cfg.lambda_s * es
+                terms["es"] = cfg.lambda_s * es
                 logs["es"] = es.item()
-        return loss, logs
+        return terms, logs
 
 
 def energy_score(ens: torch.Tensor, obs: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -373,3 +379,36 @@ def deterministic_rollout(model: CFMTransition, x0, static, doy, tisr=None, step
         x = model.sample(x, static, doy[:, k + 1], f, steps=steps, eps=eps)
         out.append(x)
     return torch.stack(out, dim=1)
+
+
+class HydrostaticProjection(nn.Module):
+    """Hard hydrostatic constraint: T on pressure levels diagnosed from the generated z.
+
+    T = -(d Phi / d ln p) / (R_d (1 + 0.608 q)), with the same centred d/d ln p
+    as the residual, so R_hyd = 0 by construction instead of by penalty
+    (step 4 proposal, docs/step4_pgcfm.md W4). Differentiable; wraps a
+    ``CFMTransition`` and keeps its sampling interface.
+    """
+
+    def __init__(self, cfm: CFMTransition, guide: PhysicsGuide):
+        super().__init__()
+        self.cfm, self.guide = cfm, guide
+        self.cfg, self.gen_idx, self.w_area = cfm.cfg, cfm.gen_idx, cfm.w_area
+
+    def project(self, dyn: torch.Tensor, static: torch.Tensor) -> torch.Tensor:
+        g = self.guide
+        F = g.to_si(dyn, static)
+        grid = g.grid(dyn.device)
+        dphi_dlnp = grid.d_p(F["Phi"]) * grid.p3()
+        T = -dphi_dlnp / (contract.CONST.r_dry * (1.0 + 0.608 * F["q"]))
+        idx = [contract.DYNAMIC_CHANNELS.index(c) for c in range(*contract.level_slice("t").indices(contract.N_CHANNELS))]
+        full_idx = [contract.DYNAMIC_CHANNELS[i] for i in idx]
+        t_norm = ((T - g.mean[full_idx]) / g.std[full_idx]).to(dyn.dtype)
+        out = dyn.clone()
+        out[:, idx] = t_norm
+        return out
+
+    def sample(self, x, static, doy_next, tisr_next=None, steps=8, generator=None, grad=False, eps=None):
+        y = self.cfm.sample(x, static, doy_next, tisr_next, steps=steps, generator=generator, grad=grad, eps=eps)
+        with torch.set_grad_enabled(grad):
+            return self.project(y, static)

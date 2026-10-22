@@ -10,6 +10,9 @@ cluster that is train 1980-2011, valid 2012 (configs/pgcfm_era5.yaml).
     # CFM-only baseline with the same backbone and the same theta updates
     python scripts/train_pgcfm.py --config configs/pgcfm_era5.yaml --out runs/cfm --phases cfm cfm_more
 
+    # multi-GPU (one node, 4 GPUs); ``batch`` is per GPU
+    torchrun --standalone --nproc_per_node 4 scripts/train_pgcfm.py --config configs/pgcfm_era5.yaml --out runs/pgcfm
+
 Each phase writes ``<out>/<phase>.pt``; ``--resume`` restarts after the
 last finished phase. ``cfm_more`` is the CFM-only continuation that matches
 the joint phase in iterations.
@@ -28,7 +31,7 @@ from pgcfm.cfm import CFMConfig, CFMTransition  # noqa: E402
 from pgcfm.coupling import PGCFM, PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
 from pgcfm.data import PGCFMSequenceDataset, kai_data_config  # noqa: E402
 from pgcfm.physics.primitive import ResidualScales  # noqa: E402
-from pgcfm.train import run_phase, take, validate_one_step  # noqa: E402
+from pgcfm.train import broadcast_module, is_main, run_phase, take, validate_one_step  # noqa: E402
 
 DEFAULTS = dict(
     train_dir=None, valid_dir=None, stats_dir=None,
@@ -37,9 +40,11 @@ DEFAULTS = dict(
     lr={"cfm": 2e-4, "guide": 1e-3, "joint": 5e-5, "cfm_more": 5e-5},
     batch=8, workers=8, device="cuda" if torch.cuda.is_available() else "cpu",
     tisr_mode="target", model_channels=64, channel_mult=[1, 2, 2, 4], num_res_blocks=2,
-    lambda_p=0.1, ramp_iters=5000, lambda_h=1e-2, lambda_s=0.0, sample_steps=2, n_sub=4,
+    lambda_p=0.1, ramp_iters=5000, lambda_h=1e-2, lambda_s=0.0, sample_steps=2, n_sub=4, grad_ratio=0.0,
     gamma={"u": 1.0, "v": 1.0, "T": 1.0, "mass": 1.0, "hyd": 1.0, "q": 0.0},
     pole_cap_deg=85.0, scale_batches=50, val_batches=10, val_members=4, val_every=2000,
+    scales=None,  # {mom, T, mass, hyd, q} in SI to fix b_j (e.g. from step3_era5_residual_stats); None = estimate
+    scale_floor_frac=0.1,
     seed=0,
 )
 
@@ -64,7 +69,8 @@ def build(cfg, n_lat, n_lon, mean, std, scales=None):
                                   num_res_blocks=cfg["num_res_blocks"]), n_lat, n_lon)
     pcfg = PhysicsConfig(lambda_p=cfg["lambda_p"], ramp_iters=cfg["ramp_iters"], lambda_h=cfg["lambda_h"],
                          lambda_s=cfg["lambda_s"], gamma=dict(cfg["gamma"]), n_sub=cfg["n_sub"],
-                         sample_steps=cfg["sample_steps"], pole_cap_deg=cfg["pole_cap_deg"])
+                         sample_steps=cfg["sample_steps"], pole_cap_deg=cfg["pole_cap_deg"],
+                         grad_ratio=cfg.get("grad_ratio", 0.0))
     guide = PhysicsGuide(n_lat, n_lon, mean, std, pcfg, scales or ResidualScales())
     return PGCFM(cfm, guide)
 
@@ -90,21 +96,35 @@ def main(argv=None):
         cfg["phases"] = a.phases
     os.makedirs(a.out, exist_ok=True)
     torch.manual_seed(cfg["seed"])
-    dev = torch.device(cfg["device"])
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > 1:  # launched by torchrun
+        local = int(os.environ["LOCAL_RANK"])
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local)
+            torch.distributed.init_process_group("nccl")
+            dev = torch.device("cuda", local)
+        else:  # CPU smoke test of the multi-GPU path
+            torch.distributed.init_process_group("gloo")
+            dev = torch.device("cpu")
+    else:
+        dev = torch.device(cfg["device"])
 
     stats = cfg["stats_dir"]
     mean_p, std_p = os.path.join(stats, "global_mean.npy"), os.path.join(stats, "global_std.npy")
     dcfg = kai_data_config(mean_p, std_p)
     train_ds = PGCFMSequenceDataset(dcfg, cfg["train_dir"], horizon=1)
     valid_ds = PGCFMSequenceDataset(dcfg, cfg["valid_dir"], horizon=1, train=False)
-    loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg["batch"], shuffle=True, drop_last=True,
+    sampler = torch.utils.data.DistributedSampler(train_ds, seed=cfg["seed"]) if world > 1 else None
+    loader = torch.utils.data.DataLoader(train_ds, batch_size=cfg["batch"], shuffle=sampler is None,
+                                         sampler=sampler, drop_last=True,
                                          num_workers=cfg["workers"], pin_memory=dev.type == "cuda",
                                          persistent_workers=cfg["workers"] > 0)
     vloader = torch.utils.data.DataLoader(valid_ds, batch_size=cfg["batch"], shuffle=False,
                                           num_workers=min(2, cfg["workers"]))
     n_lat, n_lon = train_ds.img_shape_x, train_ds.img_shape_y
     model = build(cfg, n_lat, n_lon, np.load(mean_p), np.load(std_p)).to(dev)
-    print(f"train {len(train_ds)} pairs, valid {len(valid_ds)}, grid {n_lat}x{n_lon}, "
+    log = print if is_main() else (lambda *x, **k: None)
+    log(f"train {len(train_ds)} pairs, valid {len(valid_ds)}, grid {n_lat}x{n_lon}, "
           f"theta {sum(q.numel() for q in model.cfm.parameters()):,}, "
           f"psi {sum(q.numel() for q in model.guide.parameters()):,}, device {dev}", flush=True)
 
@@ -117,8 +137,9 @@ def main(argv=None):
                 model.load_state_dict(state["model"])
                 model.guide.scales = ResidualScales(**state["scales"])
                 done = state["phases_done"]
-                print(f"resumed after {done}", flush=True)
+                log(f"resumed after {done}", flush=True)
                 break
+    broadcast_module(model)
 
     vb = take(vloader, cfg["val_batches"])
     log_path = os.path.join(a.out, "log.jsonl")
@@ -128,17 +149,26 @@ def main(argv=None):
             continue
         if ph in ("guide", "joint") and "scales" not in done:
             # b_j from observed pairs (sec. 5.1), fixed for the rest of training
-            model.guide.scales = estimate_scales(model.guide, [
-                {k: v.to(dev) for k, v in b.items()} for b in take(loader, cfg["scale_batches"])])
+            if cfg.get("scales"):
+                sc = ResidualScales(**cfg["scales"])
+            else:
+                sc = estimate_scales(model.guide, [
+                    {k: v.to(dev) for k, v in b.items()} for b in take(loader, cfg["scale_batches"])],
+                    floor_frac=cfg["scale_floor_frac"])
+            if world > 1:  # every rank uses rank 0's b_j
+                obj = [vars(sc)]
+                torch.distributed.broadcast_object_list(obj, 0)
+                sc = ResidualScales(**obj[0])
+            model.guide.scales = sc
             done.append("scales")
-            print("residual scales b_j:", vars(model.guide.scales), flush=True)
+            log("residual scales b_j:", vars(model.guide.scales), flush=True)
 
         def on_log(it, avg, ph=ph):
             rec = {"phase": ph, "it": it, **avg}
             if it % cfg["val_every"] == 0 or it == cfg["iters"][ph]:
                 rec["val"] = validate_one_step(model, vb, cfg["val_members"], device=dev)
                 model.train()
-                print("    val " + " ".join(f"{k} {v:.4g}" for k, v in rec["val"].items()), flush=True)
+                log("    val " + " ".join(f"{k} {v:.4g}" for k, v in rec["val"].items()), flush=True)
             with open(log_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
 
@@ -146,8 +176,11 @@ def main(argv=None):
         run_phase(model, base, loader, cfg["iters"][ph], cfg["lr"][ph], device=dev,
                   log_every=min(100, cfg["iters"][ph]), on_log=on_log)
         done.append(ph)
-        save(os.path.join(a.out, f"{ph}.pt"), model, cfg, done)
-    print("done:", done)
+        if is_main():
+            save(os.path.join(a.out, f"{ph}.pt"), model, cfg, done)
+    log("done:", done)
+    if world > 1:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
