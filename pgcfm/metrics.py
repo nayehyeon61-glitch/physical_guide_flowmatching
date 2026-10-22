@@ -34,5 +34,7 @@ def crps(ens: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
     """Fair ensemble CRPS, area-weighted."""
     M = ens.shape[0]
     skill = (ens - obs).abs().mean(0)
-    pair = (ens[:, None] - ens[None]).abs().sum(dim=(0, 1)) / (2 * M * (M - 1))
+    # sum_{i,j} |x_i - x_j| = 2 sum_i (2i - M + 1) x_(i) over sorted members (no M x M tensor)
+    w = (2 * torch.arange(M, device=ens.device, dtype=ens.dtype) - M + 1).view((M,) + (1,) * (ens.dim() - 1))
+    pair = (w * ens.sort(dim=0).values).sum(0) / (M * (M - 1))
     return _wmean(skill - pair)

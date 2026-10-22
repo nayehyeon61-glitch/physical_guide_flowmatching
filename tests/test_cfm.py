@@ -119,3 +119,11 @@ def test_velocity_is_equivariant_to_longitude_roll():
     # A shift by a multiple of the total downsampling (2) keeps the pooling grid aligned.
     assert v.abs().mean() > 1e-2
     assert torch.allclose(v.roll(16, -1), v_roll, atol=1e-4 * v.abs().max().item())
+
+
+def test_crps_pair_term_matches_bruteforce():
+    torch.manual_seed(0)
+    ens, obs = torch.randn(7, 3, 5, 6), torch.randn(3, 5, 6)
+    M = ens.shape[0]
+    brute = (ens - obs).abs().mean(0) - (ens[:, None] - ens[None]).abs().sum(dim=(0, 1)) / (2 * M * (M - 1))
+    assert torch.allclose(metrics.crps(ens, obs), metrics._wmean(brute), atol=1e-6)

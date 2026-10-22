@@ -169,15 +169,19 @@ def main(argv=None):
         torch.manual_seed(0)
         model = CFMTransition(CFMConfig(tisr_mode=mode), a.n_lat, a.n_lon)
         ckpt = os.path.join(a.out, f"cfm_{mode}.pt")
+        setup = {k: getattr(a, k) for k in ["n_lat", "n_lon", "train_years", "train_days", "iters", "batch", "lr"]}
         if os.path.exists(ckpt):  # resume an interrupted run without retraining
             saved = torch.load(ckpt)
+            if saved.get("setup") != setup:
+                raise RuntimeError(f"{ckpt} was trained with {saved.get('setup')}, not {setup}; "
+                                   "use a new --out or delete the checkpoint")
             model.load_state_dict(saved["model"])
             model.eval()
             hist, secs = saved["hist"], saved["secs"]
         else:
             hist, secs = train(model, train_ds, a.iters, a.batch, a.lr, seed=0,
                                log_every=max(1, a.iters // 10))
-            torch.save({"model": model.state_dict(), "hist": hist, "secs": secs}, ckpt)
+            torch.save({"model": model.state_dict(), "hist": hist, "secs": secs, "setup": setup}, ckpt)
         print(f"[{mode}] rollout", flush=True)
         t0 = time.time()
         tisr = obs[:, :, TISR_DYN:TISR_DYN + 1] if mode == "forcing" else None
