@@ -64,6 +64,12 @@ def autograd_residuals(field_fn: FieldFn, lam, phi, p, s, const: Constants = CON
     return primitive.residuals(F, coords[1], coords[2], const, closures, virtual)
 
 
+def tangent_to_uv(Vx, Vy, Vz, lam, phi):
+    """Project a Cartesian vector onto the local east / north unit vectors -> (u, v)."""
+    cl, sl, cp, sp = torch.cos(lam), torch.sin(lam), torch.cos(phi), torch.sin(phi)
+    return -sl * Vx + cl * Vy, -sp * cl * Vx - sp * sl * Vy + cp * Vz
+
+
 def sample_collocation(n: int, p_range=(5.0e3, 1.0e5), s_range=(0.0, CONST.dt_seconds),
                        pole_cap_deg: float = 89.0, generator: Optional[torch.Generator] = None,
                        dtype=torch.float64):
@@ -124,9 +130,7 @@ class PhysicsInformedNN(nn.Module):
         X = torch.stack([cp * cl, cp * sl, sp, torch.log(p), s], dim=1).to(self.dtype)
         Y = self.neural_net(X)
         out = {k: Y[:, i] for i, k in enumerate(self.OUTPUTS)}
-        # project the Cartesian vector onto the local east / north unit vectors
-        u = -sl * out["Vx"] + cl * out["Vy"]
-        v = -sp * cl * out["Vx"] - sp * sl * out["Vy"] + cp * out["Vz"]
+        u, v = tangent_to_uv(out["Vx"], out["Vy"], out["Vz"], lam, phi)
         F = {"u": u, "v": v}
         F.update({k: out[k] for k in ("T", "Phi", "omega", "q")})
         return {k: self.field_scales[k][0] + self.field_scales[k][1] * x for k, x in F.items()}
