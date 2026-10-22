@@ -1,0 +1,7 @@
+numpy
+torch
+netCDF4
+xarray
+tqdm
+ruamel.yaml
+pytest
