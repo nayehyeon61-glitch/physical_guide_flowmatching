@@ -7,7 +7,7 @@
 ```bash
 git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
 cd physical_guide_flowmatching
-git checkout claude/project-thread-bessib     # 1–5단계 PR이 모두 합쳐진 통합 브랜치
+git checkout claude/project-thread-bessib     # 1–5단계 PR이 모두 합쳐진 통합 브랜치 (6단계는 claude/project-thread-z37s9z)
 pip install -r requirements.txt               # torch는 서버 CUDA에 맞는 wheel을 먼저 설치
 python -m pytest -q                           # CPU에서 수 분, 전부 통과해야 함
 ```
@@ -95,3 +95,39 @@ python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
 5. `val res_gen_*`(생성 멤버의 독립 잔차)가 `res_obs_*`(관측 쌍)에 가까워지는지. 가장 큰 항이 무엇인지(합성에서는 hyd가 손실의 95% 이상).
 6. 평가에서 PG-CFM과 CFM 단독을 같은 초기장으로 비교: CRPS, 앙상블 평균 RMSE, spread-skill, ε=0 기준선, tendency 진폭 비, 물리 균형 진단(정역학·지균).
 7. 멤버 진폭(`lead_member_amp`에 해당하는 spread와 스펙트럼)이 진실보다 작아지지 않는지. PG-CFM이 장기 lead에서 이기는 이유가 진폭 축소(기후값으로 수렴)인지 확인해야 합니다(docs/step4 W3).
+
+## 7. 6단계: PINN 학습·동결 → CFM 결과의 ODE 사영 → 시퀀스 손실 (`docs/step6_projection.md`)
+
+3절의 CFM 단독 체크포인트(`runs/cfm/cfm.pt`)에서 시작합니다. CFM은 고정되고, PINN(bridge + closure)을 수렴할 때까지 학습해 고정한 뒤, 사영 ODE g_φ만 rollout CRPS로 학습합니다.
+
+```bash
+pip install torchdiffeq                       # requirements.txt에 추가됨
+# (a) 사영 ODE, CRPS 시퀀스 손실만 (λ_P = 0)
+torchrun --standalone --nproc_per_node 4 scripts/train_projection.py --config configs/projection_era5.yaml \
+    --cfm-ckpt runs/cfm/cfm.pt --out runs/proj_crps
+# (b) + 동결 PINN 잔차 (physics gradient ≤ 0.5 × CRPS gradient). 1단계 PINN은 (a)의 것을 재사용
+mkdir -p runs/proj_phys && cp runs/proj_crps/pinn.pt runs/proj_phys/
+torchrun --standalone --nproc_per_node 4 scripts/train_projection.py --config configs/projection_era5.yaml \
+    --cfm-ckpt runs/cfm/cfm.pt --out runs/proj_phys --resume --set lambda_p=0.1
+# (c) 비물리 평활 대조군 (같은 λ, 물리 없음)
+mkdir -p runs/proj_smooth && cp runs/proj_crps/pinn.pt runs/proj_smooth/
+torchrun --standalone --nproc_per_node 4 scripts/train_projection.py --config configs/projection_era5.yaml \
+    --cfm-ckpt runs/cfm/cfm.pt --out runs/proj_smooth --resume --set lambda_p=0.1 control=smooth
+```
+
+- 1단계 로그: `[pinn] ... val_phys ... rel` — 상대 개선이 `pinn_tol`(1%) 미만인 window가 `pinn_patience`번 이어지면 멈추고 `pinn.pt`를 씁니다. `log.jsonl`의 `stage: pinn` 줄에 기록됩니다.
+- 2단계 로그: `[proj] ... crps crps_d1 crps_d2 ... horizon` (+ `phys grad_crps grad_phys phys_scale`). curriculum `[1, 2, 3, 5]`일이 `proj_iters`를 4등분합니다.
+- 메모리: 121×240에서 5일 rollout을 CFM까지 역전파(`bptt: true`)하면 GPU당 batch 2 × 2 members가 한계일 수 있습니다. OOM이면 `--set bptt=false`(CFM 사이 gradient 끊음), `curriculum=[1,2,3]`, `cfm_steps`는 추론과 같게 유지하세요.
+
+추론과 평가는 4·5절과 같습니다 (`proj.pt`면 CFM 뒤에 사영 ODE가 자동으로 붙습니다):
+
+```bash
+python scripts/infer_pgcfm.py --ckpt runs/proj_crps/proj.pt --test-file /path/to/era-data/test/2020.nc \
+    --stats-dir /path/to/KAI-New/stats --out runs/proj_crps/forecast.nc --leads 10 --members 16 --ic-stride 7 --det
+python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
+    --forecast CFM=runs/cfm/forecast.nc --forecast "proj CRPS"=runs/proj_crps/forecast.nc \
+    --forecast "proj +PINN"=runs/proj_phys/forecast.nc --forecast "proj +smooth"=runs/proj_smooth/forecast.nc \
+    --climatology runs/clim_1980_2011.nc --out runs/eval/2020_step6
+```
+
+확인할 것: (1) 사영 후 1일 SSR이 1에 가까워지는지와 함께 멤버 진폭·스펙트럼이 진실보다 작아지지 않는지(압축이 진폭 축소로 가는지), (2) `proj +PINN`이 `proj +smooth`보다 물리 균형 진단(정역학·지균)에서 나은지, (3) 5일 이후 lead에서 curriculum 밖(5일 초과)으로도 안정한지.

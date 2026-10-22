@@ -9,6 +9,9 @@ writes the zero-noise (eps = 0) run with the same ICs and no member dim.
 
     python scripts/infer_pgcfm.py --ckpt runs/pgcfm/joint.pt --test-file /data/test/2020.nc \
         --stats-dir /data/KAI-New/stats --out runs/pgcfm/forecast.nc --leads 10 --members 16 --det
+
+A step 6 checkpoint (``train_projection.py``, ``proj.pt``) is rolled out through
+the frozen CFM followed by the projection ODE.
 """
 
 import argparse
@@ -80,6 +83,10 @@ def main(argv=None):
         doy_all = np.array([d.timetuple().tm_yday - 1 for d in dates])
         H, W = src["fields"].shape[-2:]
         model = build(state["config"], H, W, mean, std).to(dev)
+        if "projection" in state:  # step 6 checkpoint (train_projection.py): frozen CFM + projection ODE
+            from pgcfm.projection import ODEProjection
+            from scripts.train_projection import projection_config
+            model.cfm = ODEProjection(model.cfm, projection_config(state["projection"]), H, W).to(dev)
         model.load_state_dict(state["model"])
         model.eval()
         ics = a.ics if a.ics else list(range(0, T - a.leads, a.ic_stride))

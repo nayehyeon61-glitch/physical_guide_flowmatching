@@ -1,0 +1,40 @@
+# Step 6 (scripts/train_projection.py): frozen PINN -> projection ODE -> rollout loss.
+# Needs a trained CFM checkpoint from train_pgcfm.py (--phases cfm), passed as --cfm-ckpt.
+train_dir: /home/work/data/hklab-ahmed/era-data/train   # 1980-2011
+valid_dir: /home/work/data/hklab-ahmed/era-data/valid   # 2012
+stats_dir: /home/work/data/hklab-ahmed/KAI-New/stats
+
+stages: [pinn, proj]
+workers: 8
+
+# stage 1: bridge h_psi + closure on observed pairs until the held-out physics loss
+# improves by < pinn_tol (relative) for pinn_patience windows, then frozen
+pinn_max_iters: 20000
+pinn_lr: 1.0e-3
+pinn_window: 500
+pinn_tol: 0.01
+pinn_patience: 3
+pinn_batch: 8
+scales: null               # or {mom, T, mass, hyd, q} from step3_era5_residual_stats
+scale_floor_frac: 0.1
+
+# stage 3: projection ODE dy/ds = g_phi(y, s | x_k), s in [0, 1], torchdiffeq fixed grid
+proj_iters: 20000
+proj_lr: 2.0e-4
+batch: 2                   # sequences per GPU; x members -> 4 rollouts per GPU
+model_channels: 64
+channel_mult: [1, 2, 2, 4]
+num_res_blocks: 1
+ode_method: rk4
+ode_steps: 2               # NFE 8 per transition
+curriculum: [1, 2, 3, 5]   # rollout days, equal share of proj_iters (NeuralGCM: up to 5 days)
+members: 2                 # fair CRPS with 2 members (NeuralGCM stochastic)
+cfm_steps: 8               # Heun steps of the frozen CFM, same as inference
+bptt: true                 # gradient through the frozen CFM between days (memory: set false if OOM)
+lambda_p: 0.0              # > 0 adds the frozen-PINN residual of each member transition
+control: physics           # "smooth" = non-physical Laplacian control arm (same lambda_p)
+grad_ratio: 0.5            # with lambda_p > 0: physics gradient <= 0.5 x CRPS gradient
+
+val_batches: 10
+val_members: 4
+val_every: 2000
