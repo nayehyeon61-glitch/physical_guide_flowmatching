@@ -1,0 +1,76 @@
+loaded shared CFM + frozen PINN from runs/step6/base.pt
+[gradflow_smooth] 0s 1-day {"crps": 0.4672, "rmse": 0.9239, "spread": 0.8179, "tendency_ratio": 1.4364, "res_gen_u": 3.6167, "res_gen_v": 1.9071, "res_gen_T": 1.0003, "res_gen_mass": 2.1876, "res_gen_hyd": 48.5464, "res_gen_q": 0.8948, "ssr": 0.939}
+[gradflow_smooth] compression {"spread_raw": 1.1265, "spread_proj": 0.8152, "rmse_raw": 0.9626, "rmse_proj": 0.9227, "displacement": 0.5051, "mean_shift": 0.1884}
+  [proj] it     40 crps 0.4356 crps_d1 0.4356 phys 29.98 grad_crps 0.06498 grad_phys 0.331 phys_scale 1 horizon 1
+  [proj] it     80 crps 0.4381 crps_d1 0.4381 phys 25.96 grad_crps 0.05937 grad_phys 0.3353 phys_scale 1 horizon 1
+  [proj] it    120 crps 0.4714 crps_d1 0.4373 crps_d2 0.5055 phys 25.38 grad_crps 0.07842 grad_phys 0.2737 phys_scale 1 horizon 2
+  [proj] it    160 crps 0.4765 crps_d1 0.4358 crps_d2 0.5173 phys 23.33 grad_crps 0.08067 grad_phys 0.2464 phys_scale 1 horizon 2
+  [proj] it    200 crps 0.5009 crps_d1 0.4379 crps_d2 0.512 crps_d3 0.5529 phys 24.15 grad_crps 0.1045 grad_phys 0.2442 phys_scale 1 horizon 3
+  [proj] it    240 crps 0.4979 crps_d1 0.437 crps_d2 0.5071 crps_d3 0.5497 phys 23.23 grad_crps 0.1012 grad_phys 0.2334 phys_scale 1 horizon 3
+[proj_smooth] 2559s 1-day {"crps": 0.4795, "rmse": 0.9511, "spread": 1.0639, "tendency_ratio": 1.7068, "res_gen_u": 6.1926, "res_gen_v": 2.5789, "res_gen_T": 1.2083, "res_gen_mass": 3.8179, "res_gen_hyd": 71.6188, "res_gen_q": 1.0009, "ssr": 1.1864}
+[proj_smooth] compression {"spread_raw": 1.1265, "spread_proj": 1.0625, "rmse_raw": 0.9626, "rmse_proj": 0.9552, "displacement": 0.2478, "mean_shift": 0.1235}
+  [proj] it     40 crps 0.4355 crps_d1 0.4355 horizon 1
+  [proj] it     80 crps 0.4353 crps_d1 0.4353 horizon 1
+  [proj] it    120 crps 0.432 crps_d1 0.432 horizon 1
+  [proj] it    160 crps 0.4284 crps_d1 0.4284 horizon 1
+  [proj] it    200 crps 0.4302 crps_d1 0.4302 horizon 1
+  [proj] it    240 crps 0.4245 crps_d1 0.4245 horizon 1
+[proj_k1] 558s 1-day {"crps": 0.4618, "rmse": 0.9164, "spread": 1.1087, "tendency_ratio": 1.7034, "res_gen_u": 6.7729, "res_gen_v": 2.7148, "res_gen_T": 1.3011, "res_gen_mass": 4.1418, "res_gen_hyd": 76.1687, "res_gen_q": 1.1282, "ssr": 1.2833}
+[proj_k1] compression {"spread_raw": 1.1265, "spread_proj": 1.1068, "rmse_raw": 0.9626, "rmse_proj": 0.9179, "displacement": 0.1995, "mean_shift": 0.1796}
+  [proj] it     40 crps 0.4368 crps_d1 0.4368 phys 5470 grad_crps 0.07675 grad_phys 436.5 phys_scale 1 horizon 1
+  [proj] it     80 crps 0.4438 crps_d1 0.4438 phys 3334 grad_crps 0.09266 grad_phys 681.1 phys_scale 1 horizon 1
+  [proj] it    120 crps 0.4833 crps_d1 0.4501 crps_d2 0.5166 phys 3980 grad_crps 0.1785 grad_phys 923.1 phys_scale 1 horizon 2
+  [proj] it    160 crps 0.4936 crps_d1 0.4542 crps_d2 0.5329 phys 3421 grad_crps 0.2175 grad_phys 808 phys_scale 1 horizon 2
+  [proj] it    200 crps 0.5203 crps_d1 0.4595 crps_d2 0.5306 crps_d3 0.5708 phys 3640 grad_crps 0.2933 grad_phys 530.1 phys_scale 1 horizon 3
+  [proj] it    240 crps 0.5198 crps_d1 0.4601 crps_d2 0.5286 crps_d3 0.5707 phys 3505 grad_crps 0.2946 grad_phys 416.1 phys_scale 1 horizon 3
+[proj_phys] 2765s 1-day {"crps": 0.5043, "rmse": 0.9945, "spread": 1.1205, "tendency_ratio": 1.8041, "res_gen_u": 6.3012, "res_gen_v": 2.6441, "res_gen_T": 1.3017, "res_gen_mass": 4.1258, "res_gen_hyd": 43.6124, "res_gen_q": 1.0687, "ssr": 1.195}
+[proj_phys] compression {"spread_raw": 1.1265, "spread_proj": 1.1194, "rmse_raw": 0.9626, "rmse_proj": 0.9989, "displacement": 0.3413, "mean_shift": 0.2664}
+
+lead: RMSE / spread / CRPS / SSR / det(eps=0) RMSE / member amp   (truth amp, persistence)
+ d1: truth amp 1.211  persistence 0.753
+   cfm           0.979 / 1.137 / 0.486 / 1.23 / 0.927 / 1.432
+   proj_crps     0.946 / 1.112 / 0.469 / 1.25 / 0.884 / 1.414
+   proj_phys_gr  0.952 / 1.114 / 0.472 / 1.24 / 0.893 / 1.417
+   gradflow      0.976 / 1.084 / 0.484 / 1.18 / 0.932 / 1.390
+   gradflow_smooth 0.945 / 0.824 / 0.469 / 0.92 / 0.951 / 1.184
+   proj_smooth   0.978 / 1.069 / 0.485 / 1.16 / 0.943 / 1.369
+   proj_k1       0.938 / 1.112 / 0.465 / 1.26 / 0.876 / 1.421
+   proj_phys     1.019 / 1.125 / 0.508 / 1.17 / 1.010 / 1.446
+ d3: truth amp 1.202  persistence 1.232
+   cfm           1.250 / 1.275 / 0.623 / 1.08 / 1.380 / 1.448
+   proj_crps     1.237 / 1.239 / 0.619 / 1.06 / 1.345 / 1.412
+   proj_phys_gr  1.241 / 1.250 / 0.620 / 1.07 / 1.350 / 1.426
+   gradflow      1.245 / 1.236 / 0.624 / 1.05 / 1.374 / 1.420
+   gradflow_smooth 1.221 / 1.018 / 0.618 / 0.88 / 1.339 / 1.245
+   proj_smooth   1.233 / 1.214 / 0.618 / 1.04 / 1.361 / 1.385
+   proj_k1       1.242 / 1.236 / 0.621 / 1.06 / 1.350 / 1.419
+   proj_phys     1.274 / 1.259 / 0.642 / 1.05 / 1.420 / 1.451
+ d5: truth amp 1.117  persistence 1.320
+   cfm           1.247 / 1.326 / 0.622 / 1.13 / 1.437 / 1.445
+   proj_crps     1.219 / 1.290 / 0.610 / 1.12 / 1.374 / 1.411
+   proj_phys_gr  1.224 / 1.301 / 0.612 / 1.13 / 1.379 / 1.425
+   gradflow      1.235 / 1.294 / 0.618 / 1.11 / 1.425 / 1.424
+   gradflow_smooth 1.214 / 1.081 / 0.613 / 0.94 / 1.400 / 1.243
+   proj_smooth   1.224 / 1.262 / 0.613 / 1.09 / 1.411 / 1.380
+   proj_k1       1.230 / 1.286 / 0.615 / 1.11 / 1.397 / 1.418
+   proj_phys     1.266 / 1.303 / 0.638 / 1.09 / 1.476 / 1.445
+ d10: truth amp 1.098  persistence 1.548
+   cfm           1.267 / 1.360 / 0.635 / 1.14 / 1.542 / 1.435
+   proj_crps     1.236 / 1.319 / 0.619 / 1.13 / 1.499 / 1.397
+   proj_phys_gr  1.242 / 1.329 / 0.623 / 1.13 / 1.505 / 1.408
+   gradflow      1.251 / 1.326 / 0.627 / 1.12 / 1.524 / 1.415
+   gradflow_smooth 1.236 / 1.112 / 0.624 / 0.95 / 1.475 / 1.229
+   proj_smooth   1.248 / 1.283 / 0.627 / 1.09 / 1.480 / 1.372
+   proj_k1       1.253 / 1.317 / 0.628 / 1.12 / 1.533 / 1.408
+   proj_phys     1.282 / 1.325 / 0.648 / 1.10 / 1.578 / 1.434
+
+independent residual of member transitions (normalized by b_j), lead 1 / last
+   truth         u 0.91/0.82  v 1.05/0.80  T 1.01/0.86  mass 0.76/0.68  hyd 0.00/0.00  q 1.10/0.97
+   cfm           u 6.86/9.81  v 2.74/3.91  T 1.26/1.56  mass 4.20/5.97  hyd 68.46/90.78  q 0.99/0.96
+   proj_crps     u 6.85/9.78  v 2.72/3.88  T 1.27/1.51  mass 4.19/5.96  hyd 68.58/91.01  q 1.04/0.93
+   proj_phys_gr  u 6.74/9.65  v 2.70/3.85  T 1.27/1.52  mass 4.19/5.96  hyd 50.58/72.46  q 1.04/0.94
+   gradflow      u 4.83/6.80  v 2.30/3.26  T 1.26/1.51  mass 4.10/5.79  hyd 28.71/32.85  q 0.99/0.93
+   gradflow_smooth u 3.64/5.23  v 1.90/2.73  T 0.98/1.06  mass 2.22/3.09  hyd 44.07/58.96  q 0.85/0.75
+   proj_smooth   u 6.25/9.00  v 2.58/3.71  T 1.18/1.37  mass 3.85/5.49  hyd 64.03/85.29  q 0.92/0.81
+   proj_k1       u 6.85/9.79  v 2.72/3.89  T 1.27/1.51  mass 4.19/5.96  hyd 68.49/90.74  q 1.05/0.94
+   proj_phys     u 6.30/9.08  v 2.63/3.78  T 1.30/1.57  mass 4.12/5.84  hyd 43.52/65.28  q 1.13/1.11

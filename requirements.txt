@@ -10,3 +10,4 @@ scipy
 pandas
 fsspec
 matplotlib
+torchdiffeq
