@@ -59,6 +59,7 @@ class PhysicsConfig:
         "u": 1.0, "v": 1.0, "T": 1.0, "mass": 1.0, "hyd": 1.0, "q": 0.0})  # q > 0: + moisture
     n_sub: int = 4  # Simpson intervals in eq. (18)
     sample_steps: int = 2  # Heun steps of the differentiable endpoint (NFE = 2x)
+    control: str = "physics"  # "smooth": non-physical Laplacian penalty in place of L_phys (step 4 control)
     grad_ratio: float = 0.0  # > 0: cap ||grad_theta phys|| at grad_ratio x ||grad_theta cfm|| (step 4 fix)
     pole_cap_deg: float = 85.0  # residual rows poleward are dropped (docs/step3, E5)
     lat_weight: str = "area"
@@ -345,7 +346,13 @@ class PGCFM(nn.Module):
             tn = self._tisr_next(y)
             tn = tn.repeat(n_mem, 1, 1, 1) if tn is not None else None
             y_hat = self.cfm.sample(xs, sts, d1, tn, steps=cfg.sample_steps, grad=True)
-            if lam > 0:
+            if lam > 0 and cfg.control == "smooth":
+                # Control arm: same lambda, same differentiable endpoint, but a purely
+                # spatial-smoothness penalty normalized by the truth's roughness.
+                l_s = (laplacian(y_hat) ** 2).mean() / (laplacian(y) ** 2).mean().detach().clamp_min(1e-12)
+                terms["phys"] = lam * l_s
+                logs.update(phys=l_s.item())
+            elif lam > 0:
                 R, reg = self.guide.residuals(xs, y_hat, sts, doy0.repeat(n_mem))
                 m = self.guide.mask(x, y, st).repeat(n_mem, 1, 1, 1)
                 l_phys = self.guide.loss(R, m)
@@ -356,6 +363,12 @@ class PGCFM(nn.Module):
                 terms["es"] = cfg.lambda_s * es
                 logs["es"] = es.item()
         return terms, logs
+
+
+def laplacian(x: torch.Tensor) -> torch.Tensor:
+    """5-point grid Laplacian, periodic in longitude, replicate in latitude (normalized units)."""
+    xp = nn.functional.pad(nn.functional.pad(x, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="replicate")
+    return xp[..., 1:-1, 2:] + xp[..., 1:-1, :-2] + xp[..., 2:, 1:-1] + xp[..., :-2, 1:-1] - 4 * x
 
 
 def energy_score(ens: torch.Tensor, obs: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

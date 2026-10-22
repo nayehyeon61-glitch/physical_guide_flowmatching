@@ -108,6 +108,8 @@ def main(argv=None):
     p.add_argument("--iters-guide", type=int, default=300)
     p.add_argument("--iters-joint", type=int, default=500)
     p.add_argument("--lambdas", type=float, nargs="+", default=[0.1, 1.0])
+    p.add_argument("--smooth-control", action="store_true",
+                   help="extra arm: same schedule with a non-physical Laplacian penalty instead of L_phys")
     p.add_argument("--grad-ratios", type=float, nargs="*", default=[],
                    help="extra arms lambda_P = max(lambdas) with the physics gradient capped at r x CFM's")
     p.add_argument("--batch", type=int, default=8)
@@ -160,9 +162,10 @@ def main(argv=None):
     results["truth_lead_residual"] = member_residuals(
         base, test_batch["x0"], test_batch["targets"][:, None], test_batch["static"], test_batch["doy"])
 
-    arms = [("cfm", None, 0.0)] + [(f"pgcfm_{lam:g}", lam, 0.0) for lam in a.lambdas] + \
-        [(f"pgcfm_{max(a.lambdas):g}_gr{r:g}", max(a.lambdas), r) for r in a.grad_ratios]
-    for name, lam, gr in arms:
+    arms = [("cfm", None, 0.0, "physics")] + [(f"pgcfm_{lam:g}", lam, 0.0, "physics") for lam in a.lambdas] + \
+        [(f"pgcfm_{max(a.lambdas):g}_gr{r:g}", max(a.lambdas), r, "physics") for r in a.grad_ratios] + \
+        ([(f"smooth_{max(a.lambdas):g}", max(a.lambdas), 0.0, "smooth")] if a.smooth_control else [])
+    for name, lam, gr, ctl in arms:
         torch.manual_seed(1)
         m = copy.deepcopy(base)
         t = time.time()
@@ -170,7 +173,7 @@ def main(argv=None):
             run_phase(m, "cfm", loader, a.iters_joint, 5e-5, log_every=max(1, a.iters_joint // 5))
             logs = []
         else:
-            m.guide.cfg.lambda_p, m.guide.cfg.grad_ratio = lam, gr
+            m.guide.cfg.lambda_p, m.guide.cfg.grad_ratio, m.guide.cfg.control = lam, gr, ctl
             run_phase(m, "guide", loader, a.iters_guide, 1e-3, log_every=max(1, a.iters_guide // 3))
             logs = run_phase(m, "joint", loader, a.iters_joint, 5e-5, log_every=max(1, a.iters_joint // 5))
         secs = time.time() - t
@@ -182,7 +185,7 @@ def main(argv=None):
         print(f"[{name}] 1-day", json.dumps({k: round(v, 4) for k, v in r["one_step"].items()}), flush=True)
         with open(os.path.join(a.out, "results.json"), "w") as f:
             json.dump(results, f, indent=1)
-    print_table(results, [n for n, _, _ in arms], a.horizon)
+    print_table(results, [n for n, *_ in arms], a.horizon)
     return results
 
 

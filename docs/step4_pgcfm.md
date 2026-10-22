@@ -12,7 +12,7 @@
 | `scripts/infer_pgcfm.py` | 멤버별 Markov rollout → KAI `forecast.nc` (+ ε=0 `_det.nc`), 5단계 `evaluate.py` 입력 형식 |
 | `scripts/make_balanced_era5.py` | 정역학 + 지균 균형을 만족하는 합성 자료 (아래 설명) |
 | `scripts/run_step4_pgcfm.py`, `scripts/run_step4_projection.py` | 이 문서의 실험 |
-| `docs/step4/` | 세 실험의 원시 결과(json)와 로그 |
+| `docs/step4/` | 네 실험의 원시 결과(json)와 로그 |
 | `tests/test_coupling.py` | 6개: h_ψ=0이면 3단계 선형 bridge와 일치, 끝점 보존, L_phys → θ gradient 도달, 관측 쌍 mask, b_j 하한, 학습·추론 스크립트 end-to-end |
 
 결합의 핵심 경로는 논문 그대로입니다. 학습 중 새 ε로 미분 가능한 Heun 적분(2 step)을 돌려 ŷ를 만들고, B_ψ(s) = (1−a)x + aŷ + a(1−a)h_ψ 위에서 시간적분 잔차를 계산합니다. ŷ를 detach하지 않으므로 L_phys → B_ψ → ŷ → θ로 gradient가 흐릅니다(`test_physics_gradient_reaches_theta`). 유효 collocation mask는 관측 쌍의 지표기압으로 정해서, 생성 멤버가 ps를 낮춰 잔차 계산점을 없앨 수 없습니다.
@@ -81,6 +81,21 @@ guide 단계 후, 관측 쌍을 학습된 bridge + closure로 이으면 운동�
 
 ### W6. 비용
 joint 단계는 같은 iter의 CFM 단독보다 7배 느립니다(338 s vs 48 s): 미분 가능한 Heun 2 step(U-Net 순전파 4회 + 역전파)과 float64 잔차 5 노드. 121×240에서는 GPU 메모리가 먼저 한계가 될 수 있어 `batch`, `sample_steps`, `n_sub`를 조절할 수 있게 했습니다. 학습 중 sample_steps=2인 ŷ는 추론(8 step) 분포와 다르다는 점도 남습니다(학습-추론 불일치).
+
+### W8. 비물리 평활 penalty 대조군이 PG-CFM 효과의 대부분을 재현한다
+2단계 결과(PR #4)에서 CFM 멤버 편차는 공간적으로 white noise였습니다(인접 격자 상관 0.03). 그러면 미분이 들어간 L_phys는 사실상 평활화 penalty일 수 있습니다. 같은 일정(guide 150 + joint 300 iter, λ=0.1, 같은 미분 가능 endpoint)에서 L_phys 대신 ‖∇²ŷ‖² / ‖∇²y‖²(격자 Laplacian, 물리 없음)를 넣은 대조군을 돌렸습니다(`run_step4_pgcfm.py --smooth-control`, `docs/step4/run4_smooth.log`). 경도 주기 패딩이 들어간 PR #4 최종 CFM을 썼고, CFM 단독 수치는 앞 실험과 같습니다.
+
+| 모델 | 1일 CRPS | 1일 SSR | 1일 멤버 진폭 (진실 1.21) | 5일 / 10일 CRPS | 독립 잔차 T / q / hyd (1일) |
+| --- | --- | --- | --- | --- | --- |
+| CFM 단독 | **0.484** | 1.25 | 1.43 | 0.624 / 0.633 | 1.26 / 0.99 / 68 |
+| PG-CFM λ_P=0.1 | 0.610 | 0.93 | 1.07 | 0.609 / **0.597** | 1.03 / 0.62 / **56** |
+| 평활 penalty λ=0.1 | 0.517 | 1.10 | **1.22** | 0.609 / 0.613 | 1.03 / 0.67 / 68 |
+
+- T·q 잔차 감소와 5일 CRPS 개선은 평활 penalty로도 똑같이 나옵니다. 이 부분은 물리 제약의 효과라고 볼 수 없습니다.
+- PG-CFM에만 있는 효과는 정역학 잔차 감소(68 → 56)와 10일 CRPS의 추가 개선(0.613 → 0.597)입니다. 그 대가로 1일 CRPS가 0.517 → 0.610으로 나빠지고, 진폭이 진실보다 작아집니다(W3).
+- 평활 penalty는 joint 단계도 1.5배 빠릅니다(281 s vs 411 s).
+
+**결론**: penalty 방식의 L_phys를 평가할 때는 평활 대조군을 기본 baseline으로 두어야 합니다(논문 표 2에 "CFM + 평활 penalty" 행 추가 제안). 그리고 W4의 수정(상관 noise, 정역학 parameterization)은 white noise라는 같은 원인을 직접 겨냥합니다.
 
 ### W7. 이 실험의 한계
 - 합성 자료의 시간 진화가 AR(1)이라 운동량·열역학 잔차의 의미가 제한적이고, closure가 무엇을 흡수했는지(식별성)는 검증할 수 없습니다.

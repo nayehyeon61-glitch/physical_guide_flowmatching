@@ -1,0 +1,59 @@
+b_j: {'mom': 0.00015274818729468532, 'T': 0.00015388742912716779, 'mass': 1.0000000000000002e-06, 'hyd': 0.1, 'q': 6.804819182418776e-08}
+  [cfm] it    120 cfm 1.88 loss 1.88 sec 29.55
+  [cfm] it    240 cfm 1.587 loss 1.587 sec 55.99
+  [cfm] it    360 cfm 1.494 loss 1.494 sec 81.27
+  [cfm] it    480 cfm 1.452 loss 1.452 sec 107.8
+  [cfm] it    600 cfm 1.412 loss 1.412 sec 134.5
+  [cfm] it    720 cfm 1.397 loss 1.397 sec 161.6
+  [cfm] it    840 cfm 1.378 loss 1.378 sec 189.1
+  [cfm] it    960 cfm 1.357 loss 1.357 sec 217.6
+  [cfm] it   1080 cfm 1.364 loss 1.364 sec 244.6
+  [cfm] it   1200 cfm 1.356 loss 1.356 sec 271.9
+  [cfm] it     60 cfm 1.357 loss 1.357 sec 13.65
+  [cfm] it    120 cfm 1.348 loss 1.348 sec 27.44
+  [cfm] it    180 cfm 1.344 loss 1.344 sec 40.69
+  [cfm] it    240 cfm 1.352 loss 1.352 sec 54.66
+  [cfm] it    300 cfm 1.336 loss 1.336 sec 68.32
+[cfm] 1-day {"crps": 0.4838, "rmse": 0.9589, "spread": 1.13, "tendency_ratio": 1.7787, "res_gen_u": 6.8046, "res_gen_v": 2.7298, "res_gen_T": 1.2923, "res_gen_mass": 4.1495, "res_gen_hyd": 76.2209, "res_gen_q": 1.0514, "res_obs_u": 0.9272, "res_obs_v": 1.0643, "res_obs_T": 1.0146, "res_obs_mass": 0.6548, "res_obs_hyd": 0.0021, "res_obs_q": 1.1012, "ssr": 1.25}
+  [guide] it     50 phys 2.692 reg 0.3806 closure_rms 0.08977 loss 2.696 sec 16.41
+  [guide] it    100 phys 1.82 reg 0.7371 closure_rms 0.1597 loss 1.828 sec 30.91
+  [guide] it    150 phys 1.522 reg 1.047 closure_rms 0.171 loss 1.533 sec 47.4
+  [joint] it     60 cfm 1.41 lambda_p 0.0305 phys 5840 reg 0.4061 loss 178.1 sec 88.37
+  [joint] it    120 cfm 1.558 lambda_p 0.087 phys 5391 reg 0.3294 loss 467.9 sec 172.4
+  [joint] it    180 cfm 1.679 lambda_p 0.1 phys 4554 reg 0.3264 loss 457.1 sec 254
+  [joint] it    240 cfm 1.749 lambda_p 0.1 phys 3995 reg 0.3499 loss 401.2 sec 334.1
+  [joint] it    300 cfm 1.79 lambda_p 0.1 phys 3857 reg 0.3682 loss 387.5 sec 411.1
+[pgcfm_0.1] 1-day {"crps": 0.6095, "rmse": 1.1908, "spread": 1.0449, "tendency_ratio": 2.0678, "res_gen_u": 6.5378, "res_gen_v": 2.5901, "res_gen_T": 1.0597, "res_gen_mass": 4.1376, "res_gen_hyd": 61.4523, "res_gen_q": 0.7063, "res_obs_u": 0.9272, "res_obs_v": 1.0643, "res_obs_T": 1.0146, "res_obs_mass": 0.6548, "res_obs_hyd": 0.0021, "res_obs_q": 1.1012, "ssr": 0.9307}
+  [guide] it     50 phys 2.692 reg 0.3806 closure_rms 0.08977 loss 2.696 sec 15.68
+  [guide] it    100 phys 1.82 reg 0.7371 closure_rms 0.1597 loss 1.828 sec 30.32
+  [guide] it    150 phys 1.522 reg 1.047 closure_rms 0.171 loss 1.533 sec 46.66
+  [joint] it     60 cfm 1.356 lambda_p 0.0305 phys 28.17 loss 2.226 sec 58.75
+  [joint] it    120 cfm 1.364 lambda_p 0.087 phys 26.93 loss 3.712 sec 116.8
+  [joint] it    180 cfm 1.35 lambda_p 0.1 phys 27.44 loss 4.094 sec 172.8
+  [joint] it    240 cfm 1.352 lambda_p 0.1 phys 26.74 loss 4.026 sec 226.8
+  [joint] it    300 cfm 1.349 lambda_p 0.1 phys 26.6 loss 4.008 sec 280.6
+[smooth_0.1] 1-day {"crps": 0.5167, "rmse": 1.0251, "spread": 1.0665, "tendency_ratio": 1.839, "res_gen_u": 6.7044, "res_gen_v": 2.6458, "res_gen_T": 1.0653, "res_gen_mass": 4.0929, "res_gen_hyd": 75.6957, "res_gen_q": 0.7663, "res_obs_u": 0.9272, "res_obs_v": 1.0643, "res_obs_T": 1.0146, "res_obs_mass": 0.6548, "res_obs_hyd": 0.0021, "res_obs_q": 1.1012, "ssr": 1.1035}
+
+lead: RMSE / spread / CRPS / SSR / det(eps=0) RMSE / member amp   (truth amp, persistence)
+ d1: truth amp 1.211  persistence 0.753
+   cfm          0.981 / 1.133 / 0.486 / 1.23 / 0.932 / 1.429
+   pgcfm_0.1    1.228 / 1.044 / 0.626 / 0.90 / 1.241 / 1.070
+   smooth_0.1   1.067 / 1.067 / 0.533 / 1.06 / 0.952 / 1.219
+ d3: truth amp 1.202  persistence 1.232
+   cfm          1.253 / 1.267 / 0.625 / 1.07 / 1.385 / 1.449
+   pgcfm_0.1    1.256 / 1.047 / 0.644 / 0.88 / 1.281 / 1.052
+   smooth_0.1   1.260 / 1.106 / 0.645 / 0.93 / 1.375 / 1.186
+ d5: truth amp 1.117  persistence 1.320
+   cfm          1.250 / 1.316 / 0.624 / 1.12 / 1.439 / 1.450
+   pgcfm_0.1    1.176 / 1.046 / 0.609 / 0.94 / 1.208 / 1.051
+   smooth_0.1   1.179 / 1.113 / 0.609 / 1.00 / 1.402 / 1.182
+ d10: truth amp 1.098  persistence 1.548
+   cfm          1.264 / 1.359 / 0.633 / 1.14 / 1.519 / 1.438
+   pgcfm_0.1    1.160 / 1.046 / 0.597 / 0.96 / 1.200 / 1.051
+   smooth_0.1   1.191 / 1.124 / 0.613 / 1.00 / 1.444 / 1.184
+
+independent residual of member transitions (normalized by b_j), lead 1 / last
+   truth        u 0.91/0.82  v 1.05/0.80  T 1.01/0.86  mass 0.76/0.68  hyd 0.00/0.00  q 1.10/0.97
+   cfm          u 6.86/9.80  v 2.74/3.91  T 1.26/1.56  mass 4.19/5.97  hyd 68.48/90.87  q 0.99/0.96
+   pgcfm_0.1    u 6.61/9.48  v 2.61/3.64  T 1.03/1.23  mass 4.18/5.97  hyd 56.24/80.02  q 0.62/0.54
+   smooth_0.1   u 6.76/9.82  v 2.67/3.91  T 1.03/1.22  mass 4.13/5.92  hyd 67.81/88.37  q 0.67/0.56
