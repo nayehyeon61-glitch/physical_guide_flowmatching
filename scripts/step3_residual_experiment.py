@@ -181,22 +181,29 @@ def e8_pinn_fit(steps=1500, seed=0):
     Xf = pinn.sample_collocation(1500, generator=gen, s_range=(0.0, 0.0))
     Xtest = pinn.sample_collocation(2000, generator=gen, s_range=(0.0, 0.0))
     truth = fn(*Xtest)
-    lb, ub = [math.log(5e3), -1.0], [math.log(1e5), 1.0]
-    out = {}
+    # s is in seconds: the input scaling must use the physical range, otherwise
+    # d/ds of the net is O(1) per second (first run of this script had (-1, 1)).
+    lb, ub = [math.log(5e3), 0.0], [math.log(1e5), contract.CONST.dt_seconds]
     phys = {"u": 1.0, "v": 1.0, "T": 1.0, "mass": 1.0, "hyd": 1.0, "q": 0.0}
-    for name, w in (("data only", {k: 0.0 for k in EQS}),
-                    ("data + physics, gamma=1", phys),
-                    ("data + physics, gamma=1e-4", {k: 1e-4 * v for k, v in phys.items()})):
+    off = {k: 0.0 for k in EQS}
+    out = {}
+    for name, stages in (("data only", [(steps, off)]),
+                         ("data + physics from step 0", [(steps, phys)]),
+                         ("data warm-up, then + physics", [(steps // 2, off), (steps - steps // 2, phys)])):
         torch.manual_seed(seed)
         net = pinn.PhysicsInformedNN([5, 64, 64, 64, 7], lb, ub, dtype=torch.float64)
         t0 = time.time()
-        hist = net.train_model(Xu, tgt, Xf, n_adam=steps, lr=2e-3, weights=w)
+        hist = []
+        for n, w in stages:
+            hist += net.train_model(Xu, tgt, Xf, n_adam=n, lr=2e-3, weights=w)
         F, R = net.predict(*Xtest)
         out[name] = {
             "seconds": round(time.time() - t0, 1),
             "final_data_loss": hist[-1]["data"],
             "test_field_rmse": {k: float(((F[k] - truth[k]) ** 2).mean().sqrt()) for k in ("u", "v", "T", "Phi")},
-            "test_residual_rms_over_b": {k: float(((R[k] / SC.of(k)) ** 2).mean().sqrt()) for k in ("u", "v", "mass", "hyd")},
+            "test_wind_speed_rms(pred, truth)": [float((F["u"] ** 2 + F["v"] ** 2).mean().sqrt()),
+                                                 float((truth["u"] ** 2 + truth["v"] ** 2).mean().sqrt())],
+            "test_residual_rms_over_b": {k: float(((R[k] / SC.of(k)) ** 2).mean().sqrt()) for k in ("u", "v", "T", "mass", "hyd")},
         }
     return out
 
