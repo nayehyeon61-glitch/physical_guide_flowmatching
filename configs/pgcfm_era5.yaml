@@ -1,0 +1,39 @@
+# PG-CFM on KAI ERA5 daily means (1.5 deg, 121 x 240, 67 channels).
+# Paths follow the owner's cluster layout (KAI_ERA5_IO_FORMAT): edit to match.
+train_dir: /home/work/data/hklab-ahmed/era-data/train   # 1980-2011, one .nc per year
+valid_dir: /home/work/data/hklab-ahmed/era-data/valid   # 2012
+stats_dir: /home/work/data/hklab-ahmed/KAI-New/stats    # global_mean.npy, global_std.npy (67,)
+
+phases: [cfm, guide, joint]
+iters: {cfm: 100000, guide: 5000, joint: 20000, cfm_more: 20000}
+lr: {cfm: 2.0e-4, guide: 1.0e-3, joint: 5.0e-5, cfm_more: 5.0e-5}
+batch: 8
+workers: 8
+
+# backbone (same for CFM-only and PG-CFM, paper sec. 4.3)
+tisr_mode: target          # "forcing" = tisr_{k+1} given as condition (ablation)
+model_channels: 64
+channel_mult: [1, 2, 2, 4]
+num_res_blocks: 2
+
+# eq. (12); start lambda_p small (step 3: gamma=1 alone drives the PINN to a rest state)
+lambda_p: 0.1
+ramp_iters: 5000
+lambda_h: 1.0e-2
+lambda_s: 0.0              # > 0 adds the energy score with M = 2
+sample_steps: 2            # Heun steps of the differentiable endpoint in the joint phase
+n_sub: 4                   # Simpson intervals of the time-integrated residual (eq. 18)
+gamma: {u: 1.0, v: 1.0, T: 1.0, mass: 1.0, hyd: 1.0, q: 0.0}   # q: 1.0 = "+ moisture" row of Table 2
+pole_cap_deg: 85.0
+
+scale_batches: 50          # observed pairs used for b_j
+val_batches: 10
+val_members: 4
+val_every: 2000
+
+# b_j of eq. (10). null = RMS of observed-pair residuals (scale_batches), floored at
+# scale_floor_frac x the synoptic default. To fix them from
+# scripts/step3_era5_residual_stats.py, e.g. scales: {mom: 1.0e-4, T: 5.0e-5, mass: 1.0e-6, hyd: 0.5, q: 1.0e-8}
+scales: null
+scale_floor_frac: 0.1
+grad_ratio: 0.0            # > 0 caps the physics gradient on theta at grad_ratio x the CFM gradient (docs/step4)
