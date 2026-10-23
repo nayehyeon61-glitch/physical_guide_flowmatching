@@ -47,8 +47,9 @@ def test_latent_model_shapes_and_eps0():
 def test_quick_experiment(tmp_path):
     from scripts.run_step7_latent import main
     r = main(["--out", str(tmp_path), "--quick"])
-    for n in ("cfm", "cfm_dct", "pinn_det", "lat_frozen", "lat_retrain", "lat_finetune", "lat_nophys", "lat_serial", "lat_serial_nophys", "lat_serial_op",
-              "lat_serial_op_nophys", "lat_serial_op_band", "lat_serial_op2", "lat_serial_op2_nophys"):
+    for n in ("cfm", "cfm_dct", "pinn_det", "lat_frozen", "lat_retrain", "lat_finetune", "lat_nophys", "lat_serial",
+              "lat_serial_nophys", "lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band", "lat_serial_op2",
+              "lat_serial_op2_nophys"):
         assert n in r and len(r[n]["lead_crps"]) == 2
     assert all(v == v for v in r["floors"].values())
 
@@ -90,3 +91,22 @@ def test_carry_highpass_keeps_unresolved_scales():
     y = m.sample(x, b["static"], b["doy"][:, 1], steps=2)
     hp = lambda t: t - m.dct_x.filter(t)  # noqa: E731
     assert torch.allclose(hp(y), hp(x), atol=1e-4)  # high modes persist, low modes generated
+
+
+def test_checkpoint_resume_roundtrip(tmp_path):
+    import numpy as np
+    from pgcfm.ens_operator import EnsembleOperator
+    from pgcfm.latent import _checkpoint, _resume
+
+    def make():
+        op = EnsembleOperator(n_modes=(4, 4), hidden=8)
+        opt = torch.optim.Adam(op.parameters())
+        return op, opt, torch.optim.lr_scheduler.CosineAnnealingLR(opt, 10)
+    op, opt, sched = make()
+    with torch.no_grad():
+        op.gate.fill_(0.3)
+    ck = str(tmp_path / "op.pt")
+    _checkpoint(ck, {"op": op}, opt, sched, [{"es": np.float64(1.0)}], 4)  # FNO "_metadata", numpy logs
+    op2, opt2, sched2 = make()
+    hist, it = _resume(ck, {"op": op2}, opt2, sched2, "cpu")
+    assert it == 4 and len(hist) == 1 and op2.gate.item() == op.gate.item()

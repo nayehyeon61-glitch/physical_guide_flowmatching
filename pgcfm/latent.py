@@ -412,9 +412,10 @@ def _resume(ckpt: Optional[str], mods: Dict[str, nn.Module], opt, sched, device)
     """Load a ``_checkpoint`` file into ``mods``/``opt``/``sched`` -> (history, next iteration)."""
     if ckpt is None or not os.path.exists(ckpt):
         return [], 0
-    ck = torch.load(ckpt, map_location=device)
+    ck = torch.load(ckpt, map_location=device, weights_only=False)  # own file; history holds numpy scalars
     for k, m in mods.items():
-        m.load_state_dict(ck[k])
+        # neuraloperator's FNO adds a "_metadata" entry that a wrapping module does not expect
+        m.load_state_dict({n: v for n, v in ck[k].items() if n != "_metadata"})
     opt.load_state_dict(ck["opt"])
     sched.load_state_dict(ck["sched"])
     return ck["hist"], ck["it"]
