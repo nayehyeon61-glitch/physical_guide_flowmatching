@@ -136,11 +136,18 @@ def main(argv=None):
     if os.path.exists(res_path):  # later invocations (--arms split) add to the same file
         with open(res_path) as f:
             res = json.load(f)
+    loaded = dict(res)
     res.update({"args_" + "_".join(a.arms): vars(a), "scales": vars(guide.scales), "n_train_pairs": len(pair_ds)})
 
-    def save():
-        with open(res_path, "w") as f:
-            json.dump(res, f, indent=1)
+    def save():  # merge with what other invocations wrote meanwhile (arms can run in parallel)
+        cur = {}
+        if os.path.exists(res_path):
+            with open(res_path) as f:
+                cur = json.load(f)
+        cur.update({k: v for k, v in res.items() if loaded.get(k) is not v})  # only what this run wrote
+        with open(res_path + ".tmp", "w") as f:
+            json.dump(cur, f, indent=1)
+        os.replace(res_path + ".tmp", res_path)
 
     x_k = test_batch["x0"][:, None][..., KEEP, :, :]
     o = test_batch["targets"][..., KEEP, :, :]
@@ -299,10 +306,12 @@ def main(argv=None):
             hist = train_operator(w, guide, cal_loader, a.iters_op2, steps=4, grad_ratio=a.grad_ratio,
                                   lambda_p=0.0 if name.endswith("nophys") else a.lambda_p,
                                   curriculum=tuple(a.op2_curriculum), lambda_corr=a.lambda_corr,
-                                  log_every=max(1, a.iters_op2 // 6))
+                                  log_every=max(1, a.iters_op2 // 6), ckpt=os.path.join(a.out, f"{name}_train.pt"))
             secs = serial[1] + time.time() - t
             score(name, w, secs,
                   {"op_log_last": {k: float(np.mean([h[k] for h in hist[-30:] if k in h])) for k in hist[-1]}})
+            if os.path.exists(os.path.join(a.out, f"{name}_train.pt")):
+                os.remove(os.path.join(a.out, f"{name}_train.pt"))
 
     if "lat_nophys" in arms:
         s0, secs0, log0 = stage1(0.0)

@@ -408,12 +408,31 @@ def _set_trainable(mods, flag: bool):
             p.requires_grad_(flag)
 
 
+def _resume(ckpt: Optional[str], mods: Dict[str, nn.Module], opt, sched, device) -> Tuple[list, int]:
+    """Load a ``_checkpoint`` file into ``mods``/``opt``/``sched`` -> (history, next iteration)."""
+    if ckpt is None or not os.path.exists(ckpt):
+        return [], 0
+    ck = torch.load(ckpt, map_location=device)
+    for k, m in mods.items():
+        m.load_state_dict(ck[k])
+    opt.load_state_dict(ck["opt"])
+    sched.load_state_dict(ck["sched"])
+    return ck["hist"], ck["it"]
+
+
+def _checkpoint(ckpt: str, mods: Dict[str, nn.Module], opt, sched, hist, it: int) -> None:
+    torch.save({**{k: m.state_dict() for k, m in mods.items()}, "opt": opt.state_dict(),
+                "sched": sched.state_dict(), "hist": hist, "it": it}, ckpt + ".tmp")
+    os.replace(ckpt + ".tmp", ckpt)  # never leave a half-written file behind a restart
+
+
 def _capped_backward(terms, params, lambda_p: float, grad_ratio: float, logs) -> None:
     """data + lambda_P x phys, with ||g_phys|| <= grad_ratio x ||g_data|| (step 4 W2 fix)."""
     if "phys" not in terms:
         terms["data"].backward()
         return
-    norm = lambda gs: torch.sqrt(sum(g.abs().pow(2).sum() for g in gs if g is not None))  # noqa: E731  (FNO weights are complex)
+    # abs(): FNO spectral weights are complex
+    norm = lambda gs: torch.sqrt(sum(g.abs().pow(2).sum() for g in gs if g is not None))  # noqa: E731
     g_d = torch.autograd.grad(terms["data"], params, retain_graph=True, allow_unused=True)
     g_p = torch.autograd.grad(lambda_p * terms["phys"], params, allow_unused=True)
     n_d, n_p = norm(g_d), norm(g_p)
@@ -477,20 +496,14 @@ def train_serial(model: LatentPGCFM, guide, loader, iters: int, lr: float = 1e-3
     opt = torch.optim.Adam(params, lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(1, iters))
     use_phys = guide is not None and lambda_p > 0
-    hist, batches, start = [], _cycle(loader), 0
-    if ckpt is not None and os.path.exists(ckpt):
-        ck = torch.load(ckpt, map_location=device)
-        model.net.load_state_dict(ck["net"])
-        model.serial.load_state_dict(ck["serial"])
-        opt.load_state_dict(ck["opt"])
-        sched.load_state_dict(ck["sched"])
-        hist, start = ck["hist"], ck["it"]
+    mods = {"net": model.net, "serial": model.serial}
+    batches = _cycle(loader)
+    hist, start = _resume(ckpt, mods, opt, sched, device)
+    if start:
         log(f"  [serial] resumed at it {start}")
     for it in range(start, iters):
         if ckpt is not None and it > start and it % ckpt_every == 0:
-            torch.save({"net": model.net.state_dict(), "serial": model.serial.state_dict(), "opt": opt.state_dict(),
-                        "sched": sched.state_dict(), "hist": hist, "it": it}, ckpt + ".tmp")
-            os.replace(ckpt + ".tmp", ckpt)
+            _checkpoint(ckpt, mods, opt, sched, hist, it)
         b = _to(next(batches), device)
         l_fm, logs = model.cfm_loss(b)
         terms, lq = serial_terms(model, b, guide if use_phys else None, members, steps, joint)

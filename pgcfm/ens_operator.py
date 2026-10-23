@@ -31,9 +31,8 @@ pad latitude (``lat_padding``) so the FFT does not wrap pole to pole, and be fit
 calibration period the base chain never saw.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 from neuralop.models import FNO
@@ -41,7 +40,7 @@ from neuralop.models import FNO
 from . import contract
 from .cfm import TISR_DYN, calendar_features
 from .coupling import energy_score
-from .latent import _capped_backward, _log_avg, _set_trainable
+from .latent import _capped_backward, _checkpoint, _log_avg, _resume, _set_trainable
 
 N_COND = contract.N_DYNAMIC + 1 + 2
 
@@ -121,7 +120,7 @@ class OperatorCorrected(nn.Module):
 def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, members: int = 4, lr: float = 1e-3,
                    lambda_p: float = 0.1, grad_ratio: float = 0.5, steps: int = 8, curriculum=(1,),
                    lambda_corr: float = 0.0, bptt: bool = True, log_every: int = 50, log=print,
-                   device="cpu") -> List[Dict[str, float]]:
+                   device="cpu", ckpt: Optional[str] = None, ckpt_every: int = 20) -> List[Dict[str, float]]:
     """Operator only; the base chain (encoder, CFM, PINNs, decoder) is frozen.
 
     Loss per lead k of an unrolled member-wise rollout (horizon from ``curriculum``, as in
@@ -132,7 +131,8 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
     Corrected members are fed back as the next initial state; with ``bptt`` the gradient
     crosses the whole rollout (through the frozen base, w.r.t. its inputs). ``curriculum=(1,)``
     is the one-step training of the first version. The loader must give >= max(curriculum)
-    targets; members are drawn fresh every batch.
+    targets; members are drawn fresh every batch. ``ckpt``: resumable checkpoint, as in
+    ``latent.train_serial``.
     """
     from .projection import curriculum_horizon, ProjectionConfig
     from .train import _cycle, _to
@@ -145,8 +145,13 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
     keep = [i for i in range(contract.N_DYNAMIC) if i != TISR_DYN]
     use_phys = guide is not None and lambda_p > 0
     pc = ProjectionConfig(curriculum=tuple(curriculum))
-    hist, batches = [], _cycle(loader)
-    for it in range(iters):
+    batches = _cycle(loader)
+    hist, start = _resume(ckpt, {"op": wrapped.op}, opt, sched, device)
+    if start:
+        log(f"  [operator] resumed at it {start}")
+    for it in range(start, iters):
+        if ckpt is not None and it > start and it % ckpt_every == 0:
+            _checkpoint(ckpt, {"op": wrapped.op}, opt, sched, hist, it)
         b = _to(next(batches), device)
         x0, tg, st, d = b["x0"], b["targets"], b["static"], b["doy"]
         K = min(curriculum_horizon(pc, it, iters), tg.shape[1])
