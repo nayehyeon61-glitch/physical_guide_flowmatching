@@ -11,7 +11,9 @@ writes the zero-noise (eps = 0) run with the same ICs and no member dim.
         --stats-dir /data/KAI-New/stats --out runs/pgcfm/forecast.nc --leads 10 --members 16 --det
 
 A step 6 checkpoint (``train_projection.py``, ``proj.pt``) is rolled out through
-the frozen CFM followed by the projection ODE.
+the frozen CFM followed by the projection ODE. A step 7 checkpoint
+(``train_latent.py``, ``latent.pt``) is rolled out as encoder -> frozen latent
+PINN + latent CFM -> decoder, re-encoded every day.
 """
 
 import argparse
@@ -88,6 +90,11 @@ def main(argv=None):
             from scripts.train_projection import projection_config
             model.cfm = ODEProjection(model.cfm, projection_config(state["projection"]), H, W).to(dev)
         model.load_state_dict(state["model"])
+        if "latent_config" in state:  # step 7 checkpoint (train_latent.py): DCT encoder -> latent CFM -> decoder
+            from pgcfm.latent import LatentConfig, LatentPGCFM
+            lc = {k: tuple(v) if isinstance(v, list) else v for k, v in state["latent_config"].items()}
+            model.cfm = LatentPGCFM(LatentConfig(**lc), H, W).to(dev)
+            model.cfm.load_state_dict(state["latent"])
         model.eval()
         ics = a.ics if a.ics else list(range(0, T - a.leads, a.ic_stride))
         K = a.leads
