@@ -42,8 +42,9 @@ evaluation run on it unchanged.
 """
 
 import copy
+import os
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -457,12 +458,15 @@ def train_stage1(model: LatentPGCFM, guide, loader, iters: int, lr: float = 1e-3
 
 def train_serial(model: LatentPGCFM, guide, loader, iters: int, lr: float = 1e-3, lambda_p: float = 0.1,
                  grad_ratio: float = 0.5, members: int = 2, steps: int = 4, joint: bool = True,
-                 log_every: int = 100, log=print, device="cpu") -> List[Dict[str, float]]:
+                 log_every: int = 100, log=print, device="cpu", ckpt: Optional[str] = None,
+                 ckpt_every: int = 50) -> List[Dict[str, float]]:
     """Serial coupling CFM -> PINN, both trained in the same step (encoder/decoder from stage 1 frozen).
 
     Loss = L_CFM (flow matching on z_{k+1} - z_k) + decoded member CRPS + lambda_P x physics of
     every member after Q_phi, physics gradient capped at ``grad_ratio`` x the data gradient.
     ``steps`` Heun steps are back-propagated through when ``joint``.
+    ``ckpt``: file written every ``ckpt_every`` iterations (CFM, Q_phi, optimizer, schedule) and
+    resumed from if it exists; the data order and noise after a resume differ from an unbroken run.
     """
     from .train import _cycle, _to
     if model.serial is None:
@@ -473,8 +477,20 @@ def train_serial(model: LatentPGCFM, guide, loader, iters: int, lr: float = 1e-3
     opt = torch.optim.Adam(params, lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(1, iters))
     use_phys = guide is not None and lambda_p > 0
-    hist, batches = [], _cycle(loader)
-    for it in range(iters):
+    hist, batches, start = [], _cycle(loader), 0
+    if ckpt is not None and os.path.exists(ckpt):
+        ck = torch.load(ckpt, map_location=device)
+        model.net.load_state_dict(ck["net"])
+        model.serial.load_state_dict(ck["serial"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        hist, start = ck["hist"], ck["it"]
+        log(f"  [serial] resumed at it {start}")
+    for it in range(start, iters):
+        if ckpt is not None and it > start and it % ckpt_every == 0:
+            torch.save({"net": model.net.state_dict(), "serial": model.serial.state_dict(), "opt": opt.state_dict(),
+                        "sched": sched.state_dict(), "hist": hist, "it": it}, ckpt + ".tmp")
+            os.replace(ckpt + ".tmp", ckpt)
         b = _to(next(batches), device)
         l_fm, logs = model.cfm_loss(b)
         terms, lq = serial_terms(model, b, guide if use_phys else None, members, steps, joint)

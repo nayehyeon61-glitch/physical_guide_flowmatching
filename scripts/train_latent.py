@@ -118,8 +118,16 @@ def main(argv=None):
             rec["val"] = v
         write(rec)
 
-    s1_ck = os.path.join(a.out, "stage1.pt")
-    if a.resume and os.path.exists(s1_ck):
+    s1_ck, lat_ck = os.path.join(a.out, "stage1.pt"), os.path.join(a.out, "latent.pt")
+    done = []
+    if a.resume and os.path.exists(lat_ck):  # latest checkpoint: skip every stage it already holds
+        ck = torch.load(lat_ck, map_location=dev)
+        model.load_state_dict(ck["latent"])
+        base.guide.scales = ResidualScales(**ck["scales"])
+        freeze(model.pinn)
+        done = ck.get("stages_done", ["stage1", "stage2"])
+        log("resumed", ", ".join(done))
+    elif a.resume and os.path.exists(s1_ck):
         ck = torch.load(s1_ck, map_location=dev)
         model.load_state_dict(ck["latent"], strict=False)  # stage 1 may come from the other coupling
         base.guide.scales = ResidualScales(**ck["scales"])
@@ -142,18 +150,19 @@ def main(argv=None):
         save(s1_ck, ["stage1"])
     freeze(base.guide)
 
-    if "stage2" in cfg["stages"] and cfg["coupling"] == "serial":
+    run2 = "stage2" in cfg["stages"] and "stage2" not in done
+    if run2 and cfg["coupling"] == "serial":
         train_serial(model, base.guide, loader, cfg["serial_iters"], lr=cfg["serial_lr"], lambda_p=cfg["lambda_p"],
                      grad_ratio=cfg["grad_ratio"], members=cfg["serial_members"], steps=cfg["serial_steps"],
                      log_every=min(500, cfg["serial_iters"]), log=log, device=dev)
         report("stage2")
         save(os.path.join(a.out, "latent.pt"), ["stage1", "stage2"])
-    elif "stage2" in cfg["stages"]:
+    elif run2:
         train_stage2(model, loader, cfg["stage2_iters"], mode=cfg["stage2_mode"], lr=cfg["stage2_lr"],
                      ae_lr=cfg["ae_lr"], log_every=min(500, cfg["stage2_iters"]), log=log, device=dev)
         report("stage2")
         save(os.path.join(a.out, "latent.pt"), ["stage1", "stage2"])
-    if "decft" in cfg["stages"]:
+    if "decft" in cfg["stages"] and "decft" not in done:
         finetune_decoder(model, loader, cfg["decft_iters"], lr=cfg["decft_lr"], log=log, device=dev)
         report("decft")
         save(os.path.join(a.out, "latent.pt"), ["stage1", "stage2", "decft"])

@@ -53,7 +53,7 @@ def test_quick_experiment(tmp_path):
     assert all(v == v for v in r["floors"].values())
 
 
-def test_train_latent_and_infer_scripts(tmp_path):
+def test_train_latent_and_infer_scripts(tmp_path, capsys):
     import netCDF4 as nc
     from scripts.infer_pgcfm import main as infer
     from scripts.make_balanced_era5 import main as make_balanced
@@ -65,6 +65,14 @@ def test_train_latent_and_infer_scripts(tmp_path):
            f"valid_dir={d}/valid", f"stats_dir={d}/train/stats", "batch=2", "workers=0", "k_lat=3", "k_lon=4",
            "latent=8", "enc_hidden=[16]", "pinn_hidden=[16]", "cfm_width=16", "stage1_iters=2", "stage2_iters=2",
            "decft_iters=1", "dct_fit_batches=2", "scale_batches=1", "val_batches=1", "val_members=2"])
+    capsys.readouterr()
+    before = torch.load(f"{d}/run/latent.pt")["latent"]
+    train(["--out", f"{d}/run", "--resume", "--stages", "stage2", "decft", "--set", f"train_dir={d}/train",
+           f"valid_dir={d}/valid", f"stats_dir={d}/train/stats", "batch=2", "workers=0", "k_lat=3", "k_lon=4",
+           "latent=8", "enc_hidden=[16]", "pinn_hidden=[16]", "cfm_width=16", "val_batches=1"])
+    assert "resumed stage1, stage2, decft" in capsys.readouterr().out  # finished stages are not retrained
+    after = torch.load(f"{d}/run/latent.pt")["latent"]
+    assert all(torch.equal(before[k], after[k]) for k in before)
     infer(["--ckpt", f"{d}/run/latent.pt", "--test-file", f"{d}/valid/2012.nc", "--stats-dir", f"{d}/train/stats",
            "--out", f"{d}/fc.nc", "--leads", "2", "--members", "2", "--steps", "1", "--ics", "0", "--det"])
     with nc.Dataset(f"{d}/fc.nc") as f:

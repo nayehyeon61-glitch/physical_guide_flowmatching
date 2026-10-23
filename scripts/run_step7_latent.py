@@ -263,13 +263,15 @@ def main(argv=None):
             t = time.time()
             hist = train_serial(m, guide, loader, a.iters_serial, grad_ratio=a.grad_ratio,
                                 lambda_p=0.0 if name.endswith("nophys") else a.lambda_p,
-                                log_every=max(1, a.iters_serial // 10))
-            secs = s1_secs + time.time() - t
+                                log_every=max(1, a.iters_serial // 10), ckpt=os.path.join(a.out, f"{name}_train.pt"))
+            secs = s1_secs + time.time() - t  # after a resume: time since the resume only
             score(name, m, secs,
                   {"stage2_log_last": {k: float(np.mean([h[k] for h in hist[-50:] if k in h])) for k in hist[-1]}})
             if name == "lat_serial":
                 serial = (m, secs)
                 torch.save({"latent": m.state_dict(), "secs": secs}, serial_ck)
+            if os.path.exists(os.path.join(a.out, f"{name}_train.pt")):
+                os.remove(os.path.join(a.out, f"{name}_train.pt"))
         for name in ("lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band"):
             if name not in arms or serial is None:
                 continue
