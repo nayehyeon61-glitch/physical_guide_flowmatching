@@ -48,7 +48,7 @@ def test_quick_experiment(tmp_path):
     from scripts.run_step7_latent import main
     r = main(["--out", str(tmp_path), "--quick"])
     for n in ("cfm", "cfm_dct", "pinn_det", "lat_frozen", "lat_retrain", "lat_finetune", "lat_nophys", "lat_serial", "lat_serial_nophys", "lat_serial_op",
-              "lat_serial_op_nophys", "lat_serial_op_band"):
+              "lat_serial_op_nophys", "lat_serial_op_band", "lat_serial_op2", "lat_serial_op2_nophys"):
         assert n in r and len(r[n]["lead_crps"]) == 2
     assert all(v == v for v in r["floors"].values())
 

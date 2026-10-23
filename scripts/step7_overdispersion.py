@@ -54,7 +54,9 @@ def main(argv=None):
     if not os.path.exists(os.path.join(te, "2020.nc")):
         make_balanced(["--out", te, "--years", "2020", "--days", "32", "--n-lat", "25", "--n-lon", "48",
                        "--seed", "1000"])
-    res, path = {"args": vars(a)}, os.path.join(a.out, "results.json")
+    path = os.path.join(a.out, "results.json")
+    res = json.load(open(path)) if os.path.exists(path) else {}
+    res["args"] = vars(a)
     for n in a.n_years:
         tr = os.path.join(a.out, "data", f"train{n}")
         if not os.path.exists(os.path.join(tr, "stats", "global_std.npy")):
@@ -65,8 +67,8 @@ def main(argv=None):
         pair_ds = PGCFMSequenceDataset(dcfg, tr, horizon=1)
         loader = torch.utils.data.DataLoader(pair_ds, batch_size=8, shuffle=True, drop_last=True)
         test_b = take(torch.utils.data.DataLoader(PGCFMSequenceDataset(dcfg, te, horizon=1, train=False),
-                                                  batch_size=8), 2)
-        train_b = take(torch.utils.data.DataLoader(pair_ds, batch_size=8, shuffle=False), 2)
+                                                  batch_size=4), 3)
+        train_b = take(torch.utils.data.DataLoader(pair_ds, batch_size=4, shuffle=False), 3)
         torch.manual_seed(0)
         m = build(dict(DEFAULTS, model_channels=32, channel_mult=[1, 2, 2], num_res_blocks=1),
                   25, 48, np.load(mean_p), np.load(std_p))

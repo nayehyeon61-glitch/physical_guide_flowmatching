@@ -17,6 +17,8 @@ enc_hidden: [1024, 512]    # decoder mirrors it
 pinn_hidden: [1024, 1024]
 act: tanh                  # Raissi PINN activation (the sketch's F.sinh does not exist)
 cfm_width: 1024
+carry_highpass: true       # modes above the DCT cut are copied from x_k (docs/step7 W1)
+coupling: serial           # serial: CFM members -> PINN Q per member (best on synthetic); anchor: P(z_k) + CFM
 
 scales: null               # or {mom, T, mass, hyd, q} from step3_era5_residual_stats
 scale_floor_frac: 0.1
@@ -27,7 +29,13 @@ stage1_lr: 1.0e-3
 lambda_p: 0.1
 grad_ratio: 0.5            # physics gradient <= 0.5 x data gradient
 
-# stage 2: latent CFM, frozen PINN
+# stage 2, coupling: serial — CFM + per-member PINN Q trained together, encoder/decoder frozen
+serial_iters: 20000
+serial_lr: 1.0e-3
+serial_steps: 4            # Heun steps back-propagated through (memory)
+serial_members: 2
+
+# stage 2, coupling: anchor — latent CFM around the frozen PINN step
 stage2_iters: 50000
 stage2_lr: 1.0e-3
 stage2_mode: frozen        # recommended; "retrain" = encoder/decoder trained on CFM + reconstruction

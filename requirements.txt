@@ -11,3 +11,5 @@ pandas
 fsspec
 matplotlib
 torchdiffeq
+torch-dct==0.1.6
+neuraloperator

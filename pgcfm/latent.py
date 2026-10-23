@@ -608,6 +608,22 @@ def member_structure(transition, batches, members: int = 8, steps: int = 8, seed
 
 
 @torch.no_grad()
+def range_coverage(transition, batches, members: int = 8, steps: int = 8, seed: int = 4) -> Dict[str, float]:
+    """Fraction of truth points inside the 1-day member range [min, max]. For an exchangeable,
+    calibrated M-member ensemble the expected value is (M - 1) / (M + 1)."""
+    g = torch.Generator().manual_seed(seed)
+    acc = []
+    for b in batches:
+        x, y, st, d = b["x0"], b["targets"][:, 0], b["static"], b["doy"][:, 1]
+        rep = lambda t: t.repeat(members, *([1] * (t.dim() - 1)))  # noqa: E731
+        e = _keep(transition.sample(rep(x), rep(st), rep(d), steps=steps, generator=g).view(members, *x.shape))
+        o = _keep(y)
+        inside = ((o >= e.min(0).values) & (o <= e.max(0).values)).float()
+        acc.append(float(metrics._wmean(inside).mean()))
+    return {"coverage": float(np.mean(acc)), "nominal": (members - 1) / (members + 1)}
+
+
+@torch.no_grad()
 def encoder_drift(new: LatentPGCFM, old: LatentPGCFM, batches) -> Dict[str, float]:
     """How far a retrained encoder moved, and what that does to the frozen PINN step."""
     dz, rp = [], []

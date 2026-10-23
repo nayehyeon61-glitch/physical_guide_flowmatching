@@ -23,8 +23,12 @@ Changes from the sketch:
     transition (x_k, y^m), linear bridge, no closure, capped like every other
     physics term here (``latent._capped_backward``).
 
-The FNO pads nothing in latitude, so its FFT treats the poles as neighbours
-(lon is periodic, lat is not); see docs/step7_latent.md.
+Second version (``op2`` arms, after the owner's ``possibility_operator`` package and design
+note, 2026-10-23): the first version diverged in rollout (docs/step7_latent.md W6), so
+``train_operator`` can now unroll several days with a horizon curriculum (the package's
+``rollout_steps`` / step 6), add the correction-size penalty lambda_corr ||X_hat - X_tilde||^2,
+pad latitude (``lat_padding``) so the FFT does not wrap pole to pole, and be fit on a
+calibration period the base chain never saw.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -44,10 +48,15 @@ N_COND = contract.N_DYNAMIC + 1 + 2
 
 class EnsembleOperator(nn.Module):
     def __init__(self, C: int = contract.N_DYNAMIC, K: int = N_COND, D: int = 32, n_modes=(12, 12),
-                 hidden: int = 64):
+                 hidden: int = 64, lat_padding: float = 0.0):
         super().__init__()
-        self.encoder = FNO(n_modes=n_modes, in_channels=C + K, out_channels=D, hidden_channels=hidden)
-        self.corrector = FNO(n_modes=n_modes, in_channels=2 * D + K, out_channels=C, hidden_channels=hidden)
+        # lat_padding > 0: neuraloperator domain padding in latitude only, so the FFT does not
+        # treat the two poles as neighbours (longitude stays periodic, no padding)
+        pad = [lat_padding, 0.0] if lat_padding > 0 else None
+        self.encoder = FNO(n_modes=n_modes, in_channels=C + K, out_channels=D, hidden_channels=hidden,
+                           domain_padding=pad)
+        self.corrector = FNO(n_modes=n_modes, in_channels=2 * D + K, out_channels=C, hidden_channels=hidden,
+                             domain_padding=pad)
         self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, U: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
@@ -110,10 +119,22 @@ class OperatorCorrected(nn.Module):
 
 
 def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, members: int = 4, lr: float = 1e-3,
-                   lambda_p: float = 0.1, grad_ratio: float = 0.5, steps: int = 8, log_every: int = 50,
-                   log=print, device="cpu") -> List[Dict[str, float]]:
-    """Operator only (the base chain is frozen; its members are drawn fresh every batch, the
-    sketch's 'PINN outputs generated and fixed'): fair energy score + capped lambda_P x physics."""
+                   lambda_p: float = 0.1, grad_ratio: float = 0.5, steps: int = 8, curriculum=(1,),
+                   lambda_corr: float = 0.0, bptt: bool = True, log_every: int = 50, log=print,
+                   device="cpu") -> List[Dict[str, float]]:
+    """Operator only; the base chain (encoder, CFM, PINNs, decoder) is frozen.
+
+    Loss per lead k of an unrolled member-wise rollout (horizon from ``curriculum``, as in
+    step 6 / the owner's possibility_operator ``rollout_steps``):
+        fair energy score(corrected members, truth)
+      + lambda_corr x mean ||X_hat^m - X_tilde^m||^2 (correction size, owner's note)
+      + lambda_P x primitive-equation residual of each corrected member transition (capped).
+    Corrected members are fed back as the next initial state; with ``bptt`` the gradient
+    crosses the whole rollout (through the frozen base, w.r.t. its inputs). ``curriculum=(1,)``
+    is the one-step training of the first version. The loader must give >= max(curriculum)
+    targets; members are drawn fresh every batch.
+    """
+    from .projection import curriculum_horizon, ProjectionConfig
     from .train import _cycle, _to
     _set_trainable([wrapped.base], False)
     _set_trainable([wrapped.op], True)
@@ -123,20 +144,32 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(1, iters))
     keep = [i for i in range(contract.N_DYNAMIC) if i != TISR_DYN]
     use_phys = guide is not None and lambda_p > 0
+    pc = ProjectionConfig(curriculum=tuple(curriculum))
     hist, batches = [], _cycle(loader)
     for it in range(iters):
         b = _to(next(batches), device)
-        x, y, st, d = b["x0"], b["targets"][:, 0], b["static"], b["doy"]
+        x0, tg, st, d = b["x0"], b["targets"], b["static"], b["doy"]
+        K = min(curriculum_horizon(pc, it, iters), tg.shape[1])
         rep = lambda t: t.repeat(members, *([1] * (t.dim() - 1)))  # noqa: E731
-        xs, sts, dn = rep(x), rep(st), rep(d[:, 1])
-        with torch.no_grad():
-            u = wrapped.base.sample(xs, sts, dn, steps=steps)
-        out = wrapped.correct(xs, u, sts, dn)
-        es = energy_score(out.view(members, *x.shape)[:, :, keep], y[:, keep], wrapped.w_area)
-        terms, logs = {"data": es}, {"es": es.item(), "gate": wrapped.op.gate.item()}
+        xs, sts = rep(x0), rep(st)
+        es_l, corr_l, phys_l = [], [], []
+        for k in range(K):
+            y, dn = tg[:, k], rep(d[:, k + 1])
+            with torch.set_grad_enabled(bptt and k > 0):
+                u = wrapped.base.sample(xs, sts, dn, steps=steps, grad=bptt and k > 0)
+            out = wrapped.correct(xs, u, sts, dn)
+            es_l.append(energy_score(out.view(members, *x0.shape)[:, :, keep], y[:, keep], wrapped.w_area))
+            corr_l.append(((out - u) ** 2 * wrapped.w_area).mean())
+            if use_phys:
+                R, _ = guide.residuals(xs, out, sts, rep(d[:, k]), use_bridge=False, use_closure=False)
+                prev = x0 if k == 0 else tg[:, k - 1]
+                phys_l.append(guide.loss(R, rep(guide.mask(prev, y, st))))
+            xs = out if bptt else out.detach()
+        es, corr = torch.stack(es_l).mean(), torch.stack(corr_l).mean()
+        terms = {"data": es + lambda_corr * corr}
+        logs = {"es": es.item(), "corr": corr.item(), "gate": wrapped.op.gate.item(), "horizon": K}
         if use_phys:
-            R, _ = guide.residuals(xs, out, sts, rep(d[:, 0]), use_bridge=False, use_closure=False)
-            terms["phys"] = guide.loss(R, rep(guide.mask(x, y, st)))
+            terms["phys"] = torch.stack(phys_l).mean()
             logs["phys"] = terms["phys"].item()
         opt.zero_grad(set_to_none=True)
         _capped_backward(terms, params, lambda_p, grad_ratio, logs)

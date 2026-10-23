@@ -3,8 +3,10 @@
     stage "stage1": DCT statistics, then encoder -> latent PINN -> decoder jointly
                     (reconstruction + prediction + lambda_P x primitive-equation residual
                     of the decoded pair); the PINN is frozen               -> <out>/stage1.pt
-    stage "stage2": latent CFM around the frozen PINN step; encoder/decoder frozen
-                    (``stage2_mode: frozen``, recommended) or retrained     -> <out>/latent.pt
+    stage "stage2": ``coupling: anchor`` (parallel): latent CFM around the frozen PINN step,
+                    encoder/decoder frozen (``stage2_mode: frozen``, recommended) or retrained;
+                    ``coupling: serial``: CFM members -> trainable PINN Q per member -> decoder,
+                    CFM and Q trained together (``train_serial``)         -> <out>/latent.pt
     stage "decft" : optional low-LR decoder fine-tune on decoded CRPS       -> <out>/latent.pt
 
     python scripts/train_latent.py --config configs/latent_era5.yaml --out runs/latent
@@ -25,7 +27,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm.coupling import PGCFM, estimate_scales  # noqa: E402
 from pgcfm.data import PGCFMSequenceDataset, kai_data_config  # noqa: E402
-from pgcfm.latent import LatentConfig, LatentPGCFM, finetune_decoder, floors, train_stage1, train_stage2  # noqa: E402
+from pgcfm.latent import (LatentConfig, LatentPGCFM, finetune_decoder, floors, train_serial,  # noqa: E402
+                          train_stage1, train_stage2)
 from pgcfm.physics.primitive import ResidualScales  # noqa: E402
 from pgcfm.projection import freeze  # noqa: E402
 from pgcfm.train import take, validate_one_step  # noqa: E402
@@ -36,7 +39,7 @@ DEFAULTS = dict(
     stages=["stage1", "stage2"],
     batch=8, workers=8, device="cuda" if torch.cuda.is_available() else "cpu", seed=0,
     k_lat=24, k_lon=48, latent=512, enc_hidden=[1024, 512], pinn_hidden=[1024, 1024], act="tanh", cfm_width=1024,
-    carry_highpass=True,
+    carry_highpass=True, coupling="serial", serial_iters=20000, serial_lr=1e-3, serial_steps=4, serial_members=2,
     dct_fit_batches=200, scale_batches=50, scale_floor_frac=0.1, scales=None,
     stage1_iters=50000, stage1_lr=1e-3, lambda_p=0.1, grad_ratio=0.5,
     stage2_iters=50000, stage2_lr=1e-3, stage2_mode="frozen", ae_lr=1e-4,
@@ -58,7 +61,7 @@ def latent_config(cfg) -> LatentConfig:
     return LatentConfig(k_lat=cfg["k_lat"], k_lon=cfg["k_lon"], latent=cfg["latent"],
                         enc_hidden=tuple(cfg["enc_hidden"]), dec_hidden=tuple(reversed(cfg["enc_hidden"])),
                         pinn_hidden=tuple(cfg["pinn_hidden"]), act=cfg["act"], cfm_width=cfg["cfm_width"],
-                        carry_highpass=cfg["carry_highpass"])
+                        carry_highpass=cfg["carry_highpass"], coupling=cfg["coupling"])
 
 
 def main(argv=None):
@@ -118,7 +121,7 @@ def main(argv=None):
     s1_ck = os.path.join(a.out, "stage1.pt")
     if a.resume and os.path.exists(s1_ck):
         ck = torch.load(s1_ck, map_location=dev)
-        model.load_state_dict(ck["latent"])
+        model.load_state_dict(ck["latent"], strict=False)  # stage 1 may come from the other coupling
         base.guide.scales = ResidualScales(**ck["scales"])
         freeze(model.pinn)
         log("resumed stage 1")
@@ -139,7 +142,13 @@ def main(argv=None):
         save(s1_ck, ["stage1"])
     freeze(base.guide)
 
-    if "stage2" in cfg["stages"]:
+    if "stage2" in cfg["stages"] and cfg["coupling"] == "serial":
+        train_serial(model, base.guide, loader, cfg["serial_iters"], lr=cfg["serial_lr"], lambda_p=cfg["lambda_p"],
+                     grad_ratio=cfg["grad_ratio"], members=cfg["serial_members"], steps=cfg["serial_steps"],
+                     log_every=min(500, cfg["serial_iters"]), log=log, device=dev)
+        report("stage2")
+        save(os.path.join(a.out, "latent.pt"), ["stage1", "stage2"])
+    elif "stage2" in cfg["stages"]:
         train_stage2(model, loader, cfg["stage2_iters"], mode=cfg["stage2_mode"], lr=cfg["stage2_lr"],
                      ae_lr=cfg["ae_lr"], log_every=min(500, cfg["stage2_iters"]), log=log, device=dev)
         report("stage2")

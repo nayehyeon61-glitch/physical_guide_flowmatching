@@ -20,6 +20,11 @@ Same balanced synthetic data, grid, b_j estimate and scoring as step 6
                                      ensemble-mean pooling), fair energy score + capped physics
                   lat_serial_op_nophys  same operator without the physics term
                   lat_serial_op_band    lat_serial_op with the output projected onto the kept DCT modes
+                  lat_serial_op2        second operator version: trained on a calibration year the base
+                                        never saw, 1->2->3 day rollout curriculum with BPTT, fair energy
+                                        score + lambda_corr ||X_hat - X_tilde||^2 + capped physics,
+                                        latitude padding, DCT band limit
+                  lat_serial_op2_nophys  same without the physics term
 
     python scripts/run_step7_latent.py --out runs/step7 [--quick]
 """
@@ -39,8 +44,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm.coupling import PGCFM, estimate_scales  # noqa: E402
 from pgcfm.data import PGCFMSequenceDataset, kai_data_config  # noqa: E402
 from pgcfm.latent import (DCTFiltered, DeterministicPINN, LatentConfig, LatentPGCFM, encoder_drift,  # noqa: E402
-                          finetune_decoder, floors, member_structure, snapshot, train_serial, train_stage1,
-                          train_stage2)
+                          finetune_decoder, floors, member_structure, range_coverage, snapshot, train_serial,
+                          train_stage1, train_stage2)
 from pgcfm.ens_operator import EnsembleOperator, OperatorCorrected, train_operator  # noqa: E402
 from pgcfm.projection import GradientFlowProjection, freeze  # noqa: E402
 from pgcfm.train import run_phase, take  # noqa: E402
@@ -74,18 +79,22 @@ def main(argv=None):
     p.add_argument("--arms", nargs="+", default=["cfm", "cfm_dct", "cfm_smooth", "pinn_det", "lat_frozen",
                                                   "lat_retrain", "lat_finetune", "lat_nophys", "lat_serial",
                                                   "lat_serial_nophys", "lat_serial_op", "lat_serial_op_nophys",
-                                                  "lat_serial_op_band"])
+                                                  "lat_serial_op_band", "lat_serial_op2", "lat_serial_op2_nophys"])
     p.add_argument("--horizon", type=int, default=10)
     p.add_argument("--n-starts", type=int, default=4)
     p.add_argument("--members", type=int, default=8)
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--carry-highpass", action="store_true",
                    help="decoder output + (x_k - DCT filter(x_k)): unresolved scales persist (W1 fix)")
+    p.add_argument("--iters-op2", type=int, default=200)
+    p.add_argument("--lambda-corr", type=float, default=1.0)
+    p.add_argument("--op2-curriculum", type=int, nargs="+", default=[1, 2, 3])
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
         a.train_years, a.train_days, a.iters_cfm, a.iters_cfm_more = [2001], 12, 2, 1
-        a.iters_stage1, a.iters_stage2, a.iters_dec_ft, a.iters_serial, a.iters_op = 3, 3, 2, 2, 2
+        a.iters_stage1, a.iters_stage2, a.iters_dec_ft, a.iters_serial, a.iters_op, a.iters_op2 = 3, 3, 2, 2, 2, 2
+        a.op2_curriculum = [1, 2]
         a.horizon, a.n_starts, a.members, a.steps, a.n_lat, a.n_lon = 2, 1, 2, 2, 17, 32
         a.k_lat, a.k_lon, a.latent = 4, 8, 8
     os.makedirs(a.out, exist_ok=True)
@@ -108,6 +117,13 @@ def main(argv=None):
     test_batch = torch.utils.data.default_collate([test_ds[5 * i] for i in range(a.n_starts)])
     val_batches = take(torch.utils.data.DataLoader(tpair_ds, batch_size=8), 2)
     all_train = torch.utils.data.default_collate([pair_ds[i] for i in range(len(pair_ds))])
+    # calibration period for the second operator version: never seen by the base chain
+    cal = os.path.join(root, "calib")
+    if not os.path.exists(os.path.join(cal, "2005.nc")):
+        make_balanced(["--out", cal, "--years", "2005", "--days", str(a.train_days), "--n-lat", str(a.n_lat),
+                       "--n-lon", str(a.n_lon), "--seed", "500"])
+    cal_loader = torch.utils.data.DataLoader(
+        PGCFMSequenceDataset(dcfg, cal, horizon=max(a.op2_curriculum)), batch_size=4, shuffle=True, drop_last=True)
 
     cfg = dict(DEFAULTS, model_channels=32, channel_mult=[1, 2, 2], num_res_blocks=1)
     torch.manual_seed(0)
@@ -142,6 +158,7 @@ def main(argv=None):
         r["train_seconds"] = secs
         getattr(transition, "layout", lambda *_: None)(a.members, "repeat")
         r["structure"] = member_structure(transition, val_batches, a.members, a.steps)
+        r["range_coverage"] = range_coverage(transition, val_batches, a.members, a.steps)
         r.update(extra or {})
         res[name] = r
         print(f"[{name}] {secs:.0f}s 1-day", json.dumps({k: round(v, 4) for k, v in r["one_step"].items()
@@ -188,7 +205,8 @@ def main(argv=None):
         return m, secs, lg
 
     latent_arms = arms & {"pinn_det", "lat_frozen", "lat_retrain", "lat_finetune", "lat_serial", "lat_serial_nophys",
-                          "lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band"}
+                          "lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band",
+                          "lat_serial_op2", "lat_serial_op2_nophys"}
     if latent_arms:
         s1, s1_secs, s1_log = stage1(a.lambda_p)
         res["stage1_seconds"], res["stage1_log_last"] = s1_secs, s1_log
@@ -226,9 +244,17 @@ def main(argv=None):
                                              "drift": encoder_drift(m, ref, val_batches)})
 
         serial = None
+        op_arms = {"lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band", "lat_serial_op2",
+                   "lat_serial_op2_nophys"}
+        serial_ck = os.path.join(a.out, "serial.pt")
+        if "lat_serial" not in arms and arms & op_arms and os.path.exists(serial_ck):
+            m = LatentPGCFM(dataclasses.replace(lcfg, coupling="serial"), n_lat, n_lon)
+            st_ = torch.load(serial_ck)
+            m.load_state_dict(st_["latent"])
+            freeze(m)
+            serial = (m, st_["secs"])
         for name in ("lat_serial", "lat_serial_nophys"):
-            if name not in arms and not (name == "lat_serial" and arms & {"lat_serial_op", "lat_serial_op_nophys",
-                                                                     "lat_serial_op_band"}):
+            if name not in arms and not (name == "lat_serial" and arms & op_arms and serial is None):
                 continue
             torch.manual_seed(3)
             m = LatentPGCFM(dataclasses.replace(lcfg, coupling="serial"), n_lat, n_lon)
@@ -243,6 +269,7 @@ def main(argv=None):
                   {"stage2_log_last": {k: float(np.mean([h[k] for h in hist[-50:] if k in h])) for k in hist[-1]}})
             if name == "lat_serial":
                 serial = (m, secs)
+                torch.save({"latent": m.state_dict(), "secs": secs}, serial_ck)
         for name in ("lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band"):
             if name not in arms or serial is None:
                 continue
@@ -254,6 +281,23 @@ def main(argv=None):
             hist = train_operator(w, guide, loader, a.iters_op, steps=a.steps, grad_ratio=a.grad_ratio,
                                   lambda_p=0.0 if name.endswith("nophys") else a.lambda_p,
                                   log_every=max(1, a.iters_op // 6))
+            secs = serial[1] + time.time() - t
+            score(name, w, secs,
+                  {"op_log_last": {k: float(np.mean([h[k] for h in hist[-30:] if k in h])) for k in hist[-1]}})
+        # second version (owner's possibility_operator + design note): calibration period, rollout
+        # curriculum with BPTT, correction-size penalty, latitude padding, DCT band limit
+        for name in ("lat_serial_op2", "lat_serial_op2_nophys"):
+            if name not in arms or serial is None:
+                continue
+            torch.manual_seed(5)
+            w = OperatorCorrected(serial[0], EnsembleOperator(n_modes=(min(12, n_lat // 2), min(12, n_lon // 2)),
+                                                              hidden=16 if a.quick else 64, lat_padding=0.25),
+                                  band=serial[0].dct_x)
+            t = time.time()
+            hist = train_operator(w, guide, cal_loader, a.iters_op2, steps=4, grad_ratio=a.grad_ratio,
+                                  lambda_p=0.0 if name.endswith("nophys") else a.lambda_p,
+                                  curriculum=tuple(a.op2_curriculum), lambda_corr=a.lambda_corr,
+                                  log_every=max(1, a.iters_op2 // 6))
             secs = serial[1] + time.time() - t
             score(name, w, secs,
                   {"op_log_last": {k: float(np.mean([h[k] for h in hist[-30:] if k in h])) for k in hist[-1]}})
