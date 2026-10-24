@@ -73,19 +73,16 @@ def member_condition(x: torch.Tensor, static: torch.Tensor, doy_next: torch.Tens
     return torch.cat([x, static, cal], dim=1)
 
 
-class OperatorCorrected(nn.Module):
-    """base transition (e.g. the serial ``LatentPGCFM``) + ``EnsembleOperator``, with the
-    ``CFMTransition.sample`` interface. The operator pools over members, so it has to know
-    how the flat batch is laid out: ``order="repeat"`` (member-major, ``t.repeat(M)``, as in
-    ``validate_one_step``) or ``"interleave"`` (sample-major, as in ``cfm.rollout``); ``members=1``
-    treats every row as its own one-member ensemble (eps = 0 runs, single draws).
+class MemberGrouped(nn.Module):
+    """A transition that pools over ensemble members, with the ``CFMTransition.sample`` interface.
+    It has to know how the flat batch is laid out: ``order="repeat"`` (member-major,
+    ``t.repeat(M)``, as in ``validate_one_step``) or ``"interleave"`` (sample-major, as in
+    ``cfm.rollout``); ``members=1`` treats every row as its own one-member ensemble (eps = 0 runs,
+    single draws)."""
 
-    ``band``: project the corrected members onto the kept DCT modes, so the FNO cannot put
-    back the grid-scale noise the DCT truncation removed (hard constraint)."""
-
-    def __init__(self, base, op: EnsembleOperator, members: int = 1, order: str = "repeat", band=None):
+    def __init__(self, base, members: int = 1, order: str = "repeat"):
         super().__init__()
-        self.base, self.op, self.band = base, op, band  # band: a latent.DCTTruncation (hard band limit)
+        self.base = base
         self.cfg, self.gen_idx, self.w_area = base.cfg, base.gen_idx, base.w_area
         self.layout(members, order)
 
@@ -93,6 +90,8 @@ class OperatorCorrected(nn.Module):
         if order not in ("repeat", "interleave"):
             raise ValueError(order)
         self.members, self.order = members, order
+        if isinstance(self.base, MemberGrouped):  # stacked ensemble maps share the layout
+            self.base.layout(members, order)
         return self
 
     def _group(self, t: torch.Tensor) -> torch.Tensor:  # (N, ...) -> (B, M, ...)
@@ -103,6 +102,18 @@ class OperatorCorrected(nn.Module):
 
     def _ungroup(self, t: torch.Tensor) -> torch.Tensor:
         return (t.transpose(0, 1) if self.order == "repeat" else t).reshape(-1, *t.shape[2:])
+
+
+class OperatorCorrected(MemberGrouped):
+    """base transition (e.g. the serial ``LatentPGCFM``) + ``EnsembleOperator`` (or any module
+    ``op(U (B,M,C,H,W), cond (B,M,K,H,W)) -> (B,M,C,H,W)`` with a ``gate``).
+
+    ``band``: project the corrected members onto the kept DCT modes, so the FNO cannot put
+    back the grid-scale noise the DCT truncation removed (hard constraint)."""
+
+    def __init__(self, base, op: nn.Module, members: int = 1, order: str = "repeat", band=None):
+        super().__init__(base, members, order)
+        self.op, self.band = op, band  # band: a latent.DCTTruncation (hard band limit)
 
     def correct(self, x, y, static, doy_next):
         if y.shape[0] % self.members:

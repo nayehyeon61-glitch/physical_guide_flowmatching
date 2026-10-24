@@ -175,3 +175,28 @@ python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
 합성 데이터 실험 재현 (CPU, 약 3시간): `python scripts/run_step7_latent.py --out runs/step7`, 과분산 가설 검증: `python scripts/step7_overdispersion.py --out runs/step7_od`.
 
 FNO 앙상블 operator(`pgcfm/ens_operator.py`)는 1일 점수는 좋지만 rollout에서 발산하므로(W6) GPU 학습 스크립트에는 아직 넣지 않았습니다.
+
+## 9. 8단계: 앙상블 분포 보정 (`docs/step8_spread.md`)
+
+8절의 직렬 체크포인트(`latent.pt`, `coupling=serial`)를 그대로 쓰고, 학습 없이 멤버 분포만 보정합니다. 검증 기간(학습에 쓰지 않은 해)의 초기장 절반으로 α를 맞추고, 나머지 절반에서 보정하지 않은 직렬과 비교한 표와 H2 점검(Q 전후 분산, 정역학 접공간/법선 성분)을 출력합니다.
+
+```bash
+# (1) 보정 적합: inflate(α), band(α_b), posthoc(lead별 α_k), tangent_inflate(허용 방향만 α)
+python scripts/fit_spread.py --ckpt runs/latent_serial/latent.pt --valid-dir /path/to/era-data/valid \
+    --stats-dir /path/to/KAI-New/stats --out runs/latent_serial/calib.json --n-ics 32 --ic-stride 7 --members 8
+# 합성 결과의 기본 추천은 tangent_inflate: --mode tangent_inflate 를 붙이면 점수와 상관없이 그것을 씁니다
+# (2) 보정한 예보
+python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --spread runs/latent_serial/calib.json \
+    --test-file /path/to/era-data/test/2020.nc --stats-dir /path/to/KAI-New/stats \
+    --out runs/latent_serial/forecast_calib.nc --leads 10 --members 16 --ic-stride 7
+# (3) 평가: 보정 전후 비교
+python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
+    --forecast "latent serial"=runs/latent_serial/forecast.nc --forecast "serial + calib"=runs/latent_serial/forecast_calib.nc \
+    --climatology runs/clim_1980_2011.nc --out runs/eval/2020_step8
+```
+
+- 로그의 `[score]` 줄이 검증 후반부에서 각 보정의 CRPS / SSR / 정역학 잔차(1·5·10일)입니다. `[H2]` 줄의 `kept_*`가 1보다 작으면 Q가 같은 초기장에서도 분산을 줄이는 것입니다(합성에서는 1.57로 반대).
+- 비용: `tangent_inflate`는 스텝마다 정역학 잔차의 vjp를 층 수만큼(13층이면 12번) 돌립니다. 느리면 `--no-tangent`. GPU 메모리가 부족하면 `--chunk 2`.
+- calib.json의 `candidates`에 다른 보정의 값이 모두 있으므로, `mode`만 바꿔 다시 추론해 볼 수 있습니다.
+
+합성 데이터 실험 재현 (CPU, 약 1.5시간, 7단계 결과 필요): `python scripts/run_step7_latent.py --out runs/step7 --arms lat_serial lat_serial_nophys` 후 `python scripts/run_step8_spread.py --out runs/step8 --step7 runs/step7`.

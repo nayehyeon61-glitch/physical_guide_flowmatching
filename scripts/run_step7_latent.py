@@ -276,7 +276,8 @@ def main(argv=None):
                   {"stage2_log_last": {k: float(np.mean([h[k] for h in hist[-50:] if k in h])) for k in hist[-1]}})
             if name == "lat_serial":
                 serial = (m, secs)
-                torch.save({"latent": m.state_dict(), "secs": secs}, serial_ck)
+            torch.save({"latent": m.state_dict(), "secs": secs},  # step 8 reuses both chains
+                       serial_ck if name == "lat_serial" else os.path.join(a.out, "serial_nophys.pt"))
             if os.path.exists(os.path.join(a.out, f"{name}_train.pt")):
                 os.remove(os.path.join(a.out, f"{name}_train.pt"))
         for name in ("lat_serial_op", "lat_serial_op_nophys", "lat_serial_op_band"):
