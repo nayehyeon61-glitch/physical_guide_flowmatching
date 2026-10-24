@@ -2,9 +2,14 @@
 validation years and write ``calib.json`` for ``infer_pgcfm.py --spread``.
 
 The validation initial states are split in two: the first half fits every map (scalar inflation,
-DCT band inflation, per-lead post-hoc scale; tangent-space inflation reuses the scalar), the second
-half scores them all against the uncalibrated serial chain (CRPS, SSR, range coverage, hydrostatic
-residual per lead). The best map on the second half is written unless ``--mode`` picks one.
+DCT band inflation, per-lead post-hoc scale; tangent-space inflation reuses the scalar; step 9's
+classical channel-wise post-hoc scales s_c and s_kc, s_c restricted to the hydrostatic tangent
+space, and ``mbm``: a least-squares mean correction a_kc + b_kc mu with s_kc refitted, the
+member-by-member method of Van Schaeybroeck and Vannitsem (2015), plus its tangent version), the
+second half scores them all against the uncalibrated serial chain (CRPS, SSR, range coverage,
+hydrostatic residual per lead). Selection uses ``--criterion`` (default: empirical CRPS,
+docs/step9_structure.md; step 8 used the fair CRPS, which over-disperses a rescaled ensemble).
+The best map on the second half is written unless ``--mode`` picks one.
 It also prints the H2 check (variance before/after Q, hydrostatic tangent vs normal part).
 
     python scripts/fit_spread.py --ckpt runs/latent/latent.pt --valid-dir data/valid \
@@ -28,6 +33,7 @@ from pgcfm.physics.primitive import ResidualScales  # noqa: E402
 from pgcfm.projection import freeze  # noqa: E402
 from pgcfm.spread import (KEEP, DCTBands, EnsembleCalibrated, contraction_report, ensemble_scores,  # noqa: E402
                           fit_bands, fit_posthoc, fit_scalar, posthoc_scale)
+from pgcfm.structure import LinearMeanCalibrator, SpreadCalibrator, lead_crps, tangent_calibrated  # noqa: E402
 from scripts.run_step4_pgcfm import member_residuals  # noqa: E402
 from scripts.train_pgcfm import build  # noqa: E402
 
@@ -64,9 +70,13 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--chunk", type=int, default=4, help="initial states per rollout batch (GPU memory)")
     p.add_argument("--n-bands", type=int, default=3)
-    p.add_argument("--mode", choices=["inflate", "band", "posthoc", "tangent_inflate"],
+    p.add_argument("--mode", choices=["inflate", "band", "posthoc", "tangent_inflate", "classical", "classical_lead",
+                                      "classical_tan", "mbm", "mbm_tan"],
                    help="write this map instead of the best one on the scoring half")
-    p.add_argument("--no-tangent", action="store_true", help="skip tangent_inflate (12 vjps per step)")
+    p.add_argument("--no-tangent", action="store_true",
+                   help="skip tangent_inflate and classical_tan (12 vjps per step)")
+    p.add_argument("--criterion", choices=["empirical", "fair"], default="empirical",
+                   help="CRPS estimator for every fit and for picking the written map")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args(argv)
     dev = torch.device(a.device)
@@ -97,7 +107,7 @@ def main(argv=None):
         return out
 
     def mean_crps(tr):
-        e = [ensemble_scores(ens.transpose(0, 1)[..., KEEP, :, :], b["targets"][..., KEEP, :, :])["lead_crps"]
+        e = [lead_crps(ens.transpose(0, 1)[..., KEEP, :, :], b["targets"][..., KEEP, :, :], a.criterion)
              for ens, b in roll(tr, fit_ids)]
         return float(np.mean(e))
 
@@ -114,33 +124,55 @@ def main(argv=None):
     fit_ens = roll(wrap("serial"), fit_ids)
     ens_all = torch.cat([e for e, _ in fit_ens])[..., KEEP, :, :]
     obs_all = torch.cat([b["targets"] for _, b in fit_ens])[..., KEEP, :, :]
-    fits["posthoc"] = {"mode": "posthoc", "alpha_per_lead": fit_posthoc(ens_all, obs_all)}
+    fits["posthoc"] = {"mode": "posthoc", "alpha_per_lead": fit_posthoc(ens_all, obs_all, criterion=a.criterion)}
     print("[fit] posthoc", [round(v, 2) for v in fits["posthoc"]["alpha_per_lead"]], flush=True)
+    full_ens = torch.cat([e for e, _ in fit_ens]).cpu()
+    full_obs = torch.cat([b["targets"] for _, b in fit_ens]).cpu()
+    for name, per_lead in (("classical", False), ("classical_lead", True)):
+        cal = SpreadCalibrator(full_ens.shape[3], per_lead=per_lead, leads=a.leads)
+        info = cal.fit_validation(full_ens, full_obs, criterion=a.criterion)
+        fits[name] = {"mode": name, "scales": cal.scales.tolist(), "edge": info["edge"]}
+        print(f"[fit] {name} scales range {cal.scales.min():.2f}..{cal.scales.max():.2f}, {info['edge']} on the "
+              "grid edge", flush=True)
+    mos = LinearMeanCalibrator(full_ens.shape[3], a.leads).fit_validation(full_ens, full_obs)
+    cal = SpreadCalibrator(full_ens.shape[3], per_lead=True, leads=a.leads)
+    info = cal.fit_validation(mos(full_ens), full_obs, criterion=a.criterion)
+    fits["mbm"] = {"mode": "mbm", "scales": cal.scales.tolist(), "mos_a": mos.a.tolist(), "mos_b": mos.b.tolist(),
+                   "edge": info["edge"]}
+    print(f"[fit] mbm b range {mos.b.min():.2f}..{mos.b.max():.2f}", flush=True)
+    del full_ens, full_obs
     if not a.no_tangent:
         fits["tangent_inflate"] = {"mode": "tangent_inflate", "alpha": alpha}
+        fits["classical_tan"] = dict(fits["classical"], mode="classical_tan")
+        fits["mbm_tan"] = dict(fits["mbm"], mode="mbm_tan")
 
     gm = SimpleNamespace(guide=guide)
 
     def evaluate(tr, ens_map=None):
         parts = []
         for ens, b in roll(tr, score_ids):
-            ens = ens_map(ens) if ens_map is not None else ens
-            r = ensemble_scores(ens.transpose(0, 1)[..., KEEP, :, :], b["targets"][..., KEEP, :, :])
+            ens = ens_map(ens, b) if ens_map is not None else ens
+            e, o = ens.transpose(0, 1)[..., KEEP, :, :], b["targets"][..., KEEP, :, :]
+            r = ensemble_scores(e, o)
+            r["lead_crps_emp"] = lead_crps(e, o)
             with torch.no_grad():
                 r["hyd"] = member_residuals(gm, b["x0"], ens, b["static"], b["doy"])["hyd"]
             parts.append(r)
-        keys = ("lead_crps", "lead_ssr", "lead_coverage", "hyd")
+        keys = ("lead_crps", "lead_crps_emp", "lead_ssr", "lead_coverage", "hyd")
         return {k: np.mean([q[k] for q in parts], axis=0).tolist() for k in keys}
 
     table = {"serial": evaluate(wrap("serial"))}
     for name, f in fits.items():
         if name == "posthoc":
-            table[name] = evaluate(wrap("serial"), lambda e: posthoc_scale(e, f["alpha_per_lead"]))
+            table[name] = evaluate(wrap("serial"), lambda e, b: posthoc_scale(e, f["alpha_per_lead"]))
+        elif name.startswith(("classical", "mbm")):
+            table[name] = evaluate(wrap("serial"), lambda e, b: classical_map(f, e, b, guide))
         else:
             table[name] = evaluate(wrap(f["mode"], alpha=f.get("alpha", 1.0), band_alpha=f.get("band_alpha")))
     leads = sorted({0, min(4, a.leads - 1), a.leads - 1})  # day 1 / 5 / last
     for name, r in table.items():
-        print(f"[score] {name:16s} CRPS mean {np.mean(r['lead_crps']):.4f} | days {[i + 1 for i in leads]} CRPS "
+        print(f"[score] {name:16s} CRPS mean {np.mean(r['lead_crps']):.4f} (empirical "
+              f"{np.mean(r['lead_crps_emp']):.4f}) | days {[i + 1 for i in leads]} CRPS "
               + " / ".join(f"{r['lead_crps'][i]:.3f}" for i in leads) + " SSR "
               + " / ".join(f"{r['lead_ssr'][i]:.2f}" for i in leads) + " hyd "
               + " / ".join(f"{r['hyd'][i]:.2f}" for i in leads), flush=True)
@@ -149,13 +181,31 @@ def main(argv=None):
     h2 = contraction_report(m, guide, one, a.members, a.steps)
     print("[H2]", json.dumps({k: round(v, 5) for k, v in h2.items()}), flush=True)
 
-    choice = a.mode or min(fits, key=lambda n: np.mean(table[n]["lead_crps"]))
+    key = "lead_crps_emp" if a.criterion == "empirical" else "lead_crps"
+    choice = a.mode or min(fits, key=lambda n: np.mean(table[n][key]))
     calib = dict(fits[choice], fitted_on=a.valid_dir, n_fit_ics=len(fit_ids), members=a.members,
                  scores=table, contraction=h2, candidates=fits)
     with open(a.out, "w") as f:
         json.dump(calib, f, indent=1)
     print(f"wrote {a.out}: mode {choice}", flush=True)
     return calib
+
+
+def classical_map(f, ens, b, guide):
+    """Step 9 post-hoc classical calibration of a finished rollout ens (B, M, K, 66, H, W) from a
+    calib.json entry; ``*_tan`` keeps only the hydrostatic tangent part of the change."""
+    cal = SpreadCalibrator(ens.shape[3], per_lead=f["mode"] in ("classical_lead", "mbm", "mbm_tan"),
+                           leads=len(f["scales"]))
+    cal.scales = torch.tensor(f["scales"], dtype=ens.dtype, device=ens.device)
+    if f["mode"].startswith("mbm"):
+        mos = LinearMeanCalibrator(ens.shape[3], len(f["mos_a"]))
+        mos.a, mos.b = (torch.tensor(f[k], dtype=ens.dtype, device=ens.device) for k in ("mos_a", "mos_b"))
+        out = cal(mos(ens))
+    else:
+        out = cal(ens)
+    if f["mode"].endswith("_tan"):
+        out = tangent_calibrated(ens, out, guide, b["x0"], b["static"], b["doy"])
+    return out
 
 
 def take_one_step(ds, a, dev, n=2):

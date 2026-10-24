@@ -131,13 +131,15 @@ class OperatorCorrected(MemberGrouped):
 def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, members: int = 4, lr: float = 1e-3,
                    lambda_p: float = 0.1, grad_ratio: float = 0.5, steps: int = 8, curriculum=(1,),
                    lambda_corr: float = 0.0, bptt: bool = True, log_every: int = 50, log=print,
-                   device="cpu", ckpt: Optional[str] = None, ckpt_every: int = 20) -> List[Dict[str, float]]:
+                   device="cpu", ckpt: Optional[str] = None, ckpt_every: int = 20,
+                   lambda_grad: float = 0.0) -> List[Dict[str, float]]:
     """Operator only; the base chain (encoder, CFM, PINNs, decoder) is frozen.
 
     Loss per lead k of an unrolled member-wise rollout (horizon from ``curriculum``, as in
     step 6 / the owner's possibility_operator ``rollout_steps``):
         fair energy score(corrected members, truth)
       + lambda_corr x mean ||X_hat^m - X_tilde^m||^2 (correction size, owner's note)
+      + lambda_grad x fair energy score of the spatial differences (step 9: spatial structure)
       + lambda_P x primitive-equation residual of each corrected member transition (capped).
     Corrected members are fed back as the next initial state; with ``bptt`` the gradient
     crosses the whole rollout (through the frozen base, w.r.t. its inputs). ``curriculum=(1,)``
@@ -146,6 +148,7 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
     ``latent.train_serial``.
     """
     from .projection import curriculum_horizon, ProjectionConfig
+    from .structure import spatial_diff
     from .train import _cycle, _to
     _set_trainable([wrapped.base], False)
     _set_trainable([wrapped.op], True)
@@ -168,7 +171,7 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
         K = min(curriculum_horizon(pc, it, iters), tg.shape[1])
         rep = lambda t: t.repeat(members, *([1] * (t.dim() - 1)))  # noqa: E731
         xs, sts = rep(x0), rep(st)
-        es_l, corr_l, phys_l = [], [], []
+        es_l, corr_l, phys_l, gr_l = [], [], [], []
         for k in range(K):
             y, dn = tg[:, k], rep(d[:, k + 1])
             with torch.set_grad_enabled(bptt and k > 0):
@@ -176,6 +179,9 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
             out = wrapped.correct(xs, u, sts, dn)
             es_l.append(energy_score(out.view(members, *x0.shape)[:, :, keep], y[:, keep], wrapped.w_area))
             corr_l.append(((out - u) ** 2 * wrapped.w_area).mean())
+            if lambda_grad > 0:
+                gr_l.append(energy_score(spatial_diff(out.view(members, *x0.shape)[:, :, keep]),
+                                         spatial_diff(y[:, keep]), wrapped.w_area))
             if use_phys:
                 R, _ = guide.residuals(xs, out, sts, rep(d[:, k]), use_bridge=False, use_closure=False)
                 prev = x0 if k == 0 else tg[:, k - 1]
@@ -184,6 +190,10 @@ def train_operator(wrapped: OperatorCorrected, guide, loader, iters: int, member
         es, corr = torch.stack(es_l).mean(), torch.stack(corr_l).mean()
         terms = {"data": es + lambda_corr * corr}
         logs = {"es": es.item(), "corr": corr.item(), "gate": wrapped.op.gate.item(), "horizon": K}
+        if gr_l:
+            gr = torch.stack(gr_l).mean()
+            terms["data"] = terms["data"] + lambda_grad * gr
+            logs["es_grad"] = gr.item()
         if use_phys:
             terms["phys"] = torch.stack(phys_l).mean()
             logs["phys"] = terms["phys"].item()

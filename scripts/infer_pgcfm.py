@@ -100,7 +100,9 @@ def main(argv=None):
         calib = json.load(open(a.spread)) if a.spread else None
         if calib is not None:  # editing "mode" in calib.json picks another fitted candidate
             calib.update(calib.get("candidates", {}).get(calib["mode"], {}))
-        if calib is not None and calib["mode"] != "posthoc":  # step 8: calibrated members are fed back
+        # applied after the rollout
+        posthoc = ("posthoc", "classical", "classical_lead", "classical_tan", "mbm", "mbm_tan")
+        if calib is not None and calib["mode"] not in posthoc:  # step 8: calibrated members are fed back
             from pgcfm.spread import DCTBands, EnsembleCalibrated
             c = model.cfm.cfg
             model.cfm = EnsembleCalibrated(model.cfm, calib["mode"], guide=model.guide, alpha=calib.get("alpha", 1.0),
@@ -127,6 +129,11 @@ def main(argv=None):
             if calib is not None and calib["mode"] == "posthoc":
                 from pgcfm.spread import posthoc_scale
                 ens = posthoc_scale(ens[None], calib["alpha_per_lead"][:K])[0]
+            elif calib is not None and calib["mode"] in posthoc:  # step 9 classical channel scales / MBM
+                from scripts.fit_spread import classical_map
+                b = {"x0": dyn[None, 0], "static": static, "doy": doy}
+                with torch.no_grad():
+                    ens = classical_map(calib, ens[None], b, model.guide)[0]
             lay(1)
             full = assemble_full_state(ens, static[0]).cpu().numpy()
             ic = assemble_full_state(dyn[0], static[0]).cpu().numpy()

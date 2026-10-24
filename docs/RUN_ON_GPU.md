@@ -200,3 +200,24 @@ python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
 - calib.json의 `candidates`에 다른 보정의 값이 모두 있으므로, `mode`만 바꿔 다시 추론해 볼 수 있습니다.
 
 합성 데이터 실험 재현 (CPU, 약 1.5시간, 7단계 결과 필요): `python scripts/run_step7_latent.py --out runs/step7 --arms lat_serial lat_serial_nophys` 후 `python scripts/run_step8_spread.py --out runs/step8 --step7 runs/step7`.
+
+## 10. 9단계: classical 분산 보정 사다리 (`docs/step9_structure.md`)
+
+9절과 같은 `fit_spread.py`가 이제 classical 보정도 함께 맞춥니다. 선택 기준의 기본값이 empirical CRPS로 바뀌었습니다(재보정된 멤버에는 fair CRPS가 과대분산을 고르기 때문). 추가된 후보는 `classical`(채널별 s_c), `classical_lead`(lead·채널별 s_kc), `classical_tan`(s_c의 변화를 정역학 접공간에 사영), `mbm`(lead·채널별 선형 평균 보정 a + b·μ와 s_kc), `mbm_tan`(mbm의 변화를 접공간에 사영)입니다. 모두 rollout이 끝난 뒤 적용합니다.
+
+```bash
+# (1) 적합: 8단계 후보 + classical 사다리, empirical CRPS 기준
+python scripts/fit_spread.py --ckpt runs/latent_serial/latent.pt --valid-dir /path/to/era-data/valid \
+    --stats-dir /path/to/KAI-New/stats --out runs/latent_serial/calib.json --n-ics 32 --ic-stride 7 --members 8
+# 합성 결과의 추천: 물리 정합성까지 지키려면 --mode mbm_tan (또는 classical_tan)
+# (2) 보정한 예보: calib.json의 mode만 바꿔 다른 후보도 바로 추론 가능
+python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --spread runs/latent_serial/calib.json \
+    --test-file /path/to/era-data/test/2020.nc --stats-dir /path/to/KAI-New/stats \
+    --out runs/latent_serial/forecast_mbm.nc --leads 10 --members 16 --ic-stride 7
+```
+
+- `[score]` 줄의 `empirical` 값으로 비교하세요. `[fit] classical ... on the grid edge`가 0이 아니면 후보(0.5~6.0) 밖이 최적인 채널이 있다는 뜻입니다.
+- `mbm`의 평균 보정은 lead별로 맞추므로 추론의 `--leads`가 적합한 `--leads`보다 길면 안 됩니다.
+- 비용: `*_tan`은 lead마다 정역학 vjp 12번(`--no-tangent`로 끔).
+
+합성 데이터 실험 재현 (CPU, 약 4시간, 7·8단계 결과 필요): `python scripts/run_step9_structure.py --out runs/step9 --step7 runs/step7`.

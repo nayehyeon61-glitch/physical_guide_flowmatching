@@ -307,16 +307,18 @@ def fit_bands(crps_of, alpha0: float, n_bands: int, factors: Sequence[float] = (
     return best_a, trace
 
 
-def fit_posthoc(ens: torch.Tensor, obs: torch.Tensor, grid=None):
+def fit_posthoc(ens: torch.Tensor, obs: torch.Tensor, grid=None, criterion: str = "fair"):
     """Per-lead alpha_k for scaling a finished rollout. ens (B,M,K,C,H,W), obs (B,K,C,H,W),
-    TISR already dropped."""
+    TISR already dropped. ``criterion="empirical"`` selects by the empirical CRPS, which is the
+    right one for a rescaled ensemble (step 9, ``structure.SpreadCalibrator``)."""
+    from .structure import lead_crps
     grid = grid if grid is not None else [1.0 + 0.1 * i for i in range(51)]
     alphas = []
     for k in range(ens.shape[2]):
         e = ens[:, :, k].transpose(0, 1)
         mu = e.mean(0, keepdim=True)
         o = obs[:, k:k + 1]
-        s = {al: float(metrics.crps((mu + al * (e - mu))[:, :, None], o).mean()) for al in grid}
+        s = {al: lead_crps((mu + al * (e - mu))[:, :, None], o, criterion)[0] for al in grid}
         alphas.append(float(min(s, key=s.get)))
     return alphas
 

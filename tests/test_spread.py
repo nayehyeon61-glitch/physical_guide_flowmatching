@@ -69,8 +69,10 @@ def test_fit_spread_and_infer_scripts(tmp_path):
                  "--out", f"{d}/calib.json", "--n-ics", "4", "--ic-stride", "1", "--leads", "2", "--members", "2",
                  "--steps", "1", "--chunk", "2", "--mode", "band", "--device", "cpu"])
     assert calib["mode"] == "band" and len(calib["band_alpha"]) == 3
-    assert set(calib["scores"]) == {"serial", "inflate", "band", "posthoc", "tangent_inflate"}
-    for mode in ("band", "posthoc"):
+    assert set(calib["scores"]) == {"serial", "inflate", "band", "posthoc", "tangent_inflate", "classical",
+                                    "classical_lead", "classical_tan", "mbm", "mbm_tan"}
+    assert len(calib["candidates"]["classical"]["scales"][0]) == 66
+    for mode in ("band", "posthoc", "classical_tan", "mbm_tan"):
         c = dict(json.load(open(f"{d}/calib.json")), mode=mode)
         json.dump(c, open(f"{d}/c_{mode}.json", "w"))
         infer(["--ckpt", f"{d}/run/latent.pt", "--test-file", f"{d}/valid/2012.nc", "--stats-dir", f"{d}/train/stats",
