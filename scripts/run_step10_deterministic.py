@@ -195,8 +195,14 @@ def main(argv=None):
     def split(names, seed):
         """Rollouts of every daily IC of the split's periods, cached (members in float16)."""
         path = os.path.join(a.out, f"ens_{'+'.join(names)}.pt")
+        sig = {"step7": os.path.abspath(a.step7), "members": a.members, "steps": a.steps, "horizon": a.horizon,
+               "days": a.days, "seed": seed}
         if os.path.exists(path) and not a.force:
-            return torch.load(path)
+            out = torch.load(path)
+            if out.get("sig") != sig:  # never score a rollout made with other settings under this run's args
+                raise SystemExit(f"{path} was made with {out.get('sig')}, this run asks for {sig}; "
+                                 "use another --out or --force")
+            return out
         items = []
         for n in names:
             ds = PGCFMSequenceDataset(dcfg, dirs[n], horizon=a.horizon, train=False)
@@ -208,7 +214,7 @@ def main(argv=None):
             for i in range(0, len(items), 8):
                 ens.append(rollout(chain, b["x0"][i:i + 8], b["static"][i:i + 8], b["doy"][i:i + 8], a.members,
                                    steps=a.steps, seed=seed + i).half())
-        out = {"ens": torch.cat(ens), "targets": b["targets"], "x0": b["x0"], "static": b["static"], "doy": b["doy"]}
+        out = {"sig": sig, "ens": torch.cat(ens), "targets": b["targets"], "x0": b["x0"], "static": b["static"], "doy": b["doy"]}
         torch.save(out, path)
         print(f"[data] {names}: {len(items)} ICs, rollout {time.time() - t:.0f}s", flush=True)
         return out
@@ -365,7 +371,7 @@ def main(argv=None):
 
     res_path = os.path.join(a.out, "results.json")
     res = json.load(open(res_path)) if os.path.exists(res_path) and not a.force else {}
-    res["args"] = vars(a)
+    res.setdefault("runs", []).append(vars(a))  # every invocation; each arm also keeps its own args
     res["n_ics"] = {k: int(v["x0"].shape[0]) for k, v in S.items()}
     res["mbm_coef"] = {"a": mbm.a.tolist(), "b": mbm.b.tolist()}
 
@@ -398,7 +404,7 @@ def main(argv=None):
             te_ens = tensors(d, shift_of(name))
             pred = full(d, predict(model, name, d, te_ens), mu_test)
             res[name] = scores(pred, d)
-            res[name]["info"] = info
+            res[name]["info"], res[name]["args"] = info, vars(a)
             if name.startswith("member_chain"):  # do the corrected members still form an ensemble?
                 with torch.no_grad():
                     sp_in, sp_out = [], []
@@ -414,6 +420,7 @@ def main(argv=None):
             # the whole change from the raw mean (MBM + correction) projected on the hydrostatic tangent space
             tan = tangent_calibrated(mu_test[:, None], pred[:, None], guide, d["x0"], d["static"], d["doy"])[:, 0]
             res[f"{name}_tan"] = scores(tan, d)
+            res[f"{name}_tan"]["args"] = vars(a)
             report(f"{name}_tan")
         else:
             if name in res and not a.force:
@@ -424,6 +431,7 @@ def main(argv=None):
             else:
                 pred = classical(name, ens_test, d["x0"])
             res[name] = scores(pred, d)
+            res[name]["args"] = vars(a)
             report(name)
         save()
     return res

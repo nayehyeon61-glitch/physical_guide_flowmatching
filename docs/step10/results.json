@@ -1,27 +1,4 @@
 {
- "args": {
-  "out": "runs/step10",
-  "step7": "runs/step7",
-  "arms": [
-   "member_chain_mw"
-  ],
-  "members": 8,
-  "steps": 8,
-  "horizon": 10,
-  "days": [
-   90,
-   60,
-   40,
-   60
-  ],
-  "epochs": 8,
-  "batch": 8,
-  "lr": 0.001,
-  "width": 32,
-  "modes": 8,
-  "force": false,
-  "quick": false
- },
  "n_ics": {
   "op_train": 160,
   "cal": 50,
@@ -1800,7 +1777,27 @@
    1.0529126983883326,
    1.025671400585006,
    1.006483167599578
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "bias": {
   "lead_rmse": [
@@ -1998,7 +1995,27 @@
    1.0512516782129502,
    1.022084113848951,
    1.0002315543855322
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "bias_grid": {
   "lead_rmse": [
@@ -2196,7 +2213,27 @@
    0.9964359327282635,
    0.9585592516537377,
    0.9220540069288776
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "mbm": {
   "lead_rmse": [
@@ -2394,7 +2431,27 @@
    5.415336735175859,
    5.927185276859017,
    6.529410009755762
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "mbm_tan": {
   "lead_rmse": [
@@ -2592,7 +2649,27 @@
    1.0549260750212317,
    1.0277483533590455,
    1.0081640863012957
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "mbm_cnn": {
   "lead_rmse": [
@@ -2922,6 +2999,26 @@
    "best_val_mse": 1.3194098472595215,
    "n_params": 191105,
    "train_seconds": 302.8036267757416
+  },
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
   }
  },
  "mbm_cnn_tan": {
@@ -3120,7 +3217,27 @@
    1.0904802448259752,
    1.0581318027026425,
    1.0324065537311666
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "mbm_fno_mean": {
   "lead_rmse": [
@@ -3450,6 +3567,26 @@
    "best_val_mse": 1.2780017852783203,
    "n_params": 206369,
    "train_seconds": 745.8226647377014
+  },
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
   }
  },
  "mbm_fno_mean_tan": {
@@ -3648,7 +3785,27 @@
    1.0933366678949223,
    1.0679678812344433,
    1.0423400143202632
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "mbm_fno_ens": {
   "lead_rmse": [
@@ -3978,6 +4135,26 @@
    "best_val_mse": 1.2796097993850708,
    "n_params": 206369,
    "train_seconds": 592.7304847240448
+  },
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
   }
  },
  "mbm_fno_ens_tan": {
@@ -4176,7 +4353,27 @@
    1.0985261397946775,
    1.0742642560972282,
    1.045401063819042
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "fno_ens": {
   "lead_rmse": [
@@ -4506,6 +4703,26 @@
    "best_val_mse": 1.434143304824829,
    "n_params": 206369,
    "train_seconds": 597.9298760890961
+  },
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
   }
  },
  "fno_ens_tan": {
@@ -4704,7 +4921,27 @@
    1.0536806216798875,
    1.0262362012353698,
    1.0067355479301112
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25
+  }
  },
  "mbmx": {
   "lead_rmse": [
@@ -4902,7 +5139,27 @@
    6.815158744968646,
    7.203922284019694,
    7.599620875993171
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "member_mbm": {
   "lead_rmse": [
@@ -5100,7 +5357,27 @@
    2.3135363903725144,
    2.319301624909786,
    2.356518189942497
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "mbmx_cnn": {
   "lead_rmse": [
@@ -5345,6 +5622,26 @@
    "best_val_mse": 1.1880830526351929,
    "n_params": 191105,
    "train_seconds": 47.034281730651855
+  },
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
   }
  },
  "mbmx_cnn_tan": {
@@ -5543,7 +5840,27 @@
    1.4074106087679517,
    1.3581763504146889,
    1.3083620775554716
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "mbmx_fno_ens": {
   "lead_rmse": [
@@ -5788,6 +6105,26 @@
    "best_val_mse": 1.1726417541503906,
    "n_params": 206369,
    "train_seconds": 198.08626675605774
+  },
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
   }
  },
  "mbmx_fno_ens_tan": {
@@ -5986,7 +6323,27 @@
    1.4226785617480004,
    1.3776966980010337,
    1.3338969187469392
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "member_chain": {
   "lead_rmse": [
@@ -6255,7 +6612,27 @@
    0.05054113641381264,
    0.053536877036094666,
    0.057151004672050476
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "member_chain_tan": {
   "lead_rmse": [
@@ -6453,7 +6830,27 @@
    1.0644926005851167,
    1.0349347712678096,
    1.01334015091354
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "member_chain_mw": {
   "lead_rmse": [
@@ -6722,7 +7119,27 @@
    0.04801324009895325,
    0.04992707818746567,
    0.052570272237062454
-  ]
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
  },
  "member_chain_mw_tan": {
   "lead_rmse": [
@@ -6920,6 +7337,88 @@
    1.0642460114743344,
    1.0349506519618097,
    1.0133711518477282
-  ]
- }
+  ],
+  "args": {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8
+  }
+ },
+ "runs": [
+  {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 25,
+   "arms": [
+    "mean",
+    "bias",
+    "bias_grid",
+    "mbm",
+    "mbm_tan",
+    "mbm_cnn",
+    "mbm_fno_mean",
+    "mbm_fno_ens",
+    "fno_ens",
+    "member_mbm"
+   ]
+  },
+  {
+   "out": "runs/step10",
+   "step7": "runs/step7",
+   "members": 8,
+   "steps": 8,
+   "horizon": 10,
+   "days": [
+    90,
+    60,
+    40,
+    60
+   ],
+   "batch": 8,
+   "lr": 0.001,
+   "width": 32,
+   "modes": 8,
+   "force": false,
+   "quick": false,
+   "epochs": 8,
+   "arms": [
+    "mbmx",
+    "member_mbm",
+    "mbmx_cnn",
+    "mbmx_fno_ens",
+    "member_chain",
+    "member_chain_mw"
+   ]
+  }
+ ]
 }
