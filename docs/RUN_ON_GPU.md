@@ -7,12 +7,23 @@
 ```bash
 git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
 cd physical_guide_flowmatching
-git checkout claude/project-thread-bessib     # 1–5단계 PR이 모두 합쳐진 통합 브랜치 (6단계는 claude/project-thread-z37s9z)
+git checkout claude/project-thread-d5l3lg     # 1–7단계가 모두 들어 있는 최신 브랜치 (4단계 통합만: claude/project-thread-bessib)
 pip install -r requirements.txt               # torch는 서버 CUDA에 맞는 wheel을 먼저 설치
 python -m pytest -q                           # CPU에서 수 분, 전부 통과해야 함
 ```
 
-PR을 main에 합칠 때 순서는 #1(데이터 계약) → #2, #3, #4, #5(서로 독립, 모두 #1 위) → 이 PR(4단계 통합)입니다. 이 브랜치에는 이미 #1–#5가 merge되어 있으므로, 순서대로 merge하면 이 PR의 diff는 4단계 파일만 남습니다.
+PR을 main에 합칠 때 순서는 #1(데이터 계약) → #2, #3, #4, #5(서로 독립, 모두 #1 위) → #6(4단계 통합) → #7(6단계 사영) → 7단계 PR(DCT latent)입니다. 각 PR은 앞 PR 브랜치 위에 쌓여 있으므로, 순서대로 merge하면 각 PR의 diff에는 그 단계 파일만 남습니다.
+
+| 단계 | PR | 브랜치 | 내용 |
+|---|---|---|---|
+| 1 | #1 | claude/project-thread-owgdcu | KAI ERA5 데이터 계약 (66+1채널, 정규화, 연도별 .nc) |
+| — | #2 | claude/project-thread-n5vc19 | climate_diffusion 교훈 문서 |
+| 3 | #3 | claude/project-thread-smm6qt | NeuralGCM 4식 PINN 잔차, 극점 처리 |
+| 2 | #4 | claude/project-thread-cbs0gw | CFM 단독 앙상블 (torchcfm) |
+| 5 | #5 | claude/project-thread-0d48hq | NeuralGCM/WB2 평가 스위트 |
+| 4 | #6 | claude/project-thread-bessib | CFM + PINN 결합 PG-CFM, GPU 학습 스크립트 |
+| 6 | #7 | claude/project-thread-z37s9z | PINN 고정 → ODE 사영 → rollout 시퀀스 손실 |
+| 7 | 이 PR | claude/project-thread-d5l3lg | DCT latent: encoder→PINN→decoder, 병렬/직렬 CFM, FNO 앙상블 operator |
 
 ## 1. 경로 설정
 
@@ -131,3 +142,82 @@ python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
 ```
 
 확인할 것: (1) 사영 후 1일 SSR이 1에 가까워지는지와 함께 멤버 진폭·스펙트럼이 진실보다 작아지지 않는지(압축이 진폭 축소로 가는지), (2) `proj +PINN`이 `proj +smooth`보다 물리 균형 진단(정역학·지균)에서 나은지, (3) 5일 이후 lead에서 curriculum 밖(5일 초과)으로도 안정한지.
+
+## 8. 7단계: DCT latent PG-CFM (`docs/step7_latent.md`)
+
+DCT encoder → latent PINN → IDCT decoder를 먼저 학습하고(stage 1, PINN 고정), 그 latent에서 CFM을 학습합니다(stage 2, encoder/decoder 고정). 기본값은 합성 실험에서 가장 좋았던 **직렬** 결합입니다: CFM이 멤버 A, B, C…를 만들고, 학습 가능한 PINN Q가 멤버마다 보정한 뒤 decoder로 갑니다.
+
+```bash
+pip install torch-dct==0.1.6 neuraloperator   # requirements.txt에 추가됨
+# (a) 직렬 (기본): stage 1 → CFM + 멤버별 PINN 동시 학습
+python scripts/train_latent.py --config configs/latent_era5.yaml --out runs/latent_serial
+# (b) 병렬 비교군: 같은 stage 1을 재사용, P(z_k) + CFM, encoder/decoder 고정
+mkdir -p runs/latent_anchor && cp runs/latent_serial/stage1.pt runs/latent_anchor/
+python scripts/train_latent.py --config configs/latent_era5.yaml --out runs/latent_anchor --resume --set coupling=anchor
+# (c) physics 없는 직렬 (stage 1·2 모두 λ_P = 0: PINN 항이 무엇을 더하는지)
+python scripts/train_latent.py --config configs/latent_era5.yaml --out runs/latent_serial_nophys --set lambda_p=0
+```
+
+- (b)의 stage1.pt 재사용은 `coupling`만 다른 같은 설정일 때만 됩니다(직렬 PINN Q의 가중치는 stage 1에 없으므로 `--resume`이 encoder/decoder/PINN만 읽음). 문제가 생기면 (b)를 처음부터 돌리세요.
+- **stage 1이 끝나면 먼저 로그의 `[stage1] floors`를 보세요.** `rmse_ae`가 `tendency_rms`보다 크면(합성에서 1.4–1.5배) 그 latent로는 persistence를 이길 수 없습니다. 이 경우 `k_lat/k_lon`, `latent`, `enc_hidden`을 키우거나 데이터를 늘리세요(W1, W2).
+- 메모리: encoder 첫 층은 66 × k_lat × k_lon 입력입니다(기본 24×48 → 76k × 1024). 직렬은 Heun `serial_steps`번을 역전파합니다. OOM이면 `serial_steps=2`, `batch=4`.
+- 추론·평가는 4·5절과 같습니다(`latent.pt`를 넣으면 자동으로 latent 경로):
+
+```bash
+python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --test-file /path/to/era-data/test/2020.nc \
+    --stats-dir /path/to/KAI-New/stats --out runs/latent_serial/forecast.nc --leads 10 --members 16 --ic-stride 7 --det
+python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
+    --forecast CFM=runs/cfm/forecast.nc --forecast "latent serial"=runs/latent_serial/forecast.nc \
+    --forecast "latent anchor"=runs/latent_anchor/forecast.nc --forecast "serial no phys"=runs/latent_serial_nophys/forecast.nc \
+    --climatology runs/clim_1980_2011.nc --out runs/eval/2020_step7
+```
+
+합성 데이터 실험 재현 (CPU, 약 3시간): `python scripts/run_step7_latent.py --out runs/step7`, 과분산 가설 검증: `python scripts/step7_overdispersion.py --out runs/step7_od`.
+
+FNO 앙상블 operator(`pgcfm/ens_operator.py`)는 1일 점수는 좋지만 rollout에서 발산하므로(W6) GPU 학습 스크립트에는 아직 넣지 않았습니다.
+
+## 9. 8단계: 앙상블 분포 보정 (`docs/step8_spread.md`)
+
+8절의 직렬 체크포인트(`latent.pt`, `coupling=serial`)를 그대로 쓰고, 학습 없이 멤버 분포만 보정합니다. 검증 기간(학습에 쓰지 않은 해)의 초기장 절반으로 α를 맞추고, 나머지 절반에서 보정하지 않은 직렬과 비교한 표와 H2 점검(Q 전후 분산, 정역학 접공간/법선 성분)을 출력합니다.
+
+```bash
+# (1) 보정 적합: inflate(α), band(α_b), posthoc(lead별 α_k), tangent_inflate(허용 방향만 α)
+python scripts/fit_spread.py --ckpt runs/latent_serial/latent.pt --valid-dir /path/to/era-data/valid \
+    --stats-dir /path/to/KAI-New/stats --out runs/latent_serial/calib.json --n-ics 32 --ic-stride 7 --members 8
+# 합성 결과의 기본 추천은 tangent_inflate: --mode tangent_inflate 를 붙이면 점수와 상관없이 그것을 씁니다
+# (2) 보정한 예보
+python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --spread runs/latent_serial/calib.json \
+    --test-file /path/to/era-data/test/2020.nc --stats-dir /path/to/KAI-New/stats \
+    --out runs/latent_serial/forecast_calib.nc --leads 10 --members 16 --ic-stride 7
+# (3) 평가: 보정 전후 비교
+python scripts/evaluate.py score --data-dir /path/to/era-data/test --year 2020 \
+    --forecast "latent serial"=runs/latent_serial/forecast.nc --forecast "serial + calib"=runs/latent_serial/forecast_calib.nc \
+    --climatology runs/clim_1980_2011.nc --out runs/eval/2020_step8
+```
+
+- 로그의 `[score]` 줄이 검증 후반부에서 각 보정의 CRPS / SSR / 정역학 잔차(1·5·10일)입니다. `[H2]` 줄의 `kept_*`가 1보다 작으면 Q가 같은 초기장에서도 분산을 줄이는 것입니다(합성에서는 1.57로 반대).
+- 비용: `tangent_inflate`는 스텝마다 정역학 잔차의 vjp를 층 수만큼(13층이면 12번) 돌립니다. 느리면 `--no-tangent`. GPU 메모리가 부족하면 `--chunk 2`.
+- calib.json의 `candidates`에 다른 보정의 값이 모두 있으므로, `mode`만 바꿔 다시 추론해 볼 수 있습니다.
+
+합성 데이터 실험 재현 (CPU, 약 1.5시간, 7단계 결과 필요): `python scripts/run_step7_latent.py --out runs/step7 --arms lat_serial lat_serial_nophys` 후 `python scripts/run_step8_spread.py --out runs/step8 --step7 runs/step7`.
+
+## 10. 9단계: classical 분산 보정 사다리 (`docs/step9_structure.md`)
+
+9절과 같은 `fit_spread.py`가 이제 classical 보정도 함께 맞춥니다. 선택 기준의 기본값이 empirical CRPS로 바뀌었습니다(재보정된 멤버에는 fair CRPS가 과대분산을 고르기 때문). 추가된 후보는 `classical`(채널별 s_c), `classical_lead`(lead·채널별 s_kc), `classical_tan`(s_c의 변화를 정역학 접공간에 사영), `mbm`(lead·채널별 선형 평균 보정 a + b·μ와 s_kc), `mbm_tan`(mbm의 변화를 접공간에 사영)입니다. 모두 rollout이 끝난 뒤 적용합니다.
+
+```bash
+# (1) 적합: 8단계 후보 + classical 사다리, empirical CRPS 기준
+python scripts/fit_spread.py --ckpt runs/latent_serial/latent.pt --valid-dir /path/to/era-data/valid \
+    --stats-dir /path/to/KAI-New/stats --out runs/latent_serial/calib.json --n-ics 32 --ic-stride 7 --members 8
+# 합성 결과의 추천: 물리 정합성까지 지키려면 --mode mbm_tan (또는 classical_tan)
+# (2) 보정한 예보: calib.json의 mode만 바꿔 다른 후보도 바로 추론 가능
+python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --spread runs/latent_serial/calib.json \
+    --test-file /path/to/era-data/test/2020.nc --stats-dir /path/to/KAI-New/stats \
+    --out runs/latent_serial/forecast_mbm.nc --leads 10 --members 16 --ic-stride 7
+```
+
+- `[score]` 줄의 `empirical` 값으로 비교하세요. `[fit] classical ... on the grid edge`가 0이 아니면 후보(0.5~6.0) 밖이 최적인 채널이 있다는 뜻입니다.
+- `mbm`의 평균 보정은 lead별로 맞추므로 추론의 `--leads`가 적합한 `--leads`보다 길면 안 됩니다.
+- 비용: `*_tan`은 lead마다 정역학 vjp 12번(`--no-tangent`로 끔).
+
+합성 데이터 실험 재현 (CPU, 약 4시간, 7·8단계 결과 필요): `python scripts/run_step9_structure.py --out runs/step9 --step7 runs/step7`.

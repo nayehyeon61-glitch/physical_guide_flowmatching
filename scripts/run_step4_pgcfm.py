@@ -77,12 +77,19 @@ def bridge_residual(model, batches):
 def evaluate(model, test_batch, val_batches, members, steps):
     t0 = time.time()
     x0, st, doy, obs = test_batch["x0"], test_batch["static"], test_batch["doy"], test_batch["targets"]
+    # samplers that pool over members (step 7 ``OperatorCorrected``) are told the batch layout
+    lay = getattr(model.cfm, "layout", lambda *a: None)
+    lay(members, "interleave")
     ens = rollout(model.cfm, x0, st, doy, members, steps=steps, seed=1)  # (B,M,K,66,H,W)
+    lay(1)
     det = deterministic_rollout(model.cfm, x0, st, doy, steps=steps)  # (B,K,66,H,W)
     e = ens.transpose(0, 1)[..., KEEP, :, :]  # (M,B,K,C,H,W)
     o = obs[..., KEEP, :, :]
+    lay(members, "repeat")
+    one_step = validate_one_step(model, val_batches, n_members=members, steps=steps)
+    lay(1)
     res = {
-        "one_step": validate_one_step(model, val_batches, n_members=members, steps=steps),
+        "one_step": one_step,
         "bridge_residual": bridge_residual(model, val_batches),
         "lead_rmse": metrics.ens_mean_rmse(e, o).pow(2).mean(dim=(0, 2)).sqrt().tolist(),
         "lead_spread": metrics.ens_spread(e).pow(2).mean(dim=(0, 2)).sqrt().tolist(),

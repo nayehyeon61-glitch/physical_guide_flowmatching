@@ -11,10 +11,13 @@ writes the zero-noise (eps = 0) run with the same ICs and no member dim.
         --stats-dir /data/KAI-New/stats --out runs/pgcfm/forecast.nc --leads 10 --members 16 --det
 
 A step 6 checkpoint (``train_projection.py``, ``proj.pt``) is rolled out through
-the frozen CFM followed by the projection ODE.
+the frozen CFM followed by the projection ODE. A step 7 checkpoint
+(``train_latent.py``, ``latent.pt``) is rolled out as encoder -> frozen latent
+PINN + latent CFM -> decoder, re-encoded every day.
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -68,6 +71,7 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--det", action="store_true", help="also write the eps = 0 run (<out>_det.nc)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--spread", help="calib.json from fit_spread.py (step 8 ensemble calibration, serial latent)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args(argv)
     dev = torch.device(a.device)
@@ -88,6 +92,23 @@ def main(argv=None):
             from scripts.train_projection import projection_config
             model.cfm = ODEProjection(model.cfm, projection_config(state["projection"]), H, W).to(dev)
         model.load_state_dict(state["model"])
+        if "latent_config" in state:  # step 7 checkpoint (train_latent.py): DCT encoder -> latent CFM -> decoder
+            from pgcfm.latent import LatentConfig, LatentPGCFM
+            lc = {k: tuple(v) if isinstance(v, list) else v for k, v in state["latent_config"].items()}
+            model.cfm = LatentPGCFM(LatentConfig(**lc), H, W).to(dev)
+            model.cfm.load_state_dict(state["latent"])
+        calib = json.load(open(a.spread)) if a.spread else None
+        if calib is not None:  # editing "mode" in calib.json picks another fitted candidate
+            calib.update(calib.get("candidates", {}).get(calib["mode"], {}))
+        # applied after the rollout
+        posthoc = ("posthoc", "classical", "classical_lead", "classical_tan", "mbm", "mbm_tan")
+        if calib is not None and calib["mode"] not in posthoc:  # step 8: calibrated members are fed back
+            from pgcfm.spread import DCTBands, EnsembleCalibrated
+            c = model.cfm.cfg
+            model.cfm = EnsembleCalibrated(model.cfm, calib["mode"], guide=model.guide, alpha=calib.get("alpha", 1.0),
+                                           band_alpha=calib.get("band_alpha"),
+                                           bands=DCTBands(H, W, c.k_lat, c.k_lon, calib.get("n_bands", 3)))
+        lay = getattr(model.cfm, "layout", lambda *_: None)
         model.eval()
         ics = a.ics if a.ics else list(range(0, T - a.leads, a.ic_stride))
         K = a.leads
@@ -102,8 +123,18 @@ def main(argv=None):
             doy = torch.from_numpy(doy_all[t0:t0 + K + 1])[None].to(dev)
             # forcing mode: tisr_{k+1} is known in advance (astronomical), taken from the file
             tisr = dyn[None, 1:, TISR_DYN:TISR_DYN + 1] if model.cfm.cfg.tisr_mode == "forcing" else None
+            lay(a.members, "interleave")
             ens = rollout(model.cfm, dyn[None, 0], static, doy, a.members, tisr=tisr,
                           steps=a.steps, seed=a.seed + t0)[0]  # (M,K,66,H,W)
+            if calib is not None and calib["mode"] == "posthoc":
+                from pgcfm.spread import posthoc_scale
+                ens = posthoc_scale(ens[None], calib["alpha_per_lead"][:K])[0]
+            elif calib is not None and calib["mode"] in posthoc:  # step 9 classical channel scales / MBM
+                from scripts.fit_spread import classical_map
+                b = {"x0": dyn[None, 0], "static": static, "doy": doy}
+                with torch.no_grad():
+                    ens = classical_map(calib, ens[None], b, model.guide)[0]
+            lay(1)
             full = assemble_full_state(ens, static[0]).cpu().numpy()
             ic = assemble_full_state(dyn[0], static[0]).cpu().numpy()
             var[n, 0] = denorm(np.broadcast_to(ic, (a.members,) + ic.shape))

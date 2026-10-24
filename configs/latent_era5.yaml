@@ -1,0 +1,46 @@
+# Step 7 (scripts/train_latent.py): DCT encoder -> latent PINN -> decoder (stage 1),
+# then latent CFM around the frozen PINN step (stage 2). Single GPU.
+train_dir: /home/work/data/hklab-ahmed/era-data/train   # 1980-2011
+valid_dir: /home/work/data/hklab-ahmed/era-data/valid   # 2012
+stats_dir: /home/work/data/hklab-ahmed/KAI-New/stats
+
+stages: [stage1, stage2]   # add decft for the decoder fine-tune ablation
+batch: 8
+workers: 8
+
+# DCT truncation and MLP sizes. On 121x240, k 24x48 keeps scales down to ~7.5 deg.
+# Check the printed floors after stage 1: rmse_ae must stay well below tendency_rms.
+k_lat: 24
+k_lon: 48
+latent: 512
+enc_hidden: [1024, 512]    # decoder mirrors it
+pinn_hidden: [1024, 1024]
+act: tanh                  # Raissi PINN activation (the sketch's F.sinh does not exist)
+cfm_width: 1024
+carry_highpass: true       # modes above the DCT cut are copied from x_k (docs/step7 W1)
+coupling: serial           # serial: CFM members -> PINN Q per member (best on synthetic); anchor: P(z_k) + CFM
+
+scales: null               # or {mom, T, mass, hyd, q} from step3_era5_residual_stats
+scale_floor_frac: 0.1
+
+# stage 1: encoder + latent PINN + decoder
+stage1_iters: 50000
+stage1_lr: 1.0e-3
+lambda_p: 0.1
+grad_ratio: 0.5            # physics gradient <= 0.5 x data gradient
+
+# stage 2, coupling: serial — CFM + per-member PINN Q trained together, encoder/decoder frozen
+serial_iters: 20000
+serial_lr: 1.0e-3
+serial_steps: 4            # Heun steps back-propagated through (memory)
+serial_members: 2
+
+# stage 2, coupling: anchor — latent CFM around the frozen PINN step
+stage2_iters: 50000
+stage2_lr: 1.0e-3
+stage2_mode: frozen        # recommended; "retrain" = encoder/decoder trained on CFM + reconstruction
+ae_lr: 1.0e-4              # only for stage2_mode: retrain
+
+# optional decoder fine-tune (stage "decft")
+decft_iters: 2000
+decft_lr: 1.0e-5
