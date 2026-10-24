@@ -136,7 +136,8 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="runs/step10")
     p.add_argument("--step7", default="runs/step7")
-    p.add_argument("--arms", nargs="+", default=["mean", "bias", "bias_grid", "mbm", "mbm_tan", "member_mbm", "mbmx", *LEARNED])
+    p.add_argument("--arms", nargs="+", default=["mean", "bias", "bias_grid", "mbm", "mbm_tan", "member_mbm", "mbmx", "mbmx_tan",
+                                                     *LEARNED])
     p.add_argument("--members", type=int, default=8)
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--horizon", type=int, default=10)
@@ -425,9 +426,9 @@ def main(argv=None):
         else:
             if name in res and not a.force:
                 continue
-            if name == "mbm_tan":
-                pred = tangent_calibrated(mu_test[:, None], classical("mbm", ens_test)[:, None], guide, d["x0"],
-                                          d["static"], d["doy"])[:, 0]
+            if name in ("mbm_tan", "mbmx_tan"):
+                pred = tangent_calibrated(mu_test[:, None], classical(name[:-4], ens_test, d["x0"])[:, None], guide,
+                                          d["x0"], d["static"], d["doy"])[:, 0]
             else:
                 pred = classical(name, ens_test, d["x0"])
             res[name] = scores(pred, d)
