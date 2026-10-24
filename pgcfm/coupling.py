@@ -175,7 +175,7 @@ class PhysicsGuide(nn.Module):
 
     def grid(self, device) -> pgrid.SphereGrid:
         if self._grid is None or self._grid.lat.device != torch.device(device):
-            lat = torch.linspace(-90.0, 90.0, self.n_lat).tolist()
+            lat = contract.grid_latitudes(self.n_lat).tolist()
             lon = (torch.arange(self.n_lon) * (360.0 / self.n_lon)).tolist()
             self._grid = pgrid.SphereGrid(lat, lon, device=device)
         return self._grid

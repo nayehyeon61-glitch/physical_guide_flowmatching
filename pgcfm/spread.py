@@ -55,7 +55,7 @@ def serial_members(m, x, static, doy_next, steps=8, generator=None, eps=None):
     """Decoded members of a serial ``LatentPGCFM`` before and after Q: (D(z_cfm), D(Q(z_cfm)))."""
     z0 = m.encode(x, static, (doy_next - 1) % 366)
     zc = m.sample_latent(x, static, doy_next, steps, generator, eps, refine=False)
-    return m.decode(zc, x), m.decode(m.serial(zc, z0, doy_next), x)
+    return m.decode(zc, x, z0), m.decode(m.serial(zc, z0, doy_next), x, z0)
 
 
 class DCTBands:
