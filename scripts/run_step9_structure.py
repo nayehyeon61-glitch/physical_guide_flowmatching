@@ -9,6 +9,8 @@ are on 2020 (4 ICs) and 2021 (16 ICs). 8 members, Heun 8 steps.
 
 Operator arms (base transition):
     base           the step 7 serial chain
+    base_noQ       the same chain with the PINN Q bypassed at inference (flow matching alone)
+    base_nophys    the step 7 serial chain trained without the physics term (``serial_nophys.pt``)
     op             StructureOperator (member + ensemble mean + log spread + condition), free
     op_sp          the same, deviations rescaled to the input's channel spread (spread kept)
     op_sp_member   op_sp without the ensemble statistics in the input (member-wise operator)
@@ -193,6 +195,13 @@ def main(argv=None):
     def transition(name):
         if name == "base":
             return EnsembleCalibrated(serial, "serial"), {}
+        if name == "base_noQ":  # flow matching alone: the PINN Q bypassed at inference
+            return EnsembleCalibrated(serial, "noQ"), {}
+        if name == "base_nophys":  # the step 7 serial chain trained without the physics term
+            m0 = LatentPGCFM(lcfg, n_lat, n_lon)
+            m0.load_state_dict(torch.load(os.path.join(a.step7, "serial_nophys.pt"))["latent"])
+            freeze(m0)
+            return EnsembleCalibrated(m0.eval(), "serial"), {}
         use_stats, keep_spread, band, phys, net = OPS[name]
         torch.manual_seed(9)
         lm = min(12, n_lat // 2)
