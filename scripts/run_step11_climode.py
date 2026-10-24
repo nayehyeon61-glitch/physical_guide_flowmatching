@@ -173,7 +173,7 @@ def main(argv=None):
         a.members, a.steps, a.horizon = 2, 2, 2
     torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
-    tag = a.tag
+    tag = a.tag + ("_quick" if a.quick else "")  # a quick run never reuses / overwrites full checkpoints
     kai, era5_data = os.path.join(a.data, "kai"), os.path.join(a.data, "era5_data")
     root = os.path.join(a.out, "data")
     tr, va = os.path.join(root, "train"), os.path.join(root, "val")

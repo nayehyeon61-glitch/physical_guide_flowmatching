@@ -317,7 +317,11 @@ class LatentPGCFM(nn.Module):
         loss = ((self.velocity(tau, zt, cond) - u) ** 2).mean()
         logs = {"cfm": loss.item()}
         if train_ae:
-            recon = 0.5 * (_wmse(self.decode(z0, x, z0), x, self.w_area) + _wmse(self.decode(z1, y, z1), y, self.w_area))
+            if self.cfg.carry_tendency:  # decode(z0, x, z0) = x exactly: reconstruct the tendency (as stage 1)
+                recon = _wmse(self.decoder(z1) - self.decoder(z0), y - x, self.w_area)
+            else:
+                recon = 0.5 * (_wmse(self.decode(z0, x, z0), x, self.w_area) +
+                               _wmse(self.decode(z1, y, z1), y, self.w_area))
             loss = loss + recon
             logs["recon"] = recon.item()
         return loss, logs

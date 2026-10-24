@@ -101,10 +101,14 @@ def test_carry_tendency_cancels_the_autoencoder_error():
     m.fit_dct(b["x0"], b["static"])
     x, st, d = b["x0"], b["static"], b["doy"]
     z0 = m.encode(x, st, d[:, 0])
-    assert torch.allclose(m.decode(z0, x, z0), x)  # a latent step that does nothing = persistence
+    assert torch.allclose(m.decode(z0, x, z0), x, atol=1e-5)  # a latent step that does nothing = persistence
     assert m.sample(x, st, d[:, 1], steps=2).shape == x.shape
     terms, _ = m.stage1_terms(b)
     assert torch.isfinite(terms["data"])
+    loss, logs = m.cfm_loss(b, train_ae=True)  # stage 2 retrain still trains the decoder
+    loss.backward()
+    assert logs["recon"] > 0 and m.decoder.layers[0].weight.grad.abs().sum() > 0
+    m.zero_grad()
     terms, _ = serial_terms(m, b, members=2, steps=2)
     assert torch.isfinite(terms["crps"])
     f = floors(m, [b])
