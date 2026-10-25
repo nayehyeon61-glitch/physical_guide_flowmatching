@@ -2,7 +2,8 @@
 ClimODE's protocol, as the owner's four-model comparison (H1-H3, docs/step13_sequence.md):
 
     --model regress   H1's control: the same U-Net and inputs trained by MSE + statistical errors
-                      (Gaussian, diagonal in the 3-D DCT basis, fitted on validation-year residuals)
+                      (Gaussian, diagonal in the 3-D DCT basis of the residual divided by its RMS
+                      per lead and channel, fitted on validation-year residuals)
     --model fm        arms  raw          the flow alone
                             pinn         + the frozen PINN on every member, after generation (H2)
                             guided       physics guidance in the late generation ODE (H3, --guide-lam)
@@ -164,7 +165,7 @@ def main(argv=None):
         model.eval()
         if a.model == "regress":  # statistical errors: residuals of the regression on the validation year
             with torch.no_grad():
-                model.errors.fit(q[1] - model(q[0], q[3]) for q in draws([a.val_year], 16))
+                model.fit_errors(q[1] - model(q[0], q[3]) for q in draws([a.val_year], 16))
         torch.save(model.state_dict(), ck)
         if os.path.exists(part):
             os.remove(part)

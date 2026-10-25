@@ -27,6 +27,7 @@ The PINN is ClimODE's Climate_ResNet_2D (vendored) on the grid, like pgcfm/core.
 the whole increment sequence, its output is restricted to the low DCT modes before the IDCT.
 """
 
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Dict
@@ -225,6 +226,7 @@ class SeqFMConfig:
     model_channels: int = 64
     channel_mult: tuple = (1, 2, 2)
     num_res_blocks: int = 1
+    lead_scale: bool = True  # dct only: divide each lead and channel by its RMS before the 3-D DCT
 
 
 class SeqFM(nn.Module):
@@ -235,7 +237,13 @@ class SeqFM(nn.Module):
     for the owner's DCT claim). The path and target velocity are torchcfm's (sigma = 0, as
     pgcfm/cfm.py); the velocity network is torchcfm's U-Net on the grid (lon periodic): its input is
     the current a mapped back to increments, its output is mapped into the coefficient space, so
-    the loss weighs every coefficient alike."""
+    the loss weighs every coefficient alike.
+
+    ``lead_scale``: B = 3-D DCT of d_k / sigma_k (sigma_k = RMS of lead k per channel). Without it
+    the source is wrong in time: a Gaussian that is diagonal in the time DCT is close to stationary
+    over the leads, but the increments grow from 6 h to 144 h, so the source had the 144 h spread at
+    every lead (z500: 1100 m2/s2 at 6 h, 980 at 24 h, against a 24 h increment RMS of 580), and the
+    CPU-trained flow kept it (first run, 2026-10-25: SSR about 2 at 24 h)."""
 
     def __init__(self, cfg: SeqFMConfig, static: torch.Tensor, H: int = 32, W: int = 64):
         super().__init__()
@@ -246,6 +254,7 @@ class SeqFM(nn.Module):
         self.register_buffer("static", static)
         self.basis = SeqDCT(cfg.K, N_DYN, H, W, spatial=False)
         self.grid_basis = cfg.basis == "grid"
+        self.register_buffer("lead_std", torch.ones(cfg.K, N_DYN, 1, 1))
         self.fm = ConditionalFlowMatcher(sigma=0.0)
         n_out = cfg.K * N_DYN
         self.unet = make_lon_periodic(UNetModel(
@@ -257,17 +266,23 @@ class SeqFM(nn.Module):
     def to_coef(self, d):
         if self.grid_basis:
             return (d - self.basis.mean) / self.basis.std
-        return self.basis(d)
+        return self.basis(d / self.lead_std)
 
     def to_incr(self, a):
         if self.grid_basis:
             return a * self.basis.std + self.basis.mean
-        return self.basis.inverse(a)
+        return self.basis.inverse(a) * self.lead_std
 
     @torch.no_grad()
     def fit_basis(self, batches) -> None:
         if not self.grid_basis:
-            return self.basis.fit(batches)
+            batches = iter(batches)
+            if self.cfg.lead_scale:  # sigma_k from the first batches, then the coefficient statistics
+                head = list(itertools.islice(batches, 4))
+                ms = torch.stack([(d.double() ** 2).mean((0, 3, 4)) for d in head]).mean(0)
+                self.lead_std.copy_(ms.sqrt().float().clamp_min(1e-6)[..., None, None])
+                batches = itertools.chain(head, batches)
+            return self.basis.fit(d / self.lead_std for d in batches)
         n, s1, s2 = 0, 0.0, 0.0
         for d in batches:
             d = d.double()
@@ -356,7 +371,8 @@ class SeqFM(nn.Module):
 class SeqRegressor(nn.Module):
     """H1's control: the same U-Net and inputs as SeqFM, trained by MSE to output the increments
     directly (one deterministic 144 h sequence); members = this + statistical errors (``SeqDCT``
-    fitted on validation residuals, i.e. a Gaussian that is diagonal in the 3-D DCT basis)."""
+    fitted on validation residuals divided by their RMS per lead and channel, i.e. a Gaussian that is
+    diagonal in the 3-D DCT basis of the lead-scaled residual, as SeqFM's lead-scaled source)."""
 
     def __init__(self, cfg: SeqFMConfig, static: torch.Tensor, H: int = 32, W: int = 64):
         super().__init__()
@@ -370,6 +386,15 @@ class SeqRegressor(nn.Module):
             model_channels=cfg.model_channels, out_channels=cfg.K * N_DYN, num_res_blocks=cfg.num_res_blocks,
             attention_resolutions=(), dropout=0.0, channel_mult=cfg.channel_mult))
         self.errors = SeqDCT(cfg.K, N_DYN, H, W, spatial=False)
+        self.register_buffer("err_lead", torch.ones(cfg.K, N_DYN, 1, 1))
+
+    @torch.no_grad()
+    def fit_errors(self, residuals) -> None:
+        residuals = iter(residuals)
+        head = list(itertools.islice(residuals, 4))
+        ms = torch.stack([(r.double() ** 2).mean((0, 3, 4)) for r in head]).mean(0)
+        self.err_lead.copy_(ms.sqrt().float().clamp_min(1e-6)[..., None, None])
+        self.errors.fit(r / self.err_lead for r in itertools.chain(head, residuals))
 
     @torch.no_grad()
     def fit_scale(self, batches) -> None:
@@ -390,8 +415,8 @@ class SeqRegressor(nn.Module):
     @torch.no_grad()
     def sample(self, hist, hour0, generator=None, **_):
         mu = self(hist, hour0)
-        return mu + self.errors.inverse_coeffs(self.errors.mean + self.errors.std *
-                                               torch.randn(mu.shape, generator=generator, device=mu.device))
+        return mu + self.err_lead * self.errors.inverse_coeffs(
+            self.errors.mean + self.errors.std * torch.randn(mu.shape, generator=generator, device=mu.device))
 
 
 def hard_constraints(x0: torch.Tensor, d: torch.Tensor, mean, std):

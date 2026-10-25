@@ -102,7 +102,7 @@ def test_regressor_and_hard_constraints():
     reg = SeqRegressor(SeqFMConfig(K=K, model_channels=32, channel_mult=(1, 2)), torch.randn(8, H, W))
     hist, d, h0 = torch.randn(2, 3, C, H, W), torch.randn(2, K, C, H, W), torch.tensor([0.0, 6.0])
     reg.fit_scale([d])
-    reg.errors.fit([d])
+    reg.fit_errors([d])
     w = torch.ones(1, 1, 1, H, 1)
     loss = reg.loss(hist, d, h0, w)
     loss.backward()
@@ -114,3 +114,19 @@ def test_regressor_and_hard_constraints():
     assert 0 < frac < 1 and (fixed[:, :, q] >= -1 - 1e-6).all()
     t = contract.DYNAMIC_CHANNELS.index(contract.CHANNEL_INDEX["t500"])
     assert torch.equal(fixed[:, :, t], d[:, :, t])
+
+
+def test_lead_scaled_dct_source_follows_the_growing_spread():
+    """Random-walk increments: the source mapped to increments must grow with the lead like the data
+    (the unscaled time DCT gives about the same spread at every lead)."""
+    torch.manual_seed(0)
+    k = 8
+    d = torch.randn(64, k, C, 8, 16).cumsum(1)  # variance grows as the lead
+    ratios = {}
+    for ls in (False, True):
+        fm = SeqFM(SeqFMConfig(K=k, basis="dct", model_channels=32, channel_mult=(1,), lead_scale=ls), torch.zeros(8, 8, 16),
+                   H=8, W=16)
+        fm.fit_basis([d[:16], d[16:32], d[32:48], d[48:]])
+        e = fm.to_incr(fm.noise(256)) - fm.to_incr(torch.zeros(1, k, C, 8, 16))
+        ratios[ls] = float(e[:, -1].var() / e[:, 0].var())
+    assert 5 < ratios[True] < 12 and ratios[False] < 3  # the data ratio is 8
