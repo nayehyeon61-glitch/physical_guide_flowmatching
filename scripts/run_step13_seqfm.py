@@ -238,6 +238,8 @@ def main(argv=None):
         n_ic = min(n_ic, a.max_ics or n_ic)
         t0 = time.time()
         for c0 in range(0, n_ic, 4):
+            if c0 and c0 % 40 == 0:
+                log(f"    {y}: {c0}/{n_ic} ICs {time.time() - t0:.0f}s")
             ics = [2 + 8 * e for e in range(c0, min(n_ic, c0 + 4))]
             h, d, orog, hour0 = batch({y: x}, [(y, i) for i in ics], a.K)
             B = len(ics)
