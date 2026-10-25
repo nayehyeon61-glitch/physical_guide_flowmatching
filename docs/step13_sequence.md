@@ -64,7 +64,7 @@
 
 스크립트: `scripts/run_step13_pinn.py`(1단계), `scripts/run_step13_seqfm.py`(2단계, `--basis dct|grid`, `--pinn`, `--save-ens`), `scripts/run_step13_operator.py`(3단계), `scripts/run_step13_guide.py`(4절 보정 가이드), `scripts/score_step13.py`(평가 축 전체), `scripts/compare_step13_climode.py`(ClimODE와 같은 초기장 짝 비교), `scripts/plot_step13.py`·`scripts/plot_step13_maps.py`·`scripts/plot_step13_system.py`(그림). 테스트: `tests/test_seqdct.py`, `tests/test_ens_guide.py`.
 
-학습 시스템 구조도: `docs/step13/fig_system.png` (1단계 PINN, 2단계 FM 학습·생성·H1 회귀, 3단계 에너지 가이드와 연산자, 추론 경로).
+학습 시스템 구조도: `docs/step13/fig_system.png` (1단계 PINN, 2단계 FM 학습·생성·H1 회귀, 3단계 에너지 가이드와 연산자, 추론 경로). 최고 앙상블(reg_band)이 쓰는 경로만 진하게 한 판: `docs/step13/fig_system_best.png` (연산자 경로, 학습된 가이드, H3·ODE 안의 P는 쓰지 않음).
 
 학습 연도: 2012–2015 (CPU 메모리·시간 때문에 ClimODE의 2006–2015 중 4년), 검증 2016, 시험 2017–2018 (ClimODE IC 360개).
 
