@@ -23,6 +23,7 @@ Gates (validation year, docs/step13_sequence.md):
 import argparse
 import dataclasses
 import json
+import math
 import os
 import sys
 import time
@@ -89,12 +90,14 @@ def main(argv=None):
     p.add_argument("--alpha-max", type=float, default=1.0)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--n-val", type=int, default=32)
+    p.add_argument("--val-chunk", type=int, default=4)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
         a.train_years, a.iters, a.K, a.hidden, a.n_val = a.train_years[:1], 3, 4, 8, 4
+        a.val_chunk = 2
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
@@ -176,43 +179,64 @@ def main(argv=None):
         res.update(train_seconds=time.time() - t0, hist=hist[::10])
     P.eval()
 
-    # -- gates on the validation year -------------------------------------------------------------
+    # -- gates on the validation year, ``--val-chunk`` sequences at a time (66 channels x K frames) ------
+    for y in a.train_years:
+        del data[y]  # the gates need the validation year only
     vr = np.random.default_rng(123)
     g = torch.Generator().manual_seed(123)
-    pairs = torch.arange(a.K)
-    val = {}
+    pairs, alphas, M, n_sp = torch.arange(a.K), (0.25, 0.5, 1.0), 4, min(8, a.n_val)
+    ms = {}  # mean squares over the validation sequences, accumulated chunk by chunk
+
+    def add(key, v, wgt):
+        ms[key] = ms.get(key, 0.0) + float(v) * wgt
+
     with torch.no_grad():
-        x0, d, orog, hour0 = sample(data, [a.val_year], a.K, vr, a.n_val)
-        pd = P(x0, d, hour0)
-        base = residual_rms(guide, x0, d, d, orog, pairs)
-        val["identity"] = {"change_over_t6": float(torch.sqrt(wmse(pd, d, w, t6))),
-                           "residual_ratio": {k: v / base[k] for k, v in
-                                              residual_rms(guide, x0, pd, d, orog, pairs).items()}}
-        val["truth_residual"] = base
-        for alpha in (0.25, 0.5, 1.0):
-            eps = pert.noise(d.shape, g) * P.keep
-            dt_ = d + alpha * eps
-            out = P(x0, dt_, hour0)
-            r_in, r_out = residual_rms(guide, x0, dt_, d, orog, pairs), residual_rms(guide, x0, out, d, orog, pairs)
-            err_in, err_out = wmse(dt_, d, w, t6), wmse(out, d, w, t6)
-            # spread: M = 4 perturbations of each of the first 8 truths
-            M, n = 4, min(8, a.n_val)
-            e_in = torch.stack([d[:n] + alpha * pert.noise(d[:n].shape, g) * P.keep for _ in range(M)])
-            e_out = torch.stack([P(x0[:n], e, hour0[:n]) for e in e_in])
-            s_in, s_out = band_spread(e_in, a.k_lat, a.k_lon), band_spread(e_out, a.k_lat, a.k_lon)
-            val[f"alpha_{alpha}"] = {
-                "residual_ratio_in": {k: v / base[k] for k, v in r_in.items()},
-                "residual_ratio_out": {k: v / base[k] for k, v in r_out.items()},
-                "error_ratio": float(torch.sqrt(err_out / err_in)),
-                "change_over_error": float(torch.sqrt(wmse(out, dt_, w, t6) / err_in)),
-                "spread_ratio": {b: s_out[b] / s_in[b] for b in s_in}}
-            v = val[f"alpha_{alpha}"]
-            log(f"[val alpha {alpha}] residual in/out " + " ".join(
-                f"{k} {v['residual_ratio_in'][k]:.2f}/{v['residual_ratio_out'][k]:.2f}" for k in base)
-                + f" | error ratio {v['error_ratio']:.3f} change/err {v['change_over_error']:.3f}"
-                + f" | spread low {v['spread_ratio']['low']:.3f} high {v['spread_ratio']['high']:.3f}")
-        log(f"[val identity] change {val['identity']['change_over_t6']:.4f} x t6, residual ratio " +
-            " ".join(f"{k} {v:.3f}" for k, v in val["identity"]["residual_ratio"].items()))
+        X0, D, OR, H0 = sample(data, [a.val_year], a.K, vr, a.n_val)
+        for i in range(0, a.n_val, a.val_chunk):
+            j = slice(i, min(a.n_val, i + a.val_chunk))
+            x0, d, orog, hour0, wgt = X0[j], D[j], OR[j], H0[j], (j.stop - j.start) / a.n_val
+            pd = P(x0, d, hour0)
+            add(("identity_change",), wmse(pd, d, w, t6), wgt)
+            for name, f in (("base", d), ("identity", pd)):
+                for k, v in residual_rms(guide, x0, f, d, orog, pairs).items():
+                    add((name, k), v ** 2, wgt)
+            for alpha in alphas:
+                dt_ = d + alpha * pert.noise(d.shape, g) * P.keep
+                out = P(x0, dt_, hour0)
+                for name, f in (("in", dt_), ("out", out)):
+                    for k, v in residual_rms(guide, x0, f, d, orog, pairs).items():
+                        add((alpha, name, k), v ** 2, wgt)
+                add((alpha, "err_in"), wmse(dt_, d, w, t6), wgt)
+                add((alpha, "err_out"), wmse(out, d, w, t6), wgt)
+                add((alpha, "change"), wmse(out, dt_, w, t6), wgt)
+                if i < n_sp:  # spread: M perturbations of each of the first n_sp truths
+                    s = slice(0, min(n_sp - i, j.stop - j.start))
+                    e_in = torch.stack([d[s] + alpha * pert.noise(d[s].shape, g) * P.keep for _ in range(M)])
+                    e_out = torch.stack([P(x0[s], e, hour0[s]) for e in e_in])
+                    for name, e in (("spread_in", e_in), ("spread_out", e_out)):
+                        for b, v in band_spread(e, a.k_lat, a.k_lon).items():
+                            add((alpha, name, b), v ** 2, s.stop / n_sp)
+            log(f"  gates {j.stop}/{a.n_val}")
+    rms = {k: math.sqrt(v) for k, v in ms.items()}
+    sub = lambda *q: {k[-1]: v for k, v in rms.items() if k[:-1] == q}  # noqa: E731
+    base = sub("base")
+    val = {"identity": {"change_over_t6": rms[("identity_change",)],
+                        "residual_ratio": {k: v / base[k] for k, v in sub("identity").items()}},
+           "truth_residual": base}
+    for alpha in alphas:
+        s_in, s_out = sub(alpha, "spread_in"), sub(alpha, "spread_out")
+        val[f"alpha_{alpha}"] = v = {
+            "residual_ratio_in": {k: x / base[k] for k, x in sub(alpha, "in").items()},
+            "residual_ratio_out": {k: x / base[k] for k, x in sub(alpha, "out").items()},
+            "error_ratio": rms[(alpha, "err_out")] / rms[(alpha, "err_in")],
+            "change_over_error": rms[(alpha, "change")] / rms[(alpha, "err_in")],
+            "spread_ratio": {b: s_out[b] / s_in[b] for b in s_in}}
+        log(f"[val alpha {alpha}] residual in/out " + " ".join(
+            f"{k} {v['residual_ratio_in'][k]:.2f}/{v['residual_ratio_out'][k]:.2f}" for k in base)
+            + f" | error ratio {v['error_ratio']:.3f} change/err {v['change_over_error']:.3f}"
+            + f" | spread low {v['spread_ratio']['low']:.3f} high {v['spread_ratio']['high']:.3f}")
+    log(f"[val identity] change {val['identity']['change_over_t6']:.4f} x t6, residual ratio " +
+        " ".join(f"{k} {v:.3f}" for k, v in val["identity"]["residual_ratio"].items()))
     res["val"] = val
     with open(os.path.join(a.out, f"{tag}.json"), "w") as f:
         json.dump(res, f, indent=1)

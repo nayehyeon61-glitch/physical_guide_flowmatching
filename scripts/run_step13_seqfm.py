@@ -7,8 +7,11 @@ ClimODE's protocol, as the owner's four-model comparison (H1-H3, docs/step13_seq
                             pinn         + the frozen PINN on every member, after generation (H2)
                             guided       physics guidance in the late generation ODE (H3, --guide-lam)
                             guided_pinn  both
+                            inloop       the frozen PINN inside the late generation ODE (--inloop-mu): its
+                                         correction of the endpoint estimate steers the flow, which sees
+                                         the corrected state on the later steps
     every arm then gets the hard constraints q >= 0, tcwv >= 0 (the violated fraction is reported);
-    raw and guided start from the same noise, so their difference is paired.
+    raw, guided and inloop start from the same noise, so their differences are paired.
 
     sample   history x(t - 12 h), x(t - 6 h), x(t) -> increments d_k = x(t + 6k h) - x(t), k = 1..K
              (K = 24: the whole 144 h in one flow, no autoregressive feedback)
@@ -81,6 +84,7 @@ def main(argv=None):
     p.add_argument("--pinn", default=None, help="stage-1 checkpoint (pinn_<objective>.pt); none = no PINN")
     p.add_argument("--guide-lam", type=float, default=0.0, help="H3 guidance strength (fraction of |v|); 0 = off")
     p.add_argument("--guide-s0", type=float, default=0.75)
+    p.add_argument("--inloop-mu", type=float, default=0.0, help="PINN inside the generation ODE (needs --pinn); 0 = off")
     p.add_argument("--train-years", type=int, nargs="+", default=[2012, 2013, 2014, 2015])
     p.add_argument("--val-year", type=int, default=2016)
     p.add_argument("--test-years", type=int, nargs="+", default=[2017, 2018])
@@ -209,8 +213,9 @@ def main(argv=None):
 
     # -- ensembles on ClimODE's ICs ---------------------------------------------------------------
     guided = a.model == "fm" and a.guide_lam > 0
+    inloop = a.model == "fm" and a.inloop_mu > 0 and P is not None
     arms = ("raw",) + (("pinn",) if P is not None else ()) + (("guided",) if guided else ()) \
-        + (("guided_pinn",) if guided and P is not None else ())
+        + (("guided_pinn",) if guided and P is not None else ()) + (("inloop",) if inloop else ())
     pair_ids = torch.tensor([0, a.K // 2, a.K - 1])  # residual diagnostics and the H3 guidance
     mx, mn = climode_minmax(era5)
     wl = np.cos(np.deg2rad(lat))
@@ -218,7 +223,7 @@ def main(argv=None):
     sc = {arm: {k: [] for k in ("rmse", "acc", "crps_gauss", "crps_ens", "spread", "rmse_pers")} for arm in arms}
     phys = {arm: [] for arm in arms + ("truth",)}
     viol = {arm: [] for arm in arms}
-    bands = {arm: [] for arm in arms if arm.endswith("pinn")}
+    bands = {arm: [] for arm in arms if arm.endswith("pinn") or arm == "inloop"}
     cost = {arm: 0.0 for arm in arms}
     g = torch.Generator().manual_seed(a.seed + 7)
     for y in ([a.val_year] if a.save_ens else []) + a.test_years:
@@ -239,9 +244,12 @@ def main(argv=None):
                 orog.repeat_interleave(a.members, 0)
             x0m = hm[:, -1]
             ens, tc = {}, time.time()
+            branch = (guided or inloop) and score
             if a.model == "fm":
                 eps = model.noise(len(hm), g)
-                ens["raw"] = model.sample(hm, h0m, a.heun, eps=eps)
+                ens["raw"] = model.sample(hm, h0m, a.heun, eps=eps, keep_at=a.guide_s0 if branch else None)
+                if branch:  # the guided arms continue the raw trajectory from s0 (same noise, paired)
+                    ens["raw"], state = ens["raw"]
             else:
                 ens["raw"] = model.sample(hm, h0m, generator=g)
             cost["raw"] += time.time() - tc
@@ -249,9 +257,14 @@ def main(argv=None):
                 tc = time.time()
                 zero = torch.zeros_like(ens["raw"])
                 ens["guided"] = model.sample(
-                    hm, h0m, a.heun, eps=eps, lam=a.guide_lam, s0=a.guide_s0,
-                    physics=lambda q: sequence_residual_loss(guide, x0m, q, zero, om, pair_ids)[0])
+                    hm, h0m, a.heun, start=state, lam=a.guide_lam, s0=a.guide_s0, chunk=a.members,
+                    physics=lambda q, j: sequence_residual_loss(guide, x0m[j], q, zero[j], om[j], pair_ids)[0])
                 cost["guided"] += time.time() - tc
+            if inloop and score:
+                tc = time.time()
+                ens["inloop"] = model.sample(hm, h0m, a.heun, start=state, s0=a.guide_s0, mu=a.inloop_mu,
+                                             project=lambda q: P(x0m, q, h0m))
+                cost["inloop"] += time.time() - tc
             for src, arm in (("raw", "pinn"), ("guided", "guided_pinn")):
                 if arm in here:
                     tc = time.time()
@@ -263,7 +276,7 @@ def main(argv=None):
                 if score:
                     viol[arm].append(f)
             if score:
-                for arm, src in (("pinn", "raw"), ("guided_pinn", "guided")):
+                for arm, src in (("pinn", "raw"), ("guided_pinn", "guided"), ("inloop", "raw")):
                     if arm in ens:
                         e0 = ens[src].view(B, a.members, *ens[src].shape[1:]).transpose(0, 1)
                         e1 = ens[arm].view(B, a.members, *ens[arm].shape[1:]).transpose(0, 1)
@@ -322,7 +335,7 @@ def main(argv=None):
             + f" | q/tcwv<0 {t['hard_violation_frac']:.4f} | {t['seconds_per_ic']:.1f} s/IC"
             + (f" | spread through P {t['spread_ratio_through_pinn']}" if arm in bands else ""))
     log("[truth residual] " + " ".join(f"{k} {v:.2f}" for k, v in res["test"]["truth_residual"].items()))
-    with open(os.path.join(a.out, f"{tag}{'_pinn' if P is not None else ''}{'_guided' if guided else ''}.json"), "w") as f:
+    with open(os.path.join(a.out, f"{tag}{'_pinn' if P is not None else ''}{'_guided' if guided else ''}{'_inloop' if inloop else ''}.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
 

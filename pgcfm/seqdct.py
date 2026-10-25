@@ -29,11 +29,10 @@ the whole increment sequence, its output is restricted to the low DCT modes befo
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 import torch.nn as nn
-import torch_dct
 
 from . import contract
 from .cfm import TISR_DYN
@@ -43,21 +42,52 @@ N_DYN = contract.N_DYNAMIC
 HOURS_PER_STEP = 6
 
 
+_DCT_MATRICES: Dict[tuple, torch.Tensor] = {}
+
+
+def dct_matrix(n: int, dtype=torch.float32, device=None) -> torch.Tensor:
+    """Orthonormal DCT-II matrix M (n, n): coefficients c = M x, inverse x = M^T c (the same transform
+    as torch_dct with norm="ortho"). On CPU a matrix product is several times faster than the FFT
+    route for the short axes here (K = 24, 32, 64), where the 3-D transform of 32 members took
+    most of a sampling step."""
+    key = (n, dtype, str(device))
+    if key not in _DCT_MATRICES:
+        k, i = torch.arange(n, dtype=torch.float64)[:, None], torch.arange(n, dtype=torch.float64)[None]
+        m = torch.cos(math.pi * (2 * i + 1) * k / (2 * n)) * math.sqrt(2.0 / n)
+        m[0] /= math.sqrt(2.0)
+        _DCT_MATRICES[key] = m.to(dtype=dtype, device=device)
+    return _DCT_MATRICES[key]
+
+
+def dct_axis(x: torch.Tensor, dim: int, inverse: bool = False) -> torch.Tensor:
+    m = dct_matrix(x.shape[dim], x.dtype, x.device)
+    return (x.movedim(dim, -1) @ (m if inverse else m.T)).movedim(-1, dim)
+
+
+def dct_2d(x: torch.Tensor) -> torch.Tensor:
+    """Orthonormal 2-D DCT-II over the last two axes (lat, lon)."""
+    return dct_axis(dct_axis(x, -1), -2)
+
+
+def idct_2d(c: torch.Tensor) -> torch.Tensor:
+    return dct_axis(dct_axis(c, -2, inverse=True), -1, inverse=True)
+
+
 def dct_t(d: torch.Tensor) -> torch.Tensor:
     """Orthonormal DCT-II over the sequence axis (dim 1) of (B, K, ...)."""
-    return torch_dct.dct(d.movedim(1, -1), norm="ortho").movedim(-1, 1)
+    return dct_axis(d, 1)
 
 
 def idct_t(c: torch.Tensor) -> torch.Tensor:
-    return torch_dct.idct(c.movedim(1, -1), norm="ortho").movedim(-1, 1)
+    return dct_axis(c, 1, inverse=True)
 
 
 def lowpass(d: torch.Tensor, k_lat: int, k_lon: int) -> torch.Tensor:
     """Projection of (..., H, W) onto the k_lat x k_lon lowest spatial DCT modes."""
-    c = torch_dct.dct_2d(d, norm="ortho")
+    c = dct_2d(d)
     m = torch.zeros(c.shape[-2:], dtype=c.dtype, device=c.device)
     m[:k_lat, :k_lon] = 1
-    return torch_dct.idct_2d(c * m, norm="ortho")
+    return idct_2d(c * m)
 
 
 class SeqDCT(nn.Module):
@@ -72,11 +102,11 @@ class SeqDCT(nn.Module):
         self.register_buffer("std", torch.ones(K, C, H, W))
 
     def coeffs(self, d: torch.Tensor) -> torch.Tensor:
-        c = torch_dct.dct_2d(d, norm="ortho")
+        c = dct_2d(d)
         return c if self.spatial else dct_t(c)
 
     def inverse_coeffs(self, c: torch.Tensor) -> torch.Tensor:
-        return torch_dct.idct_2d(c if self.spatial else idct_t(c), norm="ortho")
+        return idct_2d(c if self.spatial else idct_t(c))
 
     def forward(self, d: torch.Tensor) -> torch.Tensor:
         return (self.coeffs(d) - self.mean) / self.std
@@ -178,7 +208,7 @@ def residual_rms(guide, x0, d, d_obs, orog, pairs, chunk: int = 32) -> Dict[str,
 
 def band_spread(e: torch.Tensor, k_lat: int, k_lon: int) -> Dict[str, float]:
     """Member spread of e (M, B, K, C, H, W) in the low (k_lat x k_lon) and the other DCT modes."""
-    c = torch_dct.dct_2d(e - e.mean(0, keepdim=True), norm="ortho")
+    c = dct_2d(e - e.mean(0, keepdim=True))
     m = torch.zeros(c.shape[-2:], dtype=torch.bool)
     m[:k_lat, :k_lon] = True
     low, high = (c ** 2)[..., m], (c ** 2)[..., ~m]
@@ -266,37 +296,61 @@ class SeqFM(nn.Module):
         return torch.randn((B,) + tuple(self.basis.std.shape), generator=generator, device=device)
 
     def sample(self, hist, hour0, steps: int = 8, generator=None, eps=None, physics=None, lam: float = 0.0,
-               s0: float = 0.75):
+               s0: float = 0.75, project=None, mu: float = 0.0, chunk: int = None, start=None, keep_at=None):
         """One member per row of hist: increments (B, K, 66, H, W) by Heun on the generation ODE
         da/ds = v(a, s) from s = 0 (noise ``eps``) to s = 1.
 
         ``physics(d) -> scalar`` with lam > 0 adds H3's guidance on s >= s0:
             v <- v - lam (s - s0) / (1 - s0) * rms(v) * g / rms(g),  g = grad_a physics(B^-1(a + (1 - s) v)),
         i.e. the physics loss of the endpoint estimate a_1 = a + (1 - s) v, its gradient taken with v held
-        fixed (no backpropagation through the U-Net), scaled per sample to a fraction of |v|."""
+        fixed (no backpropagation through the U-Net), scaled per sample to a fraction of |v|.
+
+        ``project(d) -> d`` (the frozen stage-1 PINN) with mu > 0 puts the PINN inside the ODE on s >= s0:
+            v <- v + mu 2 / (1 - s0) (s - s0) / (1 - s0) * (B(project(B^-1(a_1))) - a_1),
+        the PINN's correction of the endpoint estimate, ramped so that mu = 1 integrates to about one
+        application of the PINN; the flow sees the corrected state on the later steps.
+
+        ``chunk``: the guidance gradient ``chunk`` rows at a time, ``physics(d, rows)`` with ``rows`` a
+        slice (exact: the gradient is normalized per row). ``keep_at`` = s also returns the state at the
+        start of the first step that reaches past s as (a, step); ``start`` = such a state continues from it, so the
+        guided arms branch from the unguided trajectory instead of repeating its first steps."""
         B = hist.shape[0]
-        a = self.noise(B, generator, hist.device) if eps is None else eps
+        a, i0 = ((self.noise(B, generator, hist.device) if eps is None else eps), 0) if start is None else start
 
         def f(t, z):
             with torch.no_grad():
                 v = self.velocity(t, z, hist, hour0)
             s = float(t[0])
-            if physics is None or lam <= 0 or s < s0:
+            ramp = (s - s0) / (1.0 - s0)
+            if ramp <= 0:
                 return v
-            with torch.enable_grad():
-                z_ = z.detach().requires_grad_(True)
-                g, = torch.autograd.grad(physics(self.to_incr(z_ + (1.0 - s) * v)), z_)
-            dims = tuple(range(1, v.ndim))
-            r = (v.pow(2).mean(dims, keepdim=True) / g.pow(2).mean(dims, keepdim=True).clamp_min(1e-30)).sqrt()
-            return v - lam * (s - s0) / (1.0 - s0) * r * g
+            out = v
+            if physics is not None and lam > 0:
+                gs = []
+                for j in ([slice(0, B)] if chunk is None else [slice(i, min(B, i + chunk)) for i in range(0, B, chunk)]):
+                    with torch.enable_grad():
+                        z_ = z[j].detach().requires_grad_(True)
+                        d_ = self.to_incr(z_ + (1.0 - s) * v[j])
+                        gs.append(torch.autograd.grad(physics(d_) if chunk is None else physics(d_, j), z_)[0])
+                g = torch.cat(gs)
+                dims = tuple(range(1, v.ndim))
+                r = (v.pow(2).mean(dims, keepdim=True) / g.pow(2).mean(dims, keepdim=True).clamp_min(1e-30)).sqrt()
+                out = out - lam * ramp * r * g
+            if project is not None and mu > 0:
+                with torch.no_grad():
+                    a1 = z + (1.0 - s) * v
+                    out = out + mu * 2.0 / (1.0 - s0) * ramp * (self.to_coef(project(self.to_incr(a1))) - a1)
+            return out
 
-        h = 1.0 / steps
-        for i in range(steps):  # Heun (explicit trapezoidal), as cfm.heun
+        h, kept = 1.0 / steps, None
+        for i in range(i0, steps):  # Heun (explicit trapezoidal), as cfm.heun
+            if keep_at is not None and kept is None and (i + 1) * h > keep_at + 1e-9:
+                kept = (a.clone(), i)
             t0 = torch.full((B,), i * h, device=a.device)
             k1 = f(t0, a)
             k2 = f(t0 + h, a + h * k1)
             a = a + 0.5 * h * (k1 + k2)
-        return self.to_incr(a)
+        return self.to_incr(a) if keep_at is None else (self.to_incr(a), kept)
 
 
 class SeqRegressor(nn.Module):

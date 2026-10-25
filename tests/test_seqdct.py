@@ -8,6 +8,14 @@ from pgcfm.seqdct import PINNConfig, PINNProjector, SeqDCT, SeqFM, SeqFMConfig, 
 C, H, W, K = contract.N_DYNAMIC, 32, 64, 3
 
 
+
+def test_matrix_dct_matches_torch_dct():
+    from pgcfm.seqdct import dct_2d, dct_t, idct_2d, idct_t
+    x = torch.randn(2, 5, 3, 8, 16)
+    assert torch.allclose(dct_2d(x), torch_dct.dct_2d(x, norm="ortho"), atol=1e-5)
+    assert torch.allclose(dct_t(x), torch_dct.dct(x.movedim(1, -1), norm="ortho").movedim(-1, 1), atol=1e-5)
+    assert torch.allclose(idct_2d(dct_2d(x)), x, atol=1e-5) and torch.allclose(idct_t(dct_t(x)), x, atol=1e-5)
+
 def test_seq_dct_is_lossless_and_standardized():
     d = torch.randn(5, K, C, H, W) * 0.3 + 0.1
     for spatial in (False, True):
@@ -75,6 +83,18 @@ def test_guided_sampling_lowers_the_guided_loss_and_keeps_the_noise_pairing():
     guided = fm.sample(hist, h0, steps=4, eps=eps, physics=phys, lam=0.5, s0=0.5)
     assert phys(guided) < phys(raw)
     assert torch.equal(fm.sample(hist, h0, steps=4, eps=eps, physics=phys, lam=0.0), raw)
+    # the PINN inside the ODE: a projector that shrinks channel 0 pulls the member toward its fixed point
+    shrink = lambda d: torch.cat([0.5 * d[:, :, :1], d[:, :, 1:]], 2)  # noqa: E731
+    inloop = fm.sample(hist, h0, steps=4, eps=eps, project=shrink, mu=1.0, s0=0.5)
+    assert phys(inloop) < phys(raw)
+    assert torch.allclose(inloop[:, :, 1:], raw[:, :, 1:], atol=0.5 * float(raw[:, :, 1:].abs().max()))
+    assert torch.equal(fm.sample(hist, h0, steps=4, eps=eps, project=shrink, mu=0.0), raw)
+    # branching from the kept unguided state and chunking the gradient give the same members
+    same, state = fm.sample(hist, h0, steps=4, eps=eps, keep_at=0.5)
+    assert torch.equal(same, raw) and state[1] == 2
+    assert fm.sample(hist, h0, steps=2, eps=eps, keep_at=0.75)[1][1] == 1  # s0 inside the last step
+    branch = fm.sample(hist, h0, steps=4, start=state, physics=lambda d, j: phys(d), lam=0.5, s0=0.5, chunk=1)
+    assert torch.allclose(branch, guided, atol=1e-5)
 
 
 def test_regressor_and_hard_constraints():
