@@ -15,6 +15,9 @@ FM + PINN ensembles, against classical calibration.
             guide       operator mu*, Gamma from BandGuide (starts at op_mono; fair CRPS + a penalty
                         on member energy that falls from one lead to the next, whole trajectories
                         per batch; first 80 % of the validation ICs, checkpoint on the last 20 %)
+            core_band   ``--core``: mu* = the step 12 deterministic core (jump24, trained 2006-2015, so
+            core_mono   2016 is out of sample), Gamma closed form per band / with monotone energy, and
+            core_guide  the learned guide on top: the core's mean with the FM members' deviations
     energy  Doob-type control (owner): E[max_k |e_k|^2] / E|e_K|^2 of the member deviations and of
             the error of the mean (<= 4 if the energy is a submartingale in the lead), the energy by
             lead and the fraction of falling lead steps, for every arm
@@ -44,6 +47,40 @@ from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 from scripts.run_step13_operator import load, samples  # noqa: E402
 
+LEADS_H = (24, 48, 72, 96, 120, 144)
+
+
+def core_predictions(prefix, era5, year, ics):
+    """(len(ics), 6, 5, H, W) physical forecasts of the step 12 core from the ClimODE ICs ``ics``
+    (2 + 8 e): the full year from <prefix>_pred.npz (test years) or computed once and cached in
+    <prefix>_pred_<year>.npz (scripts/run_step12_core.py's normalization), then the rows of ``ics``."""
+    rows = (np.asarray(ics) - 2) // 8
+    assert np.all(2 + 8 * rows == np.asarray(ics)), "core predictions exist only for the ClimODE ICs"
+    with np.load(prefix + "_pred.npz") as z:
+        if str(year) in z.files:
+            return z[str(year)][rows]
+    cache = f"{prefix}_pred_{year}.npz"
+    if not os.path.exists(cache):
+        from pgcfm.core import Core, CoreConfig, static_features
+        from scripts.run_step12_core import forecast
+        info = json.load(open(prefix + ".json"))
+        cfg = CoreConfig(**{**info["cfg"], "blocks": tuple(info["cfg"]["blocks"])})
+        tr = np.concatenate([climode_truth(era5, y) for y in info["args"]["train_years"]])
+        mean, std = tr.mean((0, 2, 3)), tr.std((0, 2, 3))
+        del tr
+        lat, lon, oro, lsm = load_static(era5)
+        core = Core(cfg, static_features(lat, lon, oro, lsm),
+                    {int(h): torch.tensor(v, dtype=torch.float32) for h, v in info["tend_std"].items()})
+        core.load_state_dict(torch.load(prefix + ".pt"))
+        core.eval()
+        truth = climode_truth(era5, year)
+        full = [2 + 8 * e for e in range((len(truth) - 2 - 144 // 6 - 1) // 8 + 1)]
+        x = torch.from_numpy((truth - mean[:, None, None]) / std[:, None, None])
+        with torch.no_grad():
+            pred = forecast(core, x, full, 24).numpy() * std[:, None, None] + mean[:, None, None]
+        np.savez(cache, pred=pred.astype(np.float32), ics=np.asarray(full))
+    return np.load(cache)["pred"][rows]
+
 
 def predict(models, mem, ctx, chunk=64):
     with torch.no_grad():
@@ -70,6 +107,7 @@ def main(argv=None):
     p.add_argument("--guide-epochs", type=int, default=30)
     p.add_argument("--lambda-mono", type=float, default=1.0, help="penalty on energy falling with the lead")
     p.add_argument("--gamma-max", type=float, default=4.0)
+    p.add_argument("--core", default=None, help="step 12 core prefix (runs/step12/core_jump24): adds the core_* arms")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
@@ -129,47 +167,59 @@ def main(argv=None):
             " ".join(f"{x:.2f}" for x in g[j, VARS.index('z')].tolist()) for j in range(L)))
 
     # -- the learned guide: Gamma from the ensemble's own band energies -----------------------------
-    guide = BandGuide(5, nb, L, gamma_max=a.gamma_max)
-    guide.base.copy_(gam["op_mono"].clamp(1e-6, a.gamma_max).log())
-    guide.fit_inputs(sp_b)
     lead_idx = torch.arange(n * L) % L
     lead_frac = torch.as_tensor(leads, dtype=torch.float32)[lead_idx] / 144.0
     cut = int(0.8 * n)
     tr_ic, va_ic = torch.arange(cut), torch.arange(cut, n)
     rows = lambda ics: (ics[:, None] * L + torch.arange(L)).flatten()  # noqa: E731  whole trajectories
 
-    def guide_loss(ics):
-        j = rows(ics)
-        g = guide(sp_b[j], lead_idx[j], lead_frac[j])
-        crps = fair_crps(apply_gamma(mu_op[j], mem[j], g, bidx), tgt[j], w)
-        S = calibrated_energy(g, sp_b[j], counts).view(len(ics), L, -1)  # (ics, L, C)
-        fall = torch.relu(S[:, :-1] - S[:, 1:]).mean() / S.mean().detach()
-        return crps, fall
+    def train_guide(mu_v, base, name):
+        guide = BandGuide(5, nb, L, gamma_max=a.gamma_max)
+        guide.base.copy_(base.clamp(1e-6, a.gamma_max).log())
+        guide.fit_inputs(sp_b)
 
-    def guide_val():
-        with torch.no_grad():
-            q = [guide_loss(i) for i in va_ic.split(8)]
-            return float(np.mean([c for c, _ in q])), float(np.mean([f for _, f in q]))
+        def guide_loss(ics):
+            j = rows(ics)
+            g = guide(sp_b[j], lead_idx[j], lead_frac[j])
+            crps = fair_crps(apply_gamma(mu_v[j], mem[j], g, bidx), tgt[j], w)
+            S = calibrated_energy(g, sp_b[j], counts).view(len(ics), L, -1)  # (ics, L, C)
+            fall = torch.relu(S[:, :-1] - S[:, 1:]).mean() / S.mean().detach()
+            return crps, fall
 
-    opt = torch.optim.Adam(guide.net.parameters(), lr=3e-3)
-    (best, fall0), best_state, hist = guide_val(), {k: v.clone() for k, v in guide.state_dict().items()}, []
-    res["guide_val_crps_start"], res["guide_val_fall_start"] = best, fall0
-    best_obj = best + a.lambda_mono * fall0
-    for ep in range(a.guide_epochs):
-        for i in tr_ic[torch.randperm(len(tr_ic))].split(4):
-            crps, fall = guide_loss(i)
-            opt.zero_grad(set_to_none=True)
-            (crps + a.lambda_mono * fall).backward()
-            opt.step()
-        v, f_ = guide_val()
-        hist.append({"crps": v, "fall": f_})
-        if v + a.lambda_mono * f_ < best_obj:
-            best_obj, best, best_state = v + a.lambda_mono * f_, v, {k: q.clone() for k, q in guide.state_dict().items()}
-    guide.load_state_dict(best_state)
-    res.update(guide_val=hist, guide_best=best,
-               gamma={k: g.tolist() for k, g in gam.items()}, bands=list(range(nb)), band_counts=counts.tolist())
-    log(f"[guide] val fair CRPS start (= op_mono) {res['guide_val_crps_start']:.5f} best {best:.5f}"
-        f" | falling energy start {res['guide_val_fall_start']:.4f}")
+        def guide_val():
+            with torch.no_grad():
+                q = [guide_loss(i) for i in va_ic.split(8)]
+                return float(np.mean([c for c, _ in q])), float(np.mean([f for _, f in q]))
+
+        opt = torch.optim.Adam(guide.net.parameters(), lr=3e-3)
+        (best, fall0), best_state, hist = guide_val(), {k: v.clone() for k, v in guide.state_dict().items()}, []
+        best_obj, start = best + a.lambda_mono * fall0, best
+        for ep in range(a.guide_epochs):
+            for i in tr_ic[torch.randperm(len(tr_ic))].split(4):
+                crps, fall = guide_loss(i)
+                opt.zero_grad(set_to_none=True)
+                (crps + a.lambda_mono * fall).backward()
+                opt.step()
+            v, f_ = guide_val()
+            hist.append({"crps": v, "fall": f_})
+            if v + a.lambda_mono * f_ < best_obj:
+                best_obj, best, best_state = v + a.lambda_mono * f_, v, {k: q.clone() for k, q in guide.state_dict().items()}
+        guide.load_state_dict(best_state)
+        res[name] = {"val_crps_start": start, "val_fall_start": fall0, "val": hist, "best": best}
+        log(f"[{name}] val fair CRPS start {start:.5f} best {best:.5f} | falling energy start {fall0:.4f}")
+        return guide
+
+    guides = {"guide": (train_guide(mu_op, gam["op_mono"], "guide"), "op")}
+    if a.core:
+        mu_core = nz(torch.from_numpy(core_predictions(a.core, a.era5, a.val_year, load(a.ens, a.val_year)[3][:n])))
+        mu_core = mu_core.reshape(-1, 5, H, W)
+        gam["core_band"] = per_lead_gamma(band_error2(mu_core, tgt, bidx, nb), sp_b, L, M)
+        gam["core_mono"] = monotone_gamma(gam["core_band"], sp_lead, counts)
+        guides["core_guide"] = (train_guide(mu_core, gam["core_mono"], "core_guide"), "core")
+        log("[core] val z500 RMSE of the core mean by lead (normalized) "
+            + " ".join(f"{float(((mu_core[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
+                       for j in range(L)))
+    res.update(gamma={k: g.tolist() for k, g in gam.items()}, bands=list(range(nb)), band_counts=counts.tolist())
 
     # -- test years -----------------------------------------------------------------------------------
     unz = lambda q: q * torch.from_numpy(s).float() + torch.from_numpy(m).float()  # noqa: E731
@@ -183,15 +233,22 @@ def main(argv=None):
         lead_idx = torch.arange(n * L) % L
         lead_frac = torch.as_tensor(leads, dtype=torch.float32)[lead_idx] / 144.0
         mu_op, mu_mbm = predict(op_models, mem, ctx), mbm_mean(E, X0)
+        mus = {"op": mu_op}
+        if a.core:
+            mus["core"] = nz(torch.from_numpy(core_predictions(a.core, a.era5, y, ics))).reshape(-1, 5, H, W)
         sp = band_spread2(mem, bidx, nb)
         with torch.no_grad():
             arms = {"raw": mem,
                     "mbm_global": apply_gamma(mu_mbm, mem, gam["mbm_global"][lead_idx], one),
                     "mbm_band": apply_gamma(mu_mbm, mem, gam["mbm_band"][lead_idx], bidx),
                     "op_band": apply_gamma(mu_op, mem, gam["op_band"][lead_idx], bidx),
-                    "op_mono": apply_gamma(mu_op, mem, gam["op_mono"][lead_idx], bidx),
-                    "guide": torch.cat([apply_gamma(mu_op[j], mem[j], guide(sp[j], lead_idx[j], lead_frac[j]), bidx)
-                                        for j in torch.arange(n * L).split(64)])}
+                    "op_mono": apply_gamma(mu_op, mem, gam["op_mono"][lead_idx], bidx)}
+            for k in ("core_band", "core_mono"):
+                if k in gam:
+                    arms[k] = apply_gamma(mus["core"], mem, gam[k][lead_idx], bidx)
+            for k, (gd, src) in guides.items():
+                arms[k] = torch.cat([apply_gamma(mus[src][j], mem[j], gd(sp[j], lead_idx[j], lead_frac[j]), bidx)
+                                     for j in torch.arange(n * L).split(64)])
         for arm, ens in arms.items():
             crps = float(np.mean([float(fair_crps(ens[j], tgt[j], w)) for j in torch.arange(n * L).split(64)]))
             summary.setdefault(arm, []).append(crps)
