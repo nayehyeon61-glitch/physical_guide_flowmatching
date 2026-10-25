@@ -4,7 +4,9 @@ Writes two things for the ClimODE comparison (docs/step11_climode.md):
 
 1. KAI-format yearly files (``<out>/kai/<year>.nc``, var ``fields`` (T, 67, 32, 64)) with one
    snapshot per day at ``--hour`` UTC, so a 24 h PG-CFM step lands on ClimODE's 6-hourly
-   truth at leads 24, 48, ... h. Channel order and units follow pgcfm.contract.
+   truth at leads 24, 48, ... h. ``--all-hours`` writes every 6 h time instead, to
+   ``<out>/kai6h/<year>.nc`` (step 13 sequences; zlib-compressed, about 0.8 GB a year raw).
+   Channel order and units follow pgcfm.contract.
    Departures from the KAI contract (all forced by what WB2 offers at this grid):
      * instantaneous snapshots, not daily means (ClimODE scores instantaneous fields)
      * grid 64x32 equiangular *without* poles (lat -87.1875..87.1875), same as ClimODE
@@ -64,8 +66,10 @@ def tisr_1h(times, lat_deg, lon_deg, n_sub=12):
 
 
 def kai_year(ds, year, hour, path):
+    """``hour=None``: every 6 h time of the year."""
     sel = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31"))
-    sel = sel.sel(time=sel.time.dt.hour == hour)
+    if hour is not None:
+        sel = sel.sel(time=sel.time.dt.hour == hour)
     times = sel.time.values
     lat, lon = sel.latitude.values, sel.longitude.values
     T, H, W = len(times), len(lat), len(lon)
@@ -85,7 +89,8 @@ def kai_year(ds, year, hour, path):
         out.createDimension("channel", contract.N_CHANNELS)
         out.createDimension("latitude", H)
         out.createDimension("longitude", W)
-        out.createVariable("fields", "f4", ("time", "channel", "latitude", "longitude"))[:] = f
+        out.createVariable("fields", "f4", ("time", "channel", "latitude", "longitude"),
+                           zlib=hour is None, complevel=1, shuffle=True)[:] = f
         t = out.createVariable("time", "i8", ("time",))
         t.units, t.calendar = f"hours since {year}-01-01", "proleptic_gregorian"
         t[:] = ((times - np.datetime64(f"{year}-01-01")) / np.timedelta64(1, "h")).astype(np.int64)
@@ -94,7 +99,8 @@ def kai_year(ds, year, hour, path):
             ch[i] = n
         out.createVariable("latitude", "f8", ("latitude",))[:] = lat
         out.createVariable("longitude", "f8", ("longitude",))[:] = lon
-        out.title = f"ERA5 (WeatherBench2 64x32 conservative) {hour:02d} UTC snapshots, KAI channel layout"
+        when = "6-hourly" if hour is None else f"{hour:02d} UTC"
+        out.title = f"ERA5 (WeatherBench2 64x32 conservative) {when} snapshots, KAI channel layout"
     os.replace(path + ".tmp", path)
     return f
 
@@ -127,17 +133,18 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--years", type=int, nargs="+", required=True)
     p.add_argument("--hour", type=int, default=12, help="UTC hour of the daily KAI snapshot")
+    p.add_argument("--all-hours", action="store_true", help="every 6 h time, to <out>/kai6h")
     p.add_argument("--no-climode", action="store_true")
     a = p.parse_args(argv)
     ds = open_wb2()
-    kai = os.path.join(a.out, "kai")
+    kai = os.path.join(a.out, "kai6h" if a.all_hours else "kai")
     os.makedirs(kai, exist_ok=True)
     if not a.no_climode and not os.path.exists(os.path.join(a.out, "era5_data", "constants", "constants_5.625deg.nc")):
         constants(ds, os.path.join(a.out, "era5_data"))
     for y in a.years:
         path = os.path.join(kai, f"{y}.nc")
         if not os.path.exists(path):
-            kai_year(ds, y, a.hour, path)
+            kai_year(ds, y, None if a.all_hours else a.hour, path)
         if not a.no_climode:
             climode_year(ds, y, os.path.join(a.out, "era5_data"))
         print(f"{y} done", flush=True)
