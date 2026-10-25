@@ -238,10 +238,16 @@ ClimODE 공개 체크포인트를 원저자 코드로 돌린 11단계 재현(각
 
 ## 6. 그래프
 
-요청하신 형식(2×2, lead별 선, persistence 점선)입니다. 저장한 앙상블에는 ClimODE 5변수만 있어 "66채널 전체"와 "q850" 칸 대신 5변수 정규화 RMSE, t850 RMSE, z500 CRPS, z500 앙상블 퍼짐을 그렸습니다. ClimODE 선은 논문 Table 7(같은 360개 초기장)이고 RMSE만 있습니다. `python scripts/plot_step13.py --era5 <era5_data> --scores runs/step13/score_a.json runs/step13/score_guide.json runs/step13/score_reg.json --out docs/step13`.
+요청하신 형식(lead별 선, persistence 점선)입니다. 저장한 앙상블에는 ClimODE 5변수만 있어 "66채널 전체"와 "q850" 칸 대신 5변수 정규화 RMSE, z500·t850 RMSE, z500·t850 CRPS, z500 앙상블 퍼짐을 그렸습니다.
 
-- `docs/step13/fig_stage2.png`: 2단계 팔 (H1, H2, H3, 대조군)
-- `docs/step13/fig_calibration.png`: 보정 가이드 팔 (색 = 평균의 출처, 점선 = 학습된 가이드)
+- `docs/step13/fig_stage2.png`: 2단계 팔 (H1, H2, H3, 대조군), 360개 초기장
+- `docs/step13/fig_calibration.png`: 보정 가이드 팔 (색 = 평균의 출처, 점선 = 학습된 가이드), 360개 초기장
+- `docs/step13/fig_climode_paired.png`: ClimODE 재현과 같은 16개 초기장에서 z500 RMSE, t850 RMSE, z500 Gaussian CRPS(ClimODE 프로토콜), z500 퍼짐
+
+앞의 두 장에서 ClimODE 선은 논문 Table 7(같은 360개 초기장)이고, 논문에는 RMSE만 있어 RMSE 칸에만 있습니다. CRPS와 퍼짐의 ClimODE 비교는 세 번째 그림에 있습니다. ClimODE의 예측 표준편차는 z500에서 50–200 m²/s²로 오차(235–910)보다 훨씬 작아서, 긴 lead의 CRPS가 나빠지는 원인이 그림으로 보입니다.
+
+    python scripts/plot_step13.py --era5 <era5_data> --scores runs/step13/score_a.json runs/step13/score_guide.json \
+        runs/step13/score_reg.json --paired runs/step13/climode_paired.json --out docs/step13
 
 ## 7. 약점과 다음 시험
 

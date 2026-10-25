@@ -71,12 +71,61 @@ def persistence(era5, years, lat, mx, mn):
     return r, c
 
 
+PAIRED = [  # (score key, label, line style, categorical slot)
+    ("seqfm_dct_raw", "FM (DCT sequence)", "-", 0),
+    ("seqfm_dct_guided", "FM + physics guidance (H3)", "--", 1),
+    ("seqregress_raw", "Regression + statistical errors", "-", 6),
+    ("seqfm_dct_pinn_core_guide", "Core mean + FM deviations + band guide", "-", 3),
+    ("seqfm_dct_pinn_reg_guide", "Regression mean + FM deviations + band guide", "--", 5),
+]
+
+
+def plot_paired(path, out, mx, mn):
+    """z500 / t850 on ClimODE's 16 reproduced ICs (the first 8 of each test year), the same ICs for every line."""
+    d = json.load(open(path))
+    S, leads = d["scores"], d["leads"]
+    days = np.array(leads) / 24
+    iz = VARS.index("z")
+    get = lambda name, met, v: np.array([S[name][str(h)][met][v]["mean"] for h in leads])  # noqa: E731
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9.6), layout="constrained")
+    panels = [(ax[0, 0], "Geopotential at 500 hPa", "RMSE (m²/s²)", "rmse", "z", 1.0),
+              (ax[0, 1], "Temperature at 850 hPa", "RMSE (K)", "rmse", "t", 1.0),
+              (ax[1, 0], "Geopotential at 500 hPa", "Gaussian CRPS (m²/s², ClimODE protocol)", "crps_gauss", "z",
+               (mx - mn)[iz]),
+              (ax[1, 1], "Geopotential at 500 hPa", "Ensemble spread (m²/s²)", "spread", "z", 1.0)]
+    for a_, sub, ylab, met, v, scale in panels:
+        for k, lab, ls, slot in PAIRED:
+            if k in S:
+                a_.plot(days, get(k, met, v) * scale, ls, color=SLOTS[slot], lw=1.8, label=lab)
+        pers = get("persistence", met, v) * scale if met != "spread" else np.zeros(len(leads))
+        a_.plot(days, pers, ":", color=MUTED, lw=2, label="Persistence")
+        a_.plot(days, get("climode", met, v) * scale, "-", color=INK, lw=1.2, marker="s", ms=5,
+                label="ClimODE (public checkpoint, reproduced)")
+        a_.set_title(sub, fontsize=13)
+        a_.set_xlabel("Forecast lead (days)")
+        a_.set_ylabel(ylab)
+        a_.set_xlim(1, 6)
+        a_.grid(True, color=GRID, lw=0.8)
+        for s_ in ("top", "right"):
+            a_.spines[s_].set_visible(False)
+    fig.legend(*ax[0, 0].get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize=9, frameon=False)
+    n = d["n_ic"].get("climode") if isinstance(d["n_ic"], dict) else d["n_ic"]
+    fig.suptitle(f"Step 13 vs ClimODE on the same {n} ICs (ClimODE's first 8 of 2017 and of 2018, January)\n"
+                 "ClimODE: authors' checkpoint and code; ours: CPU budget, 8 members", fontsize=13)
+    p = os.path.join(out, "fig_climode_paired.png")
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    print(f"[plot] {p}: " + ", ".join(k for k, *_ in PAIRED if k in S))
+    return p
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--era5", required=True)
     p.add_argument("--scores", nargs="+", required=True, help="score_step13.py json files")
     p.add_argument("--years", type=int, nargs="+", default=[2017, 2018])
     p.add_argument("--out", default="docs/step13")
+    p.add_argument("--paired", default=None, help="climode_paired.json (scripts/compare_step13_climode.py)")
     p.add_argument("--subtitle", default="Real ERA5 5.625°, test 2017-2018 (ClimODE's 360 ICs), 8 members; "
                                          "CPU budget: FM 3000 it, PINN 1000 it")
     a = p.parse_args(argv)
@@ -100,16 +149,21 @@ def main(argv=None):
         if not present:
             print(f"[plot] {name}: no arms in the score files, skipped")
             continue
-        fig, ax = plt.subplots(2, 2, figsize=(13, 9.6), layout="constrained")
+        fig, ax = plt.subplots(2, 3, figsize=(18, 9.6), layout="constrained")
+        zs, ts = (mx - mn)[iz], (mx - mn)[it]
         panels = [
             (ax[0, 0], "Mean of 5 variables", "Normalized RMSE (RMSE / std)",
              lambda r: (np.asarray(r["rmse"]) / std).mean(1), (p_rmse / std).mean(1), (paper_rmse / std).mean(1)),
-            (ax[0, 1], "Temperature at 850 hPa", "RMSE (K)",
+            (ax[0, 1], "Geopotential at 500 hPa", "RMSE (m²/s²)",
+             lambda r: np.asarray(r["rmse"])[:, iz], p_rmse[:, iz], paper_rmse[:, iz]),
+            (ax[0, 2], "Temperature at 850 hPa", "RMSE (K)",
              lambda r: np.asarray(r["rmse"])[:, it], p_rmse[:, it], paper_rmse[:, it]),
             (ax[1, 0], "Geopotential at 500 hPa", "Ensemble CRPS (m²/s²)",
-             lambda r: np.asarray(r["crps"])[:, iz] * (mx - mn)[iz], p_crps[:, iz] * (mx - mn)[iz], None),
+             lambda r: np.asarray(r["crps"])[:, iz] * zs, p_crps[:, iz] * zs, None),
             (ax[1, 1], "Geopotential at 500 hPa", "Ensemble spread (m²/s²)",
              lambda r: np.asarray(r["spread"])[:, iz] if "spread" in r else None, np.zeros(len(LEADS_H)), None),
+            (ax[1, 2], "Temperature at 850 hPa", "Ensemble CRPS (K)",
+             lambda r: np.asarray(r["crps"])[:, it] * ts, p_crps[:, it] * ts, None),
         ]
         for a_, sub, ylab, get, pers, cl in panels:
             for k, lab, ls, slot in present:
@@ -134,6 +188,8 @@ def main(argv=None):
         plt.close(fig)
         written.append(path)
         print(f"[plot] {path}: " + ", ".join(q[0] for q in present))
+    if a.paired and os.path.exists(a.paired):
+        written.append(plot_paired(a.paired, a.out, mx, mn))
     return written
 
 

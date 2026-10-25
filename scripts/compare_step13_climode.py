@@ -5,7 +5,8 @@ scripts/run_climode_eval.py; about 18 min per IC pair on CPU). Every step 13 arm
 format (<prefix>_ens_<year>.npz) and the step 12 core are scored on exactly those ICs with the
 vectorized ClimODE scores (scripts/run_step11_climode.py: rmse, acc, crps_gauss), and the paired
 difference arm - ClimODE gets a 95% bootstrap interval over the ICs. Ensembles also get the ensemble
-CRPS (properscoring, ClimODE's min-max units), which ClimODE's Gaussian output does not have.
+CRPS (properscoring, ClimODE's min-max units), which ClimODE's Gaussian output does not have, and all
+get the latitude-weighted spread (ClimODE: its predicted std).
 
     python scripts/compare_step13_climode.py --era5 /path/era5_data --out runs/step13/climode_paired.json \
         --arms runs/step13/seqfm_dct_raw runs/step13/seqfm_dct_guided ... --core runs/step12/core_jump24
@@ -40,6 +41,9 @@ def main(argv=None):
     mx, mn = climode_minmax(a.era5)
     lat = load_static(a.era5)[0]
     sc_ = (mx - mn)[:, None, None]
+    wl = np.cos(np.deg2rad(lat))
+    wl = (wl / wl.mean())[:, None]
+    spread = lambda sd: np.sqrt((sd ** 2 * wl).mean((-1, -2)))  # noqa: E731  latitude-weighted, (5,)
     scores = {}  # name -> lead -> metric -> list over ICs of (5,)
 
     def add(name, h, met, v):
@@ -72,6 +76,7 @@ def main(argv=None):
                 s_c = climode_scores(cp["mean"][yi, e, j], obs, cp["std"][yi, e, j], clim, lat, mx, mn)
                 for met in ("rmse", "acc", "crps_gauss"):
                     add("climode", h, met, s_c[met])
+                add("climode", h, "spread", spread(cp["std"][yi, e, j]))
                 pers = climode_scores(truth[i0], obs, np.full_like(obs, 1e-6), clim, lat, mx, mn)
                 for met in ("rmse", "acc", "crps_gauss"):
                     add("persistence", h, met, pers[met])
@@ -81,6 +86,7 @@ def main(argv=None):
                     if kind == "ens":
                         mem = x[e, :, k]
                         s = climode_scores(mem.mean(0), obs, mem.std(0, ddof=1), clim, lat, mx, mn)
+                        s["spread"] = spread(mem.std(0, ddof=1))
                         s["crps_ens"] = ps.crps_ensemble((obs - mn[:, None, None]) / sc_,
                                                          np.moveaxis((mem - mn[:, None, None]) / sc_, 0, -1)).mean((-1, -2))
                     else:
