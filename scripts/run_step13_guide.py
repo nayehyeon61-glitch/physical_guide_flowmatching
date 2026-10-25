@@ -18,6 +18,8 @@ FM + PINN ensembles, against classical calibration.
             core_band   ``--core``: mu* = the step 12 deterministic core (jump24, trained 2006-2015, so
             core_mono   2016 is out of sample), Gamma closed form per band / with monotone energy, and
             core_guide  the learned guide on top: the core's mean with the FM members' deviations
+            reg_band    ``--reg``: mu* = the member mean of another saved ensemble (step 13's sequence
+            reg_guide   regression, runs/step13/seqregress_pinn: trained 2012-2015), closed form / guide
     energy  Doob-type control (owner): E[max_k |e_k|^2] / E|e_K|^2 of the member deviations and of
             the error of the mean (<= 4 if the energy is a submartingale in the lead), the energy by
             lead and the fraction of falling lead steps, for every arm
@@ -82,6 +84,14 @@ def core_predictions(prefix, era5, year, ics):
     return np.load(cache)["pred"][rows]
 
 
+def ens_mean(prefix, year, ics):
+    """(len(ics), L, 5, H, W) physical member mean of a saved stage-2 ensemble at the ICs ``ics``."""
+    z = np.load(f"{prefix}_ens_{year}.npz")
+    rows = [int(np.flatnonzero(z["ics"] == i)[0]) for i in ics]
+    d = np.stack([z["E_minus_x0"][r].astype(np.float32).mean(0) for r in rows])
+    return d + z["X0"][rows][:, None]
+
+
 def predict(models, mem, ctx, chunk=64):
     with torch.no_grad():
         return torch.stack([torch.cat([op(mem[i:i + chunk], ctx[i:i + chunk]) for i in range(0, len(mem), chunk)])
@@ -108,6 +118,9 @@ def main(argv=None):
     p.add_argument("--lambda-mono", type=float, default=1.0, help="penalty on energy falling with the lead")
     p.add_argument("--gamma-max", type=float, default=4.0)
     p.add_argument("--core", default=None, help="step 12 core prefix (runs/step12/core_jump24): adds the core_* arms")
+    p.add_argument("--reg", default=None,
+                   help="saved ensemble prefix whose member mean is mu* (runs/step13/seqregress_pinn): adds reg_*")
+    p.add_argument("--save-arms", nargs="*", default=None, help="score and save only these arms (default all)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
@@ -219,6 +232,13 @@ def main(argv=None):
         log("[core] val z500 RMSE of the core mean by lead (normalized) "
             + " ".join(f"{float(((mu_core[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
                        for j in range(L)))
+    if a.reg:
+        mu_reg = nz(torch.from_numpy(ens_mean(a.reg, a.val_year, load(a.ens, a.val_year)[3][:n]))).reshape(-1, 5, H, W)
+        gam["reg_band"] = per_lead_gamma(band_error2(mu_reg, tgt, bidx, nb), sp_b, L, M)
+        guides["reg_guide"] = (train_guide(mu_reg, monotone_gamma(gam["reg_band"], sp_lead, counts), "reg_guide"), "reg")
+        log("[reg] val z500 RMSE of the regression mean by lead (normalized) "
+            + " ".join(f"{float(((mu_reg[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
+                       for j in range(L)))
     res.update(gamma={k: g.tolist() for k, g in gam.items()}, bands=list(range(nb)), band_counts=counts.tolist())
 
     # -- test years -----------------------------------------------------------------------------------
@@ -236,6 +256,8 @@ def main(argv=None):
         mus = {"op": mu_op}
         if a.core:
             mus["core"] = nz(torch.from_numpy(core_predictions(a.core, a.era5, y, ics))).reshape(-1, 5, H, W)
+        if a.reg:
+            mus["reg"] = nz(torch.from_numpy(ens_mean(a.reg, y, ics))).reshape(-1, 5, H, W)
         sp = band_spread2(mem, bidx, nb)
         with torch.no_grad():
             arms = {"raw": mem,
@@ -243,12 +265,14 @@ def main(argv=None):
                     "mbm_band": apply_gamma(mu_mbm, mem, gam["mbm_band"][lead_idx], bidx),
                     "op_band": apply_gamma(mu_op, mem, gam["op_band"][lead_idx], bidx),
                     "op_mono": apply_gamma(mu_op, mem, gam["op_mono"][lead_idx], bidx)}
-            for k in ("core_band", "core_mono"):
+            for k in ("core_band", "core_mono", "reg_band"):
                 if k in gam:
-                    arms[k] = apply_gamma(mus["core"], mem, gam[k][lead_idx], bidx)
+                    arms[k] = apply_gamma(mus[k.split("_")[0]], mem, gam[k][lead_idx], bidx)
             for k, (gd, src) in guides.items():
                 arms[k] = torch.cat([apply_gamma(mus[src][j], mem[j], gd(sp[j], lead_idx[j], lead_frac[j]), bidx)
                                      for j in torch.arange(n * L).split(64)])
+        if a.save_arms is not None:
+            arms = {k: v for k, v in arms.items() if k in a.save_arms}
         for arm, ens in arms.items():
             crps = float(np.mean([float(fair_crps(ens[j], tgt[j], w)) for j in torch.arange(n * L).split(64)]))
             summary.setdefault(arm, []).append(crps)
@@ -271,7 +295,8 @@ def main(argv=None):
             f"{d['members']['falling_steps'][iz]:.2f}, energy by lead "
             + " ".join(f"{r[iz]:.3f}" for r in d["members"]["energy_by_lead"])
             + f" | error of mean: ratio {d['error_of_mean']['doob_ratio'][iz]:.2f}")
-    with open(os.path.join(a.out, f"guide_{tag}.json"), "w") as f:
+    name = f"guide_{tag}" + ("_" + "_".join(a.save_arms) if a.save_arms else "")
+    with open(os.path.join(a.out, name + ".json"), "w") as f:
         json.dump(res, f, indent=1)
     log("[test] fair CRPS (normalized, all vars and leads) " +
         " ".join(f"{k} {v:.5f}" for k, v in res["test_fair_crps_normalized"].items()))

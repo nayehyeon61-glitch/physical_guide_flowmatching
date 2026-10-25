@@ -47,6 +47,8 @@ FIGURES = {
         ("seqfm_dct_pinn_guide", "Operator + learned band guide", "--"),
         ("seqfm_dct_pinn_core_band", "Step 12 core mean + FM deviations", "-"),
         ("seqfm_dct_pinn_core_guide", "Core mean + learned band guide", "--"),
+        ("seqfm_dct_pinn_reg_band", "Sequence regression mean + FM deviations", "-"),
+        ("seqfm_dct_pinn_reg_guide", "Regression mean + learned band guide", "--"),
     ]),
 }
 
