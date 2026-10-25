@@ -30,3 +30,15 @@ built on the KAI-α ERA5 data contract (1.5°, 121×240, 67 channels).
 pip install -r requirements.txt
 python -m pytest
 ```
+
+## Step13 ODE comparison branch
+
+`experiment/step13-spherical-ode` extends commit `276a61f` with the original
+66-channel `SeqFM`/`PINNProjector` and an existing `torchdiffeq` physical-time
+integrator. `K=60` covers 15 days at six-hour output. The owner operator
+`pgcfm/ens_to_det.py` is unchanged. See
+[experiment protocol and results](docs/step13_ode_experiment.md).
+
+The CPU pipeline experiment uses explicitly synthetic 32×64 KAI-format data;
+its errors do **not** establish ERA5 forecasting skill. Public observed ERA5
+requires network access to `storage.googleapis.com`.

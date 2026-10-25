@@ -4,3 +4,8 @@ data/
 experiments/
 .pytest_cache/
 runs/
+*.egg-info/
+build/
+dist/
+outputs/
+.venv/

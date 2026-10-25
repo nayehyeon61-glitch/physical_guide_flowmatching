@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "physical-guide-flowmatching"
+version = "0.1.0"
+description = "Differentiable ensemble forecast integration with existing ODE solvers"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2,<3", "torchdiffeq==0.2.5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+dct = ["torch-dct==0.1.6"]
+step13 = [
+  "torchcfm==1.0.7", "netCDF4", "xarray", "zarr<3", "dask", "pandas",
+  "matplotlib", "properscoring==0.1", "tqdm", "ruamel.yaml", "fsspec",
+  "torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git@d16c6bf5b63d03dbf2977c70e19a320653b5e4a8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
