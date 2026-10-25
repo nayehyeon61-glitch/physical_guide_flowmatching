@@ -62,7 +62,7 @@
 | 대조군 | 10단계 `PersistenceMBM` (a + b·평균 + c·x0) | 그대로 |
 | 점수 | 11단계 `climode_scores` (원저자 함수와 일치 확인됨), properscoring | u10/v10은 11단계처럼 u/v1000에서 2016년 격자점별 회귀 |
 
-스크립트: `scripts/run_step13_pinn.py`(1단계), `scripts/run_step13_seqfm.py`(2단계, `--basis dct|grid`, `--pinn`, `--save-ens`), `scripts/run_step13_operator.py`(3단계). 테스트: `tests/test_seqdct.py`.
+스크립트: `scripts/run_step13_pinn.py`(1단계), `scripts/run_step13_seqfm.py`(2단계, `--basis dct|grid`, `--pinn`, `--save-ens`), `scripts/run_step13_operator.py`(3단계), `scripts/run_step13_guide.py`(4절 보정 가이드), `scripts/score_step13.py`(평가 축 전체), `scripts/compare_step13_climode.py`(ClimODE와 같은 초기장 짝 비교). 테스트: `tests/test_seqdct.py`, `tests/test_ens_guide.py`.
 
 학습 연도: 2012–2015 (CPU 메모리·시간 때문에 ClimODE의 2006–2015 중 4년), 검증 2016, 시험 2017–2018 (ClimODE IC 360개).
 
@@ -102,4 +102,30 @@ CPU 학습량의 FM은 이 source를 거의 그대로 두었습니다. 그래서
 
 소유자의 DCT 주장과 관련해서: 시간축 DCT는 6 h 증분처럼 lead에 따라 분산이 자라는 시퀀스에서는 그대로 쓰면 안 되고, lead 정규화가 같이 있어야 합니다.
 
-(이후 작성 중)
+## 4. 보정 가이드: 연산자 경로와 PINN 경로 나누기 (소유자 제안 05:10, 05:14)
+
+소유자 제안: 앙상블을 바로 PINN으로 가는 경로와 신경연산자로 가는 경로로 나누고, 연산자가 과분산의 에너지를 정제해 main stream 함수를 찾는 보정 가이드가 되게 한다. 근거로는 Doob 부등식 같은 부등식 제어, 즉 함수해석과 편미분방정식의 에너지 추정처럼 연산자가 작용할 수 있다고 보았습니다.
+
+구현 (`pgcfm/ens_guide.py`, `scripts/run_step13_guide.py`). 멤버 m마다
+
+  y_m = μ*(앙상블, x0) + IDCT( Γ(lead, 변수, 대역) ⊙ DCT(x_m − 멤버 평균) )
+
+- μ*는 main stream입니다. 소유자의 `EnsembleToDeterministic`(공식 neuraloperator FNO, 0 head라 시작은 앙상블 평균)을 2016년 두 절반에서 교차 적합해서 씁니다.
+- Γ는 멤버 편차의 공간 DCT 대역(반지름 1/16, 1/8, 1/4, 1/2로 나눈 5개)마다 곱하는 퍼짐 배율입니다. Γ < 1이면 과분산 대역의 에너지를 빼고, Γ > 1이면 더합니다. 정규직교 기저 위의 대각 곱이라 Parseval로 보정 후 에너지가 정확히 Σ_b Γ_b² |dev_b|²이고, Γ ≤ 1인 대역에서는 비팽창입니다.
+- PINN 경로는 그대로입니다. 편차 x_m − 평균은 PINN을 거친 멤버(`seqfm_dct_pinn`)에서 가져오므로 멤버의 물리 보정 구조는 대역별 배율만 받습니다.
+
+Doob이 들어가는 곳은 lead 축입니다. 멤버 편차 에너지 e_k = |x_m,k − μ_k|²가 lead k에 대해 음이 아닌 submartingale이면 Doob의 최대 부등식으로 E[max_k e_k] ≤ 4 E[e_K]이고, 마지막 lead(144 h)의 에너지가 궤적 전체를 묶습니다. 7단계 rollout 발산을 막는 안정성 논리입니다. 다만 한 번에 생성하는 FM과 시간축 DCT는 lead에 적응된(adapted) 과정이 아니어서 이 성질은 가정하지 않고 잽니다(`doob_stats`: 비율 E[max e_k]/E[e_K], 에너지가 떨어지는 lead 비율). Doob은 상한이라 안정성을 주지 보정을 주지는 않습니다.
+
+| 팔 | μ* | Γ |
+| --- | --- | --- |
+| raw | 멤버 그대로 | 없음 |
+| mbm_global | a + b·평균 + c·x0 (10단계) | (lead, 변수)마다 하나, spread-skill 닫힌 형 Γ² = E err² / ((M+1)/M · E s²) |
+| mbm_band | 같음 | (lead, 변수, 대역)마다 닫힌 형 |
+| op_band | 연산자 | 같음 |
+| op_mono | 연산자 | op_band에서 lead에 따라 보정 후 에너지가 줄지 않게 올림(cummax) |
+| guide | 연산자 | `BandGuide`: 앙상블 자신의 대역 에너지(log)와 lead로 log Γ를 내는 MLP, op_mono에서 시작, fair CRPS + 에너지 감소 벌점으로 학습 |
+| core_band, core_mono, core_guide | 12단계 jump24 코어(2006–2015 학습이라 2016은 표본 밖) | 위와 같은 세 가지 |
+
+코어 팔은 12단계 결정론 코어가 FM 앙상블 평균보다 z500 RMSE가 낮은 것(24 h 352 대 439)을 쓰려는 조합입니다. 평균은 코어에서, 퍼짐의 구조는 FM 멤버에서 가져옵니다.
+
+(결과 작성 중)
