@@ -7,11 +7,15 @@
                          basis) of the member deviations, scaled by (1 + 1/M), against the error of the mean
                          at 24 / 72 / 144 h (a calibrated ensemble lies on its error line at every scale), and
                          the realized band Gamma of both arms, sqrt(deviation energy / raw FM deviation energy)
+    fig_basis.png        the owner's DCT basis against the grid control (same FM, same frozen PINN): z500 CRPS,
+                         lag-24 h member correlation, small-scale power, and band spread / error energy
+                         (score_b.json from scripts/score_step13.py, band energies from the saved ensembles)
 
     python scripts/plot_step13_maps.py --era5 /path/era5_data --out docs/step13
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -24,7 +28,7 @@ from scipy.fft import dctn  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm.ens_guide import BAND_EDGES, band_index  # noqa: E402
-from scripts.plot_step13 import GRID, INK, MUTED, SLOTS  # noqa: E402
+from scripts.plot_step13 import GRID, INK, MUTED, SLOTS, persistence  # noqa: E402
 from scripts.run_step11_climode import VARS  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 
@@ -200,17 +204,101 @@ def plot_energy(year, out, v="z", leads_show=(24, 72, 144)):
     return p
 
 
+BASIS = [  # (score key, label, line style, slot)
+    ("seqfm_dct_raw", "FM on 3-D DCT coefficients (owner's design)", "-", 0),
+    ("seqfm_dct_pinn", "DCT FM + frozen PINN", "--", 0),
+    ("seqfm_grid_raw", "FM on grid values (control)", "-", 1),
+    ("seqfm_grid_pinn", "grid FM + frozen PINN", "--", 1),
+]
+
+
+def plot_basis(era5, out, scores=f"{O_}/score_b.json", years=(2017, 2018), v="z"):
+    d = json.load(open(scores))
+    A, iv = d["arms"], d["vars"].index(v)
+    lat = load_static(era5)[0]
+    from scripts.run_step11_climode import climode_minmax
+    mx, mn = climode_minmax(era5)
+    _, p_crps = persistence(era5, list(years), lat, mx, mn)
+    zs = (mx - mn)[iv]
+    leads = A[BASIS[0][0]]["leads"]
+    days = np.array(leads) / 24
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9.8), layout="constrained")
+    for k, lab, ls, slot in BASIS:
+        r = A[k]
+        ax[0, 0].plot(days, np.asarray(r["crps"])[:, iv] * zs, ls, color=SLOTS[slot], lw=1.8, label=lab)
+        ax[0, 1].plot(days[1:], np.asarray(r["lag24_member"])[:, iv], ls, color=SLOTS[slot], lw=1.8)
+        ax[1, 0].plot(days, np.asarray(r["power_ratio_k13-32"])[:, iv], ls, color=SLOTS[slot], lw=1.8)
+    ax[0, 0].plot(days, p_crps[:, iv] * zs, ":", color=MUTED, lw=2, label="Persistence")
+    ax[0, 1].plot(days[1:], np.asarray(A[BASIS[0][0]]["lag24_truth"])[:, iv], "-", color=INK, lw=1.2, marker="s",
+                  ms=5, label="ERA5 truth")
+    ax[1, 0].axhline(1, color=INK, lw=1.2, label="ERA5 truth")
+    ax[1, 0].set_yscale("log")
+    for k, lab, _, slot in BASIS[::2]:  # raw arms; P barely changes the spread (0.99-1.00 through P)
+        rat = []
+        for y in years:
+            ens, obs, _, lz = load_var(f"{O_}/{k}", y, v)
+            M, mu = ens.shape[1], ens.mean(1)
+            dev = band_energy(ens - mu[:, None]) / (M - 1) * M * (1 + 1 / M)  # band_energy averages over members
+            bidx = band_index(*obs.shape[-2:]).numpy()
+            c2 = dctn(mu - obs, axes=(-2, -1), norm="ortho") ** 2
+            err = np.stack([c2[..., bidx == b].mean(-1).mean(0) for b in range(int(bidx.max()) + 1)], -1)
+            rat.append((dev, err))
+            del ens, obs
+        dev, err = sum(q[0] for q in rat), sum(q[1] for q in rat)
+        for h, ls_ in ((24, "--"), (144, "-")):
+            j = lz.index(h)
+            ax[1, 1].plot(range(dev.shape[1]), dev[j] / err[j], ls_, marker="o", color=SLOTS[slot], lw=1.8, ms=5,
+                          label=f"{lab.split(' (')[0]}, +{h // 24} d")
+    ax[1, 1].axhline(1, color=INK, lw=1.2)
+    ax[1, 1].set_yscale("log")
+    ax[1, 1].set_xticks(range(5), ["0\nlargest", "1", "2", "3", "4\nsmallest"])
+    titles = [(ax[0, 0], "Geopotential at 500 hPa: ensemble CRPS", "CRPS (m²/s²)", "Forecast lead (days)"),
+              (ax[0, 1], "Member correlation over 24 h (time coherence)", "corr(x(τ), x(τ + 24 h)) of anomalies",
+               "Forecast lead of the later field (days)"),
+              (ax[1, 0], "Small-scale power, zonal wavenumbers 13–32", "Member power / ERA5 power",
+               "Forecast lead (days)"),
+              (ax[1, 1], "Spread / error energy per guide band (1 = calibrated)", "(1 + 1/M) spread² / error²",
+               "DCT band of the guide")]
+    for a_, t_, yl, xl in titles:
+        a_.set_title(t_, fontsize=13)
+        a_.set_ylabel(yl)
+        a_.set_xlabel(xl)
+        a_.grid(True, color=GRID, lw=0.8)
+        for s_ in ("top", "right"):
+            a_.spines[s_].set_visible(False)
+        if a_ is not ax[1, 1]:
+            a_.set_xlim(1, 6)
+    ax[1, 1].legend(fontsize=9, frameon=False)
+    h0, l0 = ax[0, 0].get_legend_handles_labels()
+    h1, l1 = ax[0, 1].get_legend_handles_labels()
+    fig.legend(h0 + h1, l0 + l1, loc="outside lower center", ncol=3, fontsize=9, frameon=False)
+    fig.suptitle("Step 13: DCT basis vs grid control for the sequence FM, z500, test 2017–2018 (360 ICs, 8 members)\n"
+                 "Same U-Net, same 3000 iterations, same frozen PINN; only the space the flow runs in differs",
+                 fontsize=13)
+    p = os.path.join(out, "fig_basis.png")
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    print(f"[basis] {p}")
+    return p
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--era5", required=True)
     p.add_argument("--year", type=int, default=2017)
     p.add_argument("--climode", default="runs/step11/climode/climode_pred.npz")
     p.add_argument("--out", default="docs/step13")
+    p.add_argument("--only", choices=["maps", "energy", "basis"], default=None)
     a = p.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
+    if a.only == "basis":
+        return [plot_basis(a.era5, a.out)]
     cp = dict(np.load(a.climode))
-    out = [plot_maps(v, a.year, a.era5, cp, a.out) for v in ("z", "t")]
-    out.append(plot_energy(a.year, a.out))
+    out = [plot_maps(v, a.year, a.era5, cp, a.out) for v in ("z", "t")] if a.only in (None, "maps") else []
+    if a.only in (None, "energy"):
+        out.append(plot_energy(a.year, a.out))
+    if a.only is None:
+        out.append(plot_basis(a.era5, a.out))
     return out
 
 
