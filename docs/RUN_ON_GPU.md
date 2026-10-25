@@ -221,3 +221,20 @@ python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --spread runs/
 - 비용: `*_tan`은 lead마다 정역학 vjp 12번(`--no-tangent`로 끔).
 
 합성 데이터 실험 재현 (CPU, 약 4시간, 7·8단계 결과 필요): `python scripts/run_step9_structure.py --out runs/step9 --step7 runs/step7`.
+
+## 11. 12단계: ClimODE를 저희 데이터로 처음부터 학습 (`docs/step12_core.md`)
+
+공개 체크포인트 대신 같은 데이터로 원본 크기 ClimODE를 다시 학습할 때 씁니다. CPU에서는 한 iteration에 수십 분이 걸려 GPU에서만 돌릴 수 있습니다.
+`third_party/climode/train_global.py`는 원저자 코드(@ e729d23)를 바꾸지 않은 사본입니다.
+
+```bash
+python scripts/wb2_to_kai.py --out data/era5_5p625 --years 2006 2007 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+cd data/era5_5p625 && mkdir -p Models
+python ../../third_party/climode/train_global.py --scale 0 --batch_size 8 --spectral 0 --solver euler   # 300 epoch, 검증 손실 최저 epoch를 Models/에 저장
+cd ../..
+python scripts/run_climode_eval.py --data data/era5_5p625/era5_data --out runs/climode_ours \
+    --ckpt data/era5_5p625/Models/ClimODE_global_euler_0_model_<epoch>.pt --lead-steps 24
+```
+
+- 원저자 스크립트는 학습 구간을 `slice('2006','2016')`로 잡아 검증 해 2016이 학습에 들어갑니다(원문 그대로 둠).
+- 평가는 11단계와 같은 함수와 초기장입니다. `--max-ics`를 빼면 시험 해당 180개씩 360개 전부를 돕니다.

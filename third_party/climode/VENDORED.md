@@ -12,3 +12,6 @@ baseline numbers (`visualization/data/other_model_*.csv`) are the ClimODE paper'
 so the scoring here uses the original authors' functions, which that repository also follows.
 
 Local change (pandas >= 2.2 compatibility only): `utils.py` `resample(time="6H").nearest(tolerance="1H")` -> `"6h"` / `"1h"` (3 occurrences).
+
+`train_global.py` (added in step 12) is the upstream training script, copied unchanged, so the original-size
+model can be retrained on our files on a GPU (docs/RUN_ON_GPU.md section 11).
