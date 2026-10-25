@@ -1,7 +1,7 @@
 """Step 13 training system diagram (docs/step13/fig_system.png): the three stages as built in
 run_step13_pinn.py, run_step13_seqfm.py, run_step13_guide.py and run_step13_operator.py.
-``--best`` draws fig_system_best.png: the same system with the parts the best ensemble (reg_band:
-regression mean + FM + PINN deviations + closed-form band Gamma) does not use faded.
+``--best`` draws fig_system_best.png: the same system with the parts the best ensemble (regm_band:
+a + b * regression mean + c * x(t), FM + PINN deviations, closed-form band Gamma) does not use faded.
 
     python scripts/plot_step13_system.py --out docs/step13 [--best]
 """
@@ -91,7 +91,7 @@ def stage_band(ax, y0, y1, n, name, color):
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="docs/step13")
-    p.add_argument("--best", action="store_true", help="fade what the best ensemble (reg_band) does not use")
+    p.add_argument("--best", action="store_true", help="fade what the best ensemble (regm_band) does not use")
     a = p.parse_args(argv)
     best = FADE["on"] = a.best
     fig = plt.figure(figsize=(20, 22.4))
@@ -101,7 +101,7 @@ def main(argv=None):
     ax.axis("off")
 
     ax.text(4, 108.6, "Sequence PG-CFM", fontsize=30, weight="bold", color=TITLE, va="center")
-    ax.text(4, 105.3, "Best ensemble (reg_band): regression mean + FM + PINN deviations + closed-form band Γ.  "
+    ax.text(4, 105.3, "Best ensemble (regm_band): a + b·μ_reg + c·x(t) + FM + PINN deviations + closed-form band Γ.  "
             "Faded: parts of the system it does not use" if best else
             "Step 13 training system: PINN pretraining → sequence flow matching → calibration and "
             "operator on frozen models", fontsize=15, color=BODY, va="center")
@@ -170,11 +170,11 @@ def main(argv=None):
     sublabel(ax, cx(0) + 2, 40.8, "Stage 3 · energy guide, fitted on 2016 with every generator frozen", v)
     box(ax, 0, y, "Member deviations", ["x_m − x̄ of the FM + PINN", "members, 2-D DCT", "5 radial bands"], "op")
     box(ax, 1, y, "Band energy Γ_b", ["√(err² / ((1 + 1/M) spread²))", "per lead · variable · band",
-                                      "err of μ_reg on 2016" if best else "or learned guide (fair CRPS)"],
+                                      "err of μ* on 2016" if best else "or learned guide (fair CRPS)"],
         "energy")
     box(ax, 2, y, "Scaled deviations", ["IDCT(Γ_b · DCT(x_m − x̄))", "energy ≤ FM energy where Γ ≤ 1"], "energy")
-    box(ax, 3, y, "+ main stream μ*", ["μ* = regression mean μ_reg"] if best else
-        ["regression mean (best)", "or operator, MBM, step 12 core"], "data")
+    box(ax, 3, y, "+ main stream μ*", ["μ* = a + b·μ_reg + c·x(t)", "a, b, c per lead · variable", "fitted on 2016"] if best else
+        ["a + b·μ_reg + c·x(t) (best)", "or μ_reg, operator, step 12 core"], "data")
     box(ax, 4, y, "Calibrated ensemble", ["y_m = μ* + scaled deviation", "Doob check on the energy",
                                           "8 members, 6 days"], "energy")
     for c in range(4):
@@ -185,7 +185,7 @@ def main(argv=None):
     sublabel(ax, 4, 25.3, "Operator path · the owner's stage 3" + ("  (not used by the best ensemble)" if best else ""),
              v, dim=True)
     y = 19.5
-    box(ax, 1, y, "2016 ensembles", ["frozen FM + PINN members", "(next: regression members)"], "data", dim=True)
+    box(ax, 1, y, "2016 ensembles", ["frozen FM + PINN members", "or regression members"], "data", dim=True)
     box(ax, 2, y, "Neural operator", ["EnsembleToDeterministic FNO", "member encoder + pooling", "zero head = mean"],
         "net", dim=True)
     box(ax, 3, y, "Deterministic forecast", ["one field per lead", "alternative μ*"], "data", dim=True)
@@ -201,16 +201,16 @@ def main(argv=None):
     ax.add_patch(FancyBboxPatch((4, 4.6), 95, 6.6, boxstyle="round,pad=0,rounding_size=0.9", fc=fill, ec=edge, lw=1.6))
     ax.text(51.5, 9.2, "Inference, 2017–2018 (ClimODE's 360 ICs)", ha="center", va="center", fontsize=14,
             weight="bold", color=TITLE)
-    ax.text(51.5, 6.4, "history → regression + errors → P → member mean μ*     ·     noise → flow ODE → P → IDCT "
-            "→ deviations → Γ_b → + μ* → 8 members" if best else
-            "history → regression → μ*     ·     noise → flow ODE → P → IDCT → deviations → Γ_b → + μ* "
+    ax.text(51.5, 6.4, "history → regression + errors → P → μ_reg → a + b·μ_reg + c·x(t) = μ*     ·     noise → flow ODE → P → "
+            "IDCT → deviations → Γ_b → + μ* → 8 members" if best else
+            "history → regression → MBM → μ*     ·     noise → flow ODE → P → IDCT → deviations → Γ_b → + μ* "
             "→ 8 members     ·     ensemble → operator → deterministic", ha="center", va="center", fontsize=11.5,
             color=BODY)
     ax.plot([4, 99], [3.3, 3.3], color=RULE, lw=1.2)
     ax.text(4, 2.0, "Solid: data / loss flow.  Dashed border: weights frozen from an earlier stage.  "
             "Orange: training losses.  Purple: energy control.", fontsize=11.5, color=BODY, va="center")
-    ax.text(4, 0.4, "The FM never trains through P or Γ. Current best: regression mean + FM deviations + closed-form "
-            "band Γ (reg_band); the learned guide moves the energy to the largest band.", fontsize=11.5, color=BODY,
+    ax.text(4, 0.4, "The FM never trains through P or Γ. Current best: a + b·regression mean + c·x(t), FM deviations, "
+            "closed-form band Γ (regm_band); the learned guide moves the energy to the largest band.", fontsize=11.5, color=BODY,
             va="center")
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, "fig_system_best.png" if best else "fig_system.png")
