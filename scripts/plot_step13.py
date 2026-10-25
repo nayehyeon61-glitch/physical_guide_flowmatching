@@ -49,6 +49,8 @@ FIGURES = {  # (score key, label, line style, categorical slot); calibration: sl
         ("seqfm_dct_pinn_core_guide", "Core mean + learned band guide", "--", 3),
         ("seqfm_dct_pinn_reg_band", "Sequence regression mean + band spread", "-", 5),
         ("seqfm_dct_pinn_reg_guide", "Regression mean + learned band guide", "--", 5),
+        ("seqfm_dct_pinn_regm_band", "a + b·regression mean + c·x(t) + band spread", "-", 7),
+        ("seqfm_dct_pinn_regm_guide", "a + b·regression mean + c·x(t) + learned guide", "--", 7),
     ]),
 }
 
@@ -73,16 +75,22 @@ def persistence(era5, years, lat, mx, mn):
 
 PAIRED = [  # (score key, label, line style, categorical slot)
     ("seqfm_dct_raw", "FM (DCT sequence)", "-", 0),
-    ("seqfm_dct_guided", "FM + physics guidance (H3)", "--", 1),
     ("seqregress_raw", "Regression + statistical errors", "-", 6),
     ("seqfm_dct_pinn_core_guide", "Core mean + FM deviations + band guide", "-", 3),
-    ("seqfm_dct_pinn_reg_guide", "Regression mean + FM deviations + band guide", "--", 5),
+    ("seqfm_dct_pinn_reg_band", "Regression mean + FM deviations + band Γ", "-", 5),
+    ("seqregress_pinn_reg_band", "Regression mean + its own deviations + band Γ", "--", 5),
+    ("seqfm_dct_pinn_regm_band", "a + b·regression mean + c·x(t) + FM deviations + band Γ", "-", 7),
 ]
 
 
-def plot_paired(path, out, mx, mn):
-    """z500 / t850 on ClimODE's 16 reproduced ICs (the first 8 of each test year), the same ICs for every line."""
-    d = json.load(open(path))
+def plot_paired(paths, out, mx, mn):
+    """z500 / t850 on ClimODE's 16 reproduced ICs (the first 8 of each test year), the same ICs for every line.
+    Several compare_step13_climode.py files are merged (same ICs, same ClimODE and persistence)."""
+    d = json.load(open(paths[0]))
+    for q in paths[1:]:
+        e = json.load(open(q))
+        assert e["leads"] == d["leads"] and e["n_ic"]["climode"] == d["n_ic"]["climode"]
+        d["scores"].update(e["scores"])
     S, leads = d["scores"], d["leads"]
     days = np.array(leads) / 24
     iz = VARS.index("z")
@@ -125,7 +133,7 @@ def main(argv=None):
     p.add_argument("--scores", nargs="+", required=True, help="score_step13.py json files")
     p.add_argument("--years", type=int, nargs="+", default=[2017, 2018])
     p.add_argument("--out", default="docs/step13")
-    p.add_argument("--paired", default=None, help="climode_paired.json (scripts/compare_step13_climode.py)")
+    p.add_argument("--paired", nargs="*", default=None, help="climode_paired*.json (scripts/compare_step13_climode.py)")
     p.add_argument("--subtitle", default="Real ERA5 5.625°, test 2017-2018 (ClimODE's 360 ICs), 8 members; "
                                          "CPU budget: FM 3000 it, PINN 1000 it")
     a = p.parse_args(argv)
@@ -188,8 +196,9 @@ def main(argv=None):
         plt.close(fig)
         written.append(path)
         print(f"[plot] {path}: " + ", ".join(q[0] for q in present))
-    if a.paired and os.path.exists(a.paired):
-        written.append(plot_paired(a.paired, a.out, mx, mn))
+    paired = [q for q in (a.paired or []) if os.path.exists(q)]
+    if paired:
+        written.append(plot_paired(paired, a.out, mx, mn))
     return written
 
 
