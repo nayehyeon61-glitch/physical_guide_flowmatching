@@ -30,7 +30,8 @@ def main():
     leads = report["daily_leads_hours"]
     target.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source / f"{args.tag}.json", target / "summary.json")
-    shutil.copy2(source / f"{args.tag}_scores.csv", target / "scores.csv")
+    # Normalize CSV newlines for readable Git diffs without changing values.
+    (target / "scores.csv").write_text((source / f"{args.tag}_scores.csv").read_text())
     days = [lead / 24 for lead in leads]
     fig, axes = plt.subplots(2, 2, figsize=(11, 7.4), constrained_layout=True)
     colors = ("#565656", "#d47a17", "#1976ba", "#24854b", "#ad4258")

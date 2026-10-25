@@ -451,7 +451,7 @@ def main(argv=None):
                              **{key: float(value[index, channel]) for key, value in metrics.items()}})
     if rows:
         with (out / f"{args.eval_tag}_scores.csv").open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]), lineterminator="\n")
             writer.writeheader()
             writer.writerows(rows)
     result = {
