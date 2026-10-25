@@ -8,6 +8,9 @@
     structure       zonal power of member anomalies / truth anomalies in three wavenumber bands
                     (blur or noise), z500-t850 anomaly correlation inside a member vs the truth, lag-24 h
                     anomaly autocorrelation along the member trajectory vs the truth (persistence)
+    energy          Doob-type control along the lead (owner): E[max_k |e_k|^2] / E|e_K|^2 for the member
+                    deviations and for the error of the mean (<= 4 if the energy is a submartingale in
+                    the lead), and the fraction of lead steps where the mean member energy falls
     uncertainty     paired bootstrap over ICs (members are never resampled as cases) of the CRPS and RMSE
                     difference of every arm to ``--ref``, 95 % intervals
 
@@ -93,8 +96,17 @@ def score_year(prefix, year, era5, terc, lat, mx, mn):
     out["zt_corr_truth"] = corr(oa[:, :, iz], oa[:, :, it], (-1, -2))
     out["lag24_member"] = corr(ea[:, :, :-1], ea[:, :, 1:], (-1, -2)).mean(1)  # (n, L - 1, 5)
     out["lag24_truth"] = corr(oa[:, :-1], oa[:, 1:], (-1, -2))
+    # energy along the lead (24 h multiples): per member deviation energy and error energy of the mean
+    out["e_member"] = (((E - mu[:, None]) ** 2) * w).mean((-1, -2))  # (n, M, L, 5)
+    out["e_error"] = (((mu - O) ** 2) * w).mean((-1, -2))[:, None]  # (n, 1, L, 5)
     out["M"], out["leads"] = M, leads
     return out
+
+
+def doob(e):
+    """(n, M, L, 5) energies -> Doob ratio E[max_k e_k] / E[e_K] and falling-step fraction, per variable."""
+    mk = e.mean((0, 1))
+    return e.max(2).mean((0, 1)) / e[:, :, -1].mean((0, 1)), (mk[1:] < mk[:-1]).mean(0)
 
 
 def main(argv=None):
@@ -122,6 +134,8 @@ def main(argv=None):
         per[arm]["rank_hist"] = np.mean([q["rank_hist"] for q in ys], 0)
         per[arm]["power_ratio"] = {b: np.mean([q["power_ratio"][b] for q in ys], 0) for b in BANDS}
         per[arm]["M"], per[arm]["leads"] = ys[0]["M"], ys[0]["leads"]
+        per[arm]["doob_member"], per[arm]["falling_member"] = doob(np.concatenate([q["e_member"] for q in ys]))
+        per[arm]["doob_error"], _ = doob(np.concatenate([q["e_error"] for q in ys]))
     res = {"arms": {}, "vars": VARS}
     for arm, r in per.items():
         M, leads = r["M"], r["leads"]
@@ -135,7 +149,9 @@ def main(argv=None):
              "outside_range": rh[..., 0] + rh[..., -1], "outside_range_perfect": 2 / (M + 1),
              "rank_tv_from_flat": 0.5 * np.abs(rh - 1 / (M + 1)).sum(-1),
              "zt_corr_member": r["zt_corr_member"].mean(0), "zt_corr_truth": r["zt_corr_truth"].mean(0),
-             "lag24_member": r["lag24_member"].mean(0), "lag24_truth": r["lag24_truth"].mean(0)}
+             "lag24_member": r["lag24_member"].mean(0), "lag24_truth": r["lag24_truth"].mean(0),
+             "doob_ratio_member": r["doob_member"], "falling_steps_member": r["falling_member"],
+             "doob_ratio_error": r["doob_error"]}
         d.update({f"power_ratio_{b}": v for b, v in r["power_ratio"].items()})
         res["arms"][os.path.basename(arm)] = {k: np.asarray(v).tolist() for k, v in d.items()}
         res["arms"][os.path.basename(arm)]["leads"] = np.asarray(leads).tolist()
@@ -164,7 +180,8 @@ def main(argv=None):
               f"{d['bss_lower'][0][j]:.2f}/{d['bss_upper'][0][j]:.2f} d6 {d['bss_lower'][-1][j]:.2f}/{d['bss_upper'][-1][j]:.2f}"
               + " | outside " + " ".join(f"{v[j]:.2f}" for v in d["outside_range"]) + f" (perfect {d['outside_range_perfect']:.2f})"
               + " | power k13-32 " + " ".join(f"{v[j]:.2f}" for v in d["power_ratio_k13-32"])
-              + " | z-t corr " + " ".join(f"{m:.2f}/{t:.2f}" for m, t in zip(d["zt_corr_member"], d["zt_corr_truth"])),
+              + " | z-t corr " + " ".join(f"{m:.2f}/{t:.2f}" for m, t in zip(d["zt_corr_member"], d["zt_corr_truth"]))
+              + f" | Doob member {d['doob_ratio_member'][j]:.2f} error {d['doob_ratio_error'][j]:.2f}",
               flush=True)
     return res
 
