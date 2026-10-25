@@ -58,3 +58,39 @@ def test_seq_fm_loss_and_sample_for_both_bases():
         assert torch.isfinite(loss) and 1.2 < loss.item() < 1.8  # zero output layer: E|eps - a|^2 = 1.5
         assert fm.sample(hist, h0, steps=1).shape == d.shape
 
+
+
+def test_guided_sampling_lowers_the_guided_loss_and_keeps_the_noise_pairing():
+    from pgcfm.seqdct import SeqRegressor, hard_constraints  # noqa: F401
+    torch.manual_seed(0)
+    fm = SeqFM(SeqFMConfig(K=K, basis="dct", model_channels=32, channel_mult=(1, 2)), torch.randn(8, H, W))
+    fm.fit_basis([torch.randn(6, K, C, H, W) * 0.2])
+    for q in fm.unet.out.parameters():  # the U-Net's output layer starts at zero: v = 0 means no guidance scale
+        q.data.normal_(0, 0.05)
+    hist, h0 = torch.randn(2, 3, C, H, W), torch.tensor([0.0, 6.0])
+    eps = fm.noise(2)
+    phys = lambda d: (d[:, :, 0] ** 2).sum()  # noqa: E731  (a stand-in physics loss on channel 0)
+    raw = fm.sample(hist, h0, steps=4, eps=eps)
+    assert torch.equal(raw, fm.sample(hist, h0, steps=4, eps=eps))  # same eps, same member
+    guided = fm.sample(hist, h0, steps=4, eps=eps, physics=phys, lam=0.5, s0=0.5)
+    assert phys(guided) < phys(raw)
+    assert torch.equal(fm.sample(hist, h0, steps=4, eps=eps, physics=phys, lam=0.0), raw)
+
+
+def test_regressor_and_hard_constraints():
+    from pgcfm.seqdct import SeqRegressor, hard_constraints
+    reg = SeqRegressor(SeqFMConfig(K=K, model_channels=32, channel_mult=(1, 2)), torch.randn(8, H, W))
+    hist, d, h0 = torch.randn(2, 3, C, H, W), torch.randn(2, K, C, H, W), torch.tensor([0.0, 6.0])
+    reg.fit_scale([d])
+    reg.errors.fit([d])
+    w = torch.ones(1, 1, 1, H, 1)
+    loss = reg.loss(hist, d, h0, w)
+    loss.backward()
+    assert torch.isfinite(loss) and reg.sample(hist, h0).shape == d.shape
+    mean, std = torch.zeros(contract.N_CHANNELS).numpy() + 1.0, torch.ones(contract.N_CHANNELS).numpy()
+    x0 = torch.zeros(2, C, H, W)
+    fixed, frac = hard_constraints(x0, d, mean, std)  # physical q = 1 + x: q < 0 where x < -1
+    q = contract.DYNAMIC_CHANNELS.index(contract.CHANNEL_INDEX["q500"])
+    assert 0 < frac < 1 and (fixed[:, :, q] >= -1 - 1e-6).all()
+    t = contract.DYNAMIC_CHANNELS.index(contract.CHANNEL_INDEX["t500"])
+    assert torch.equal(fixed[:, :, t], d[:, :, t])

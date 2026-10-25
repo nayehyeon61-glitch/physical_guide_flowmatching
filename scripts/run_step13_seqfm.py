@@ -1,5 +1,14 @@
 """Step 13, stage 2: sequence flow matching (pgcfm/seqdct.SeqFM) + the frozen stage-1 PINN, scored on
-ClimODE's protocol.
+ClimODE's protocol, as the owner's four-model comparison (H1-H3, docs/step13_sequence.md):
+
+    --model regress   H1's control: the same U-Net and inputs trained by MSE + statistical errors
+                      (Gaussian, diagonal in the 3-D DCT basis, fitted on validation-year residuals)
+    --model fm        arms  raw          the flow alone
+                            pinn         + the frozen PINN on every member, after generation (H2)
+                            guided       physics guidance in the late generation ODE (H3, --guide-lam)
+                            guided_pinn  both
+    every arm then gets the hard constraints q >= 0, tcwv >= 0 (the violated fraction is reported);
+    raw and guided start from the same noise, so their difference is paired.
 
     sample   history x(t - 12 h), x(t - 6 h), x(t) -> increments d_k = x(t + 6k h) - x(t), k = 1..K
              (K = 24: the whole 144 h in one flow, no autoregressive feedback)
@@ -33,8 +42,8 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from pgcfm import contract  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
-from pgcfm.seqdct import (PINNConfig, PINNProjector, SeqFM, SeqFMConfig, band_spread,  # noqa: E402
-                          residual_rms)
+from pgcfm.seqdct import (PINNConfig, PINNProjector, SeqFM, SeqFMConfig, SeqRegressor, band_spread,  # noqa: E402
+                          hard_constraints, residual_rms, sequence_residual_loss)
 from scripts.run_step11_climode import VARS, climode_minmax, climode_scores, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 from scripts.run_step13_pinn import load_years  # noqa: E402
@@ -67,8 +76,11 @@ def main(argv=None):
     p.add_argument("--kai", required=True)
     p.add_argument("--era5", required=True)
     p.add_argument("--out", default="runs/step13")
-    p.add_argument("--basis", default="dct", choices=["dct", "grid"])
+    p.add_argument("--model", default="fm", choices=["fm", "regress"])
+    p.add_argument("--basis", default="dct", choices=["dct", "grid"], help="fm only")
     p.add_argument("--pinn", default=None, help="stage-1 checkpoint (pinn_<objective>.pt); none = no PINN")
+    p.add_argument("--guide-lam", type=float, default=0.0, help="H3 guidance strength (fraction of |v|); 0 = off")
+    p.add_argument("--guide-s0", type=float, default=0.75)
     p.add_argument("--train-years", type=int, nargs="+", default=[2012, 2013, 2014, 2015])
     p.add_argument("--val-year", type=int, default=2016)
     p.add_argument("--test-years", type=int, nargs="+", default=[2017, 2018])
@@ -81,8 +93,8 @@ def main(argv=None):
     p.add_argument("--heun", type=int, default=8)
     p.add_argument("--max-ics", type=int, default=None, help="per test year (ClimODE: 180)")
     p.add_argument("--save-ens", action="store_true",
-                   help="save the ensembles (5 ClimODE vars, 24 h multiples) of the validation and test years "
-                        "at ClimODE-style ICs, for stage 3")
+                   help="save the ensembles (5 ClimODE vars, 24 h multiples) of every arm in the test years and of "
+                        "pinn (raw without a PINN) in the validation year (stage 3 trains on it)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--quick", action="store_true")
@@ -93,7 +105,7 @@ def main(argv=None):
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    tag = f"seqfm_{a.basis}" + ("_quick" if a.quick else "")
+    tag = (f"seqfm_{a.basis}" if a.model == "fm" else "seqregress") + ("_quick" if a.quick else "")
     log = lambda s: print(s, flush=True)  # noqa: E731
     stats = os.path.join(a.out, "stats")  # written by run_step13_pinn.py on the same training years
     mean, std = np.load(os.path.join(stats, "global_mean.npy")), np.load(os.path.join(stats, "global_std.npy"))
@@ -102,45 +114,58 @@ def main(argv=None):
         contract.register_latitudes(np.asarray(d["latitude"][:]))
     lat, lon, oro, lsm = load_static(a.era5)
     static = static_features(lat, lon, oro, lsm)
-    fm = SeqFM(SeqFMConfig(K=a.K, basis=a.basis, model_channels=a.channels), static)
-    res = {"args": vars(a), "cfg": dataclasses.asdict(fm.cfg), "n_params": sum(q.numel() for q in fm.parameters())}
-    log(f"[stage 2 {a.basis}] {res['n_params']} parameters")
+    w = torch.from_numpy(np.cos(np.deg2rad(lat)).astype(np.float32))
+    w = (w / w.mean()).view(1, 1, 1, -1, 1)
+    cfg = SeqFMConfig(K=a.K, basis=a.basis, model_channels=a.channels)
+    model = SeqFM(cfg, static) if a.model == "fm" else SeqRegressor(cfg, static)
+    res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "n_params": sum(q.numel() for q in model.unet.parameters())}
+    log(f"[stage 2 {tag}] {res['n_params']} parameters")
+    draws = lambda years, n: (batch(data, random_picks(data, years, a.K, rng, 8), a.K) for _ in range(n))  # noqa: E731
 
-    # -- training: the FM's own loss on its coefficients (never through the PINN) --------------------
+    # -- training: each model's own loss (the FM is never trained through the PINN) -----------------
     ck = os.path.join(a.out, f"{tag}.pt")
     if os.path.exists(ck):
-        fm.load_state_dict(torch.load(ck))
+        model.load_state_dict(torch.load(ck))
     else:
-        fm.fit_basis(batch(data, random_picks(data, a.train_years, a.K, rng, 8), a.K)[1] for _ in range(32))
-        opt = torch.optim.Adam(fm.unet.parameters(), lr=a.lr)
+        if a.model == "fm":
+            model.fit_basis(q[1] for q in draws(a.train_years, 32))
+        else:
+            model.fit_scale(q[1] for q in draws(a.train_years, 32))
+        opt = torch.optim.Adam(model.unet.parameters(), lr=a.lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
         part, hist, start, t0 = ck + ".train", [], 0, time.time()
         if os.path.exists(part):
             s = torch.load(part, weights_only=False)
-            fm.load_state_dict(s["fm"]), opt.load_state_dict(s["opt"]), sched.load_state_dict(s["sched"])
+            model.load_state_dict(s["fm"]), opt.load_state_dict(s["opt"]), sched.load_state_dict(s["sched"])
             hist, start, t0 = s["hist"], s["it"], time.time() - s["seconds"]
             rng.bit_generator.state = s["rng"]
             log(f"  resumed at it {start}")
+        model.train()
         for it in range(start, a.iters):
             if it > start and it % 100 == 0:
-                torch.save({"fm": fm.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "hist": hist,
-                            "it": it, "seconds": time.time() - t0, "rng": rng.bit_generator.state}, part + ".tmp")
+                torch.save({"fm": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                            "hist": hist, "it": it, "seconds": time.time() - t0, "rng": rng.bit_generator.state},
+                           part + ".tmp")
                 os.replace(part + ".tmp", part)
             h, d, _, hour0 = batch(data, random_picks(data, a.train_years, a.K, rng, a.batch), a.K)
-            loss = fm.loss(h, d, hour0)
+            loss = model.loss(h, d, hour0) if a.model == "fm" else model.loss(h, d, hour0, w)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(fm.unet.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.unet.parameters(), 1.0)
             opt.step()
             sched.step()
             hist.append(loss.item())
             if (it + 1) % max(1, a.iters // 30) == 0:
                 log(f"  it {it + 1:5d} loss {np.mean(hist[-50:]):.4f} {time.time() - t0:.0f}s")
-        torch.save(fm.state_dict(), ck)
+        model.eval()
+        if a.model == "regress":  # statistical errors: residuals of the regression on the validation year
+            with torch.no_grad():
+                model.errors.fit(q[1] - model(q[0], q[3]) for q in draws([a.val_year], 16))
+        torch.save(model.state_dict(), ck)
         if os.path.exists(part):
             os.remove(part)
         res.update(train_seconds=time.time() - t0, loss=hist[::10])
-    fm.eval()
+    model.eval()
 
     P = None
     if a.pinn:
@@ -156,6 +181,8 @@ def main(argv=None):
         h, d, orog, _ = batch(data, random_picks(data, a.train_years, 1, rng, 16), 1)
         est.append({"x0": h[:, -1], "targets": (h[:, -1] + d[:, 0])[:, None], "static": orog, "doy": torch.zeros(16, 1)})
     guide.scales = estimate_scales(guide, est)
+    for q in guide.parameters():
+        q.requires_grad_(False)
 
     # u10/v10 from u1000/v1000 on the validation year (step 11)
     era5 = a.era5
@@ -180,54 +207,82 @@ def main(argv=None):
             out[..., i, :, :] = sfc[v][0] + sfc[v][1] * out[..., i, :, :]
         return out
 
-    # -- test on ClimODE's ICs --------------------------------------------------------------------
+    # -- ensembles on ClimODE's ICs ---------------------------------------------------------------
+    guided = a.model == "fm" and a.guide_lam > 0
+    arms = ("raw",) + (("pinn",) if P is not None else ()) + (("guided",) if guided else ()) \
+        + (("guided_pinn",) if guided and P is not None else ())
+    pair_ids = torch.tensor([0, a.K // 2, a.K - 1])  # residual diagnostics and the H3 guidance
     mx, mn = climode_minmax(era5)
     wl = np.cos(np.deg2rad(lat))
     wl = (wl / wl.mean())[:, None]
-    arms = ("raw",) + (("pinn",) if P is not None else ())
     sc = {arm: {k: [] for k in ("rmse", "acc", "crps_gauss", "crps_ens", "spread", "rmse_pers")} for arm in arms}
     phys = {arm: [] for arm in arms + ("truth",)}
-    bands = []
+    viol = {arm: [] for arm in arms}
+    bands = {arm: [] for arm in arms if arm.endswith("pinn")}
+    cost = {arm: 0.0 for arm in arms}
     g = torch.Generator().manual_seed(a.seed + 7)
-    t0 = time.time()
     for y in ([a.val_year] if a.save_ens else []) + a.test_years:
         score = y in a.test_years
         x = data[y] if y == a.val_year else load_years(a.kai, [y], mean, std)[y]
         truth = climode_truth(era5, y)
-        keep = {"E": [], "O": [], "X0": [], "ics": []}
+        here = arms if score else [q for q in ("raw", "pinn") if q in arms]  # validation: no guidance
+        keep = {arm: {"E": [], "O": [], "X0": [], "ics": []} for arm in (here if score else here[-1:])}
         clim = truth.mean(0)
         n_ic = (len(x) - 2 - a.K) // 8 + 1
         n_ic = min(n_ic, a.max_ics or n_ic)
+        t0 = time.time()
         for c0 in range(0, n_ic, 4):
             ics = [2 + 8 * e for e in range(c0, min(n_ic, c0 + 4))]
             h, d, orog, hour0 = batch({y: x}, [(y, i) for i in ics], a.K)
             B = len(ics)
-            hm = h.repeat_interleave(a.members, 0)
-            ens = {"raw": fm.sample(hm, hour0.repeat_interleave(a.members), a.heun, g)}
-            if P is not None:
-                with torch.no_grad():
-                    ens["pinn"] = P(hm[:, -1], ens["raw"], hour0.repeat_interleave(a.members))
-            if P is not None and score:
-                e_raw = ens["raw"].view(B, a.members, *ens["raw"].shape[1:]).transpose(0, 1)
-                e_p = ens["pinn"].view(B, a.members, *ens["pinn"].shape[1:]).transpose(0, 1)
-                s_r, s_p = band_spread(e_raw, P.cfg.k_lat, P.cfg.k_lon), band_spread(e_p, P.cfg.k_lat, P.cfg.k_lon)
-                bands.append({b: s_p[b] / s_r[b] for b in s_r})
+            hm, h0m, om = h.repeat_interleave(a.members, 0), hour0.repeat_interleave(a.members), \
+                orog.repeat_interleave(a.members, 0)
+            x0m = hm[:, -1]
+            ens, tc = {}, time.time()
+            if a.model == "fm":
+                eps = model.noise(len(hm), g)
+                ens["raw"] = model.sample(hm, h0m, a.heun, eps=eps)
+            else:
+                ens["raw"] = model.sample(hm, h0m, generator=g)
+            cost["raw"] += time.time() - tc
+            if guided and score:
+                tc = time.time()
+                zero = torch.zeros_like(ens["raw"])
+                ens["guided"] = model.sample(
+                    hm, h0m, a.heun, eps=eps, lam=a.guide_lam, s0=a.guide_s0,
+                    physics=lambda q: sequence_residual_loss(guide, x0m, q, zero, om, pair_ids)[0])
+                cost["guided"] += time.time() - tc
+            for src, arm in (("raw", "pinn"), ("guided", "guided_pinn")):
+                if arm in here:
+                    tc = time.time()
+                    with torch.no_grad():
+                        ens[arm] = P(x0m, ens[src], h0m)
+                    cost[arm] += time.time() - tc
+            for arm in here:
+                ens[arm], f = hard_constraints(x0m, ens[arm], mean, std)
+                if score:
+                    viol[arm].append(f)
+            if score:
+                for arm, src in (("pinn", "raw"), ("guided_pinn", "guided")):
+                    if arm in ens:
+                        e0 = ens[src].view(B, a.members, *ens[src].shape[1:]).transpose(0, 1)
+                        e1 = ens[arm].view(B, a.members, *ens[arm].shape[1:]).transpose(0, 1)
+                        s0_, s1_ = band_spread(e0, P.cfg.k_lat, P.cfg.k_lon), band_spread(e1, P.cfg.k_lat, P.cfg.k_lon)
+                        bands[arm].append({k: s1_[k] / s0_[k] for k in s0_})
+                phys["truth"].append(residual_rms(guide, h[:, -1], d, d, orog, pair_ids))
             sel = torch.tensor([k * 4 - 1 for k in range(1, a.K // 4 + 1)])  # 24 h multiples
-            pair_ids = torch.tensor([0, a.K // 2, a.K - 1])
             O = np.stack([truth[[i + hh // 6 for hh in LEADS_H[:len(sel)]]] for i in ics])  # (B, L, 5, H, W)
             X0 = np.repeat(truth[ics][:, None], len(sel), 1)
-            if score:
-                phys["truth"].append(residual_rms(guide, h[:, -1], d, d, orog, pair_ids))
-            for arm, inc in ens.items():
-                mem = (hm[:, -1][:, None] + inc[:, sel]).view(B, a.members, len(sel), *inc.shape[2:])
+            for arm in here:
+                inc = ens[arm]
+                mem = (x0m[:, None] + inc[:, sel]).view(B, a.members, len(sel), *inc.shape[2:])
                 E = to_vars(mem.numpy())  # (B, M, L, 5, H, W)
-                if a.save_ens and arm == arms[-1]:
-                    keep["E"].append((E - X0[:, None]).astype(np.float16)), keep["O"].append(O)
-                    keep["X0"].append(X0[:, 0]), keep["ics"].extend(ics)
+                if a.save_ens and arm in keep:
+                    keep[arm]["E"].append((E - X0[:, None]).astype(np.float16)), keep[arm]["O"].append(O)
+                    keep[arm]["X0"].append(X0[:, 0]), keep[arm]["ics"].extend(ics)
                 if not score:
                     continue
-                phys[arm].append(residual_rms(guide, hm[:, -1], inc, d.repeat_interleave(a.members, 0),
-                                              orog.repeat_interleave(a.members, 0), pair_ids))
+                phys[arm].append(residual_rms(guide, x0m, inc, d.repeat_interleave(a.members, 0), om, pair_ids))
                 mu, sd = E.mean(1), E.std(1, ddof=1)
                 s = climode_scores(mu, O, np.maximum(sd, 1e-6), clim, lat, mx, mn)
                 q = climode_scores(X0, O, np.full_like(X0, 1e-6), clim, lat, mx, mn)
@@ -238,34 +293,36 @@ def main(argv=None):
                 sc[arm]["spread"].append(np.sqrt((sd ** 2 * wl).mean((-1, -2))))
                 sc[arm]["rmse_pers"].append(q["rmse"])
         if a.save_ens:  # E - X0 in float16 (physical units), O and X0 in float32
-            np.savez(os.path.join(a.out, f"{tag}_{arms[-1]}_ens_{y}.npz"), E_minus_x0=np.concatenate(keep["E"]),
-                     O=np.concatenate(keep["O"]), X0=np.concatenate(keep["X0"]), ics=np.array(keep["ics"]),
-                     leads=np.array(LEADS_H[:len(sel)]))
+            for arm, kp in keep.items():
+                np.savez(os.path.join(a.out, f"{tag}_{arm}_ens_{y}.npz"), E_minus_x0=np.concatenate(kp["E"]),
+                         O=np.concatenate(kp["O"]), X0=np.concatenate(kp["X0"]), ics=np.array(kp["ics"]),
+                         leads=np.array(LEADS_H[:len(sel)]))
         log(f"  {'test' if score else 'val'} {y}: {n_ic} ICs {time.time() - t0:.0f}s")
-    res["test"] = {}
+    n_ic = sum(len(v) for v in sc[arms[0]]["rmse"])
+    res["test"] = {"n_ic": n_ic, "truth_residual": {k: float(np.mean([q[k] for q in phys["truth"]]))
+                                                     for k in phys["truth"][0]}}
     for arm in arms:
         r = {k: np.concatenate(v) for k, v in sc[arm].items()}
-        res["test"][arm] = {k: {str(h): {v: float(r[k][:, j, i].mean()) for i, v in enumerate(VARS)}
-                                for j, h in enumerate(LEADS_H[:r[k].shape[1]])} for k in r}
-        res["test"][arm]["ssr"] = {str(h): {v: float(np.sqrt((r["spread"][:, j, i] ** 2).mean() * (a.members + 1) / a.members)
-                                                     / np.sqrt((r["rmse"][:, j, i] ** 2).mean()))
-                                            for i, v in enumerate(VARS)} for j, h in enumerate(LEADS_H[:r["rmse"].shape[1]])}
-        res["test"][arm]["residual"] = {k: float(np.mean([q[k] for q in phys[arm]])) for k in phys[arm][0]}
-        rr = res["test"][arm]["rmse"]
-        log(f"[{arm}] z500 RMSE " + " ".join(f"{h}:{rr[h]['z']:.0f}" for h in rr)
-            + " | t850 24h {:.2f} t2m 24h {:.2f}".format(rr["24"]["t"], rr["24"]["t2m"])
-            + " | SSR z500 " + " ".join(f"{res['test'][arm]['ssr'][h]['z']:.2f}" for h in rr)
-            + " | CRPS z500 " + " ".join(f"{res['test'][arm]['crps_ens'][h]['z']:.4f}" for h in rr))
-    res["test"]["truth_residual"] = {k: float(np.mean([q[k] for q in phys["truth"]])) for k in phys["truth"][0]}
-    if bands:
-        res["test"]["pinn_spread_ratio"] = {b: float(np.mean([q[b] for q in bands])) for b in bands[0]}
-        log(f"[pinn] spread after/before P: {res['test']['pinn_spread_ratio']}")
-    log("[residual] " + " | ".join(f"{arm}: " + " ".join(f"{k} {v:.2f}" for k, v in
-                                                          (res['test'][arm]['residual'] if arm != 'truth' else
-                                                           res['test']['truth_residual']).items())
-                                    for arm in arms + ("truth",)))
-    res["test"]["n_ic"] = sum(len(v) for v in sc[arms[0]]["rmse"])
-    with open(os.path.join(a.out, f"{tag}{'_pinn' if P is not None else ''}.json"), "w") as f:
+        t = {k: {str(h): {v: float(r[k][:, j, i].mean()) for i, v in enumerate(VARS)}
+                 for j, h in enumerate(LEADS_H[:r[k].shape[1]])} for k in r}
+        t["ssr"] = {str(h): {v: float(np.sqrt((r["spread"][:, j, i] ** 2).mean() * (a.members + 1) / a.members)
+                                      / np.sqrt((r["rmse"][:, j, i] ** 2).mean()))
+                             for i, v in enumerate(VARS)} for j, h in enumerate(LEADS_H[:r["rmse"].shape[1]])}
+        t["residual"] = {k: float(np.mean([q[k] for q in phys[arm]])) for k in phys[arm][0]}
+        t["hard_violation_frac"] = float(np.mean(viol[arm]))
+        t["seconds_per_ic"] = cost[arm] / n_ic
+        if arm in bands:
+            t["spread_ratio_through_pinn"] = {k: float(np.mean([q[k] for q in bands[arm]])) for k in bands[arm][0]}
+        res["test"][arm] = t
+        log(f"[{arm}] z500 RMSE " + " ".join(f"{h}:{t['rmse'][h]['z']:.0f}" for h in t["rmse"])
+            + " | t850 24h {:.2f} t2m 24h {:.2f}".format(t["rmse"]["24"]["t"], t["rmse"]["24"]["t2m"])
+            + " | SSR z500 " + " ".join(f"{t['ssr'][h]['z']:.2f}" for h in t["rmse"])
+            + " | CRPS z500 " + " ".join(f"{t['crps_ens'][h]['z']:.4f}" for h in t["rmse"])
+            + " | residual " + " ".join(f"{k} {v:.2f}" for k, v in t["residual"].items())
+            + f" | q/tcwv<0 {t['hard_violation_frac']:.4f} | {t['seconds_per_ic']:.1f} s/IC"
+            + (f" | spread through P {t['spread_ratio_through_pinn']}" if arm in bands else ""))
+    log("[truth residual] " + " ".join(f"{k} {v:.2f}" for k, v in res["test"]["truth_residual"].items()))
+    with open(os.path.join(a.out, f"{tag}{'_pinn' if P is not None else ''}{'_guided' if guided else ''}.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
 

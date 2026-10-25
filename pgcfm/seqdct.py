@@ -262,11 +262,93 @@ class SeqFM(nn.Module):
         tau, z, u = self.fm.sample_location_and_conditional_flow(torch.randn_like(a1), a1)
         return ((self.velocity(tau, z, hist, hour0) - u) ** 2).mean()
 
-    @torch.no_grad()
-    def sample(self, hist, hour0, steps: int = 8, generator=None):
-        """One member per row of hist: increments (B, K, 66, H, W) by Heun on the flow."""
-        from .cfm import heun
+    def noise(self, B: int, generator=None, device=None) -> torch.Tensor:
+        return torch.randn((B,) + tuple(self.basis.std.shape), generator=generator, device=device)
+
+    def sample(self, hist, hour0, steps: int = 8, generator=None, eps=None, physics=None, lam: float = 0.0,
+               s0: float = 0.75):
+        """One member per row of hist: increments (B, K, 66, H, W) by Heun on the generation ODE
+        da/ds = v(a, s) from s = 0 (noise ``eps``) to s = 1.
+
+        ``physics(d) -> scalar`` with lam > 0 adds H3's guidance on s >= s0:
+            v <- v - lam (s - s0) / (1 - s0) * rms(v) * g / rms(g),  g = grad_a physics(B^-1(a + (1 - s) v)),
+        i.e. the physics loss of the endpoint estimate a_1 = a + (1 - s) v, its gradient taken with v held
+        fixed (no backpropagation through the U-Net), scaled per sample to a fraction of |v|."""
         B = hist.shape[0]
-        a = torch.randn((B,) + tuple(self.basis.std.shape), generator=generator, device=hist.device)
-        a = heun(lambda t, s: self.velocity(t, s, hist, hour0), a, steps)
+        a = self.noise(B, generator, hist.device) if eps is None else eps
+
+        def f(t, z):
+            with torch.no_grad():
+                v = self.velocity(t, z, hist, hour0)
+            s = float(t[0])
+            if physics is None or lam <= 0 or s < s0:
+                return v
+            with torch.enable_grad():
+                z_ = z.detach().requires_grad_(True)
+                g, = torch.autograd.grad(physics(self.to_incr(z_ + (1.0 - s) * v)), z_)
+            dims = tuple(range(1, v.ndim))
+            r = (v.pow(2).mean(dims, keepdim=True) / g.pow(2).mean(dims, keepdim=True).clamp_min(1e-30)).sqrt()
+            return v - lam * (s - s0) / (1.0 - s0) * r * g
+
+        h = 1.0 / steps
+        for i in range(steps):  # Heun (explicit trapezoidal), as cfm.heun
+            t0 = torch.full((B,), i * h, device=a.device)
+            k1 = f(t0, a)
+            k2 = f(t0 + h, a + h * k1)
+            a = a + 0.5 * h * (k1 + k2)
         return self.to_incr(a)
+
+
+class SeqRegressor(nn.Module):
+    """H1's control: the same U-Net and inputs as SeqFM, trained by MSE to output the increments
+    directly (one deterministic 144 h sequence); members = this + statistical errors (``SeqDCT``
+    fitted on validation residuals, i.e. a Gaussian that is diagonal in the 3-D DCT basis)."""
+
+    def __init__(self, cfg: SeqFMConfig, static: torch.Tensor, H: int = 32, W: int = 64):
+        super().__init__()
+        from torchcfm.models.unet.unet import UNetModel
+        from .cfm import make_lon_periodic
+        self.cfg = cfg
+        self.register_buffer("static", static)
+        self.register_buffer("scale", torch.ones(cfg.K, N_DYN, 1, 1))  # per-lead, per-channel std of d
+        self.unet = make_lon_periodic(UNetModel(
+            image_size=max(H, W), in_channels=3 * N_DYN + static.shape[0] + 4,
+            model_channels=cfg.model_channels, out_channels=cfg.K * N_DYN, num_res_blocks=cfg.num_res_blocks,
+            attention_resolutions=(), dropout=0.0, channel_mult=cfg.channel_mult))
+        self.errors = SeqDCT(cfg.K, N_DYN, H, W, spatial=False)
+
+    @torch.no_grad()
+    def fit_scale(self, batches) -> None:
+        n, s2 = 0, 0.0
+        for d in batches:
+            n, s2 = n + d.shape[0], s2 + (d.double() ** 2).mean((-1, -2), keepdim=True).sum(0)
+        self.scale.copy_((s2 / n).sqrt().float().clamp_min(1e-6))
+
+    def forward(self, hist, hour0):
+        B, _, C, H, W = hist.shape
+        h = torch.cat([hist.reshape(B, 3 * C, H, W), self.static.expand(B, -1, -1, -1),
+                       time_features(hour0.float(), H, W)], 1)
+        return self.unet(torch.zeros(B, device=hist.device), h).view(B, self.cfg.K, C, H, W) * self.scale
+
+    def loss(self, hist, d, hour0, w):
+        return (((self(hist, hour0) - d) / self.scale) ** 2 * w).mean()
+
+    @torch.no_grad()
+    def sample(self, hist, hour0, generator=None, **_):
+        mu = self(hist, hour0)
+        return mu + self.errors.inverse_coeffs(self.errors.mean + self.errors.std *
+                                               torch.randn(mu.shape, generator=generator, device=mu.device))
+
+
+def hard_constraints(x0: torch.Tensor, d: torch.Tensor, mean, std):
+    """q >= 0 and tcwv >= 0 on the frames x0 + d (normalized KAI units). Returns (d, fraction of
+    member values that violated a constraint)."""
+    idx = [contract.DYNAMIC_CHANNELS.index(contract.CHANNEL_INDEX[c])
+           for c in [f"q{p}" for p in contract.LEVELS_HPA] + ["tcwv"]]
+    full = [contract.DYNAMIC_CHANNELS[i] for i in idx]
+    lo = torch.as_tensor(-mean[full] / (std[full] + contract.KAI_STD_EPS), dtype=d.dtype).view(1, 1, -1, 1, 1)
+    x = x0[:, None, idx] + d[:, :, idx]
+    frac = float((x < lo).float().mean())
+    d = d.clone()
+    d[:, :, idx] = torch.maximum(x, lo) - x0[:, None, idx]
+    return d, frac
