@@ -154,6 +154,7 @@ def main(argv=None):
         bs_clim_hi = r["obs_freq_upper"].mean(0) * (1 - r["obs_freq_upper"].mean(0))
         d = {"crps": r["crps"].mean(0), "rmse": r["rmse"].mean(0),
              "ssr": np.sqrt(r["spread2"].mean(0) * (M + 1) / M) / np.sqrt((r["rmse"] ** 2).mean(0)),
+             "spread": np.sqrt(r["spread2"].mean(0)),
              "brier_lower": r["brier_lower"].mean(0), "brier_upper": r["brier_upper"].mean(0),
              "bss_lower": 1 - r["brier_lower"].mean(0) / bs_clim_lo, "bss_upper": 1 - r["brier_upper"].mean(0) / bs_clim_hi,
              "outside_range": rh[..., 0] + rh[..., -1], "outside_range_perfect": 2 / (M + 1),
