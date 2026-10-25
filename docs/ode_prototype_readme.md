@@ -1,5 +1,9 @@
 # physical_guide_flowmatching
 
+이 파일은 Step13 소스를 가져오기 전 초기 ODE prototype README의 보존본입니다.
+현재 원래 모델과의 연결·실행 결과는 [Step13 실험 문서](step13_ode_experiment.md)를
+참고하십시오.
+
 FM이 생성한 앙상블에 물리 시간 적분을 연결하는 PyTorch 모듈입니다. 시간
 적분기는 **기존 `torchdiffeq==0.2.5`**를 사용합니다. 새 ODE solver를 구현하지
 않습니다. **Cartesian 추적자 예제**와 **ERA5 전지구 구면 transport·source

@@ -206,7 +206,9 @@ day_15_prediction = trajectory[-1]
 solid-body flow라 내부 step 1800초를 사용할 수 있었습니다. 이 값을 실제
 ERA5의 강한 바람·learned tendency에 일반화해서는 안 됩니다.
 
-실제 ERA5 파일, 원래 모델 코드/checkpoint는 현재 저장소에 없습니다. 따라서
-실제 데이터 로딩·기존 모델 연결·15일 학습·held-out 확률 예측 성능은 아직
-검증하지 않았습니다. 필요한 평가는 lead별 area-weighted RMSE/ACC, CRPS 또는
-energy score, spread–skill, rank/reliability, 물리 budget·장기 발산입니다.
+이 문서 작성 이후 사용자 Step13 브랜치의 원래 모델을 가져와
+`pgcfm/ode_corrector.py`로 연결하고, 합성 자료에서 K60 학습·비교를 실행했습니다.
+현재 실험은 [Step13 ODE 실험 문서](step13_ode_experiment.md)를 참고하십시오.
+실제 ERA5 파일과 기존에 충분히 학습한 checkpoint는 아직 없으므로 실제 ERA5
+성능 검증은 남아 있습니다. 필요한 평가는 lead별 area-weighted RMSE/ACC,
+CRPS 또는 energy score, spread–skill, rank/reliability, 물리 budget·장기 발산입니다.
