@@ -31,24 +31,24 @@ LEADS_H = (24, 48, 72, 96, 120, 144)
 # reference categorical order (dataviz skill palette, light mode), fixed per figure
 SLOTS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948")
 INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e4e3df"
-FIGURES = {
+FIGURES = {  # (score key, label, line style, categorical slot); calibration: slot = source of the mean
     "fig_stage2": ("Stage 2: sequence FM ensembles and controls", [
-        ("seqfm_dct_raw", "FM (DCT sequence)", "-"),
-        ("seqfm_dct_pinn", "FM + frozen PINN (H2)", "--"),
-        ("seqfm_dct_inloop", "FM + PINN inside the ODE", "-."),
-        ("seqfm_dct_guided", "FM + physics guidance (H3)", "-"),
-        ("seqfm_dct_smoothed", "FM + smoothing guidance (H3 control)", "--"),
-        ("seqregress_raw", "Regression + statistical errors (H1)", "-"),
+        ("seqfm_dct_raw", "FM (DCT sequence)", "-", 0),
+        ("seqfm_dct_pinn", "FM + frozen PINN (H2)", "--", 1),
+        ("seqfm_dct_inloop", "FM + PINN inside the ODE", "-.", 2),
+        ("seqfm_dct_guided", "FM + physics guidance (H3)", "-", 3),
+        ("seqfm_dct_smoothed", "FM + smoothing guidance (H3 control)", "--", 4),
+        ("seqregress_raw", "Regression + statistical errors (H1)", "-", 5),
     ]),
-    "fig_calibration": ("Stage 3: calibration guide on FM + PINN members", [
-        ("seqfm_dct_pinn_raw", "FM + PINN members", "-"),
-        ("seqfm_dct_pinn_mbm_band", "MBM mean + band spread", "--"),
-        ("seqfm_dct_pinn_op_mono", "Operator mean + monotone energy", "-"),
-        ("seqfm_dct_pinn_guide", "Operator + learned band guide", "--"),
-        ("seqfm_dct_pinn_core_band", "Step 12 core mean + FM deviations", "-"),
-        ("seqfm_dct_pinn_core_guide", "Core mean + learned band guide", "--"),
-        ("seqfm_dct_pinn_reg_band", "Sequence regression mean + FM deviations", "-"),
-        ("seqfm_dct_pinn_reg_guide", "Regression mean + learned band guide", "--"),
+    "fig_calibration": ("Stage 3: calibration guide on FM + PINN members (color = mean, dashed = learned guide)", [
+        ("seqfm_dct_pinn_raw", "FM + PINN members", "-", 0),
+        ("seqfm_dct_pinn_mbm_band", "MBM mean + band spread", "-", 1),
+        ("seqfm_dct_pinn_op_mono", "Operator mean + band spread", "-", 2),
+        ("seqfm_dct_pinn_guide", "Operator mean + learned band guide", "--", 2),
+        ("seqfm_dct_pinn_core_band", "Step 12 core mean + band spread", "-", 3),
+        ("seqfm_dct_pinn_core_guide", "Core mean + learned band guide", "--", 3),
+        ("seqfm_dct_pinn_reg_band", "Sequence regression mean + band spread", "-", 5),
+        ("seqfm_dct_pinn_reg_guide", "Regression mean + learned band guide", "--", 5),
     ]),
 }
 
@@ -96,11 +96,11 @@ def main(argv=None):
     days, pdays = np.array(LEADS_H) / 24, np.array(ph) / 24
     written = []
     for name, (title, lines) in FIGURES.items():
-        present = [(k, lab, ls) for k, lab, ls in lines if k in arms]
+        present = [q for q in lines if q[0] in arms]
         if not present:
             print(f"[plot] {name}: no arms in the score files, skipped")
             continue
-        fig, ax = plt.subplots(2, 2, figsize=(13, 8.6), constrained_layout=True)
+        fig, ax = plt.subplots(2, 2, figsize=(13, 9.6), layout="constrained")
         panels = [
             (ax[0, 0], "Mean of 5 variables", "Normalized RMSE (RMSE / std)",
              lambda r: (np.asarray(r["rmse"]) / std).mean(1), (p_rmse / std).mean(1), (paper_rmse / std).mean(1)),
@@ -112,10 +112,10 @@ def main(argv=None):
              lambda r: np.asarray(r["spread"])[:, iz] if "spread" in r else None, np.zeros(len(LEADS_H)), None),
         ]
         for a_, sub, ylab, get, pers, cl in panels:
-            for j, (k, lab, ls) in enumerate(present):
+            for k, lab, ls, slot in present:
                 yv = get(arms[k])
                 if yv is not None:
-                    a_.plot(days, yv, ls, color=SLOTS[j], lw=1.8, label=lab)
+                    a_.plot(days, yv, ls, color=SLOTS[slot], lw=1.8, label=lab)
             a_.plot(days, pers, ":", color=MUTED, lw=2, label="Persistence")
             if cl is not None:
                 a_.plot(pdays, cl, "-", color=INK, lw=1, marker="s", ms=5, label="ClimODE (paper, same ICs)")
@@ -126,13 +126,14 @@ def main(argv=None):
             a_.grid(True, color=GRID, lw=0.8)
             for s_ in ("top", "right"):
                 a_.spines[s_].set_visible(False)
-        ax[0, 0].legend(fontsize=9, frameon=True, loc="upper left")
+        fig.legend(*ax[0, 0].get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize=9,
+                   frameon=False)
         fig.suptitle(f"Step 13: {title}\n{a.subtitle}", fontsize=13)
         path = os.path.join(a.out, name + ".png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
         written.append(path)
-        print(f"[plot] {path}: " + ", ".join(k for k, _, _ in present))
+        print(f"[plot] {path}: " + ", ".join(q[0] for q in present))
     return written
 
 
