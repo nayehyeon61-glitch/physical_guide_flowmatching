@@ -11,8 +11,11 @@ ClimODE's protocol, as the owner's four-model comparison (H1-H3, docs/step13_seq
                             inloop       the frozen PINN inside the late generation ODE (--inloop-mu): its
                                          correction of the endpoint estimate steers the flow, which sees
                                          the corrected state on the later steps
+                            smoothed     H3's control (--smooth-lam): the same late guidance with a Laplacian
+                                         roughness instead of the physics (no physics, only smoothing)
     every arm then gets the hard constraints q >= 0, tcwv >= 0 (the violated fraction is reported);
-    raw, guided and inloop start from the same noise, so their differences are paired.
+    raw, guided, inloop and smoothed start from the same noise, so their differences are paired
+    (--resume-ens replays the noise of the skipped years, so arms added later stay paired).
 
     sample   history x(t - 12 h), x(t - 6 h), x(t) -> increments d_k = x(t + 6k h) - x(t), k = 1..K
              (K = 24: the whole 144 h in one flow, no autoregressive feedback)
@@ -47,7 +50,7 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
 from pgcfm.seqdct import (PINNConfig, PINNProjector, SeqFM, SeqFMConfig, SeqRegressor, band_spread,  # noqa: E402
-                          hard_constraints, residual_rms, sequence_residual_loss)
+                          hard_constraints, laplacian_roughness, residual_rms, sequence_residual_loss)
 from scripts.run_step11_climode import VARS, climode_minmax, climode_scores, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 from scripts.run_step13_pinn import load_years  # noqa: E402
@@ -86,6 +89,7 @@ def main(argv=None):
     p.add_argument("--guide-lam", type=float, default=0.0, help="H3 guidance strength (fraction of |v|); 0 = off")
     p.add_argument("--guide-s0", type=float, default=0.75)
     p.add_argument("--inloop-mu", type=float, default=0.0, help="PINN inside the generation ODE (needs --pinn); 0 = off")
+    p.add_argument("--smooth-lam", type=float, default=0.0, help="Laplacian smoothing guidance (H3 control); 0 = off")
     p.add_argument("--train-years", type=int, nargs="+", default=[2012, 2013, 2014, 2015])
     p.add_argument("--val-year", type=int, default=2016)
     p.add_argument("--test-years", type=int, nargs="+", default=[2017, 2018])
@@ -100,6 +104,9 @@ def main(argv=None):
     p.add_argument("--save-ens", action="store_true",
                    help="save the ensembles (5 ClimODE vars, 24 h multiples) of every arm in the test years and of "
                         "pinn (raw without a PINN) in the validation year (stage 3 trains on it)")
+    p.add_argument("--resume-ens", action="store_true",
+                   help="with --save-ens: skip the years whose ensembles are all saved already (the json then "
+                        "scores only the years generated in this run)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--quick", action="store_true")
@@ -215,8 +222,10 @@ def main(argv=None):
     # -- ensembles on ClimODE's ICs ---------------------------------------------------------------
     guided = a.model == "fm" and a.guide_lam > 0
     inloop = a.model == "fm" and a.inloop_mu > 0 and P is not None
+    smoothed = a.model == "fm" and a.smooth_lam > 0
     arms = ("raw",) + (("pinn",) if P is not None else ()) + (("guided",) if guided else ()) \
-        + (("guided_pinn",) if guided and P is not None else ()) + (("inloop",) if inloop else ())
+        + (("guided_pinn",) if guided and P is not None else ()) + (("inloop",) if inloop else ()) \
+        + (("smoothed",) if smoothed else ())
     pair_ids = torch.tensor([0, a.K // 2, a.K - 1])  # residual diagnostics and the H3 guidance
     mx, mn = climode_minmax(era5)
     wl = np.cos(np.deg2rad(lat))
@@ -227,15 +236,29 @@ def main(argv=None):
     bands = {arm: [] for arm in arms if arm.endswith("pinn") or arm == "inloop"}
     cost = {arm: 0.0 for arm in arms}
     g = torch.Generator().manual_seed(a.seed + 7)
+    skipped = []
+    saved = lambda arm, y: os.path.join(a.out, f"{tag}_{arm}_ens_{y}.npz")  # noqa: E731
     for y in ([a.val_year] if a.save_ens else []) + a.test_years:
         score = y in a.test_years
+        here = list(arms) if score else [q for q in ("raw", "pinn") if q in arms]  # validation: no guidance
+        if not score:
+            here = here[-1:] if a.resume_ens else here  # only the saved arm matters on a resumed run
+        existing = {arm for arm in here if a.resume_ens and os.path.exists(saved(arm, y))}
+        with nc.Dataset(os.path.join(a.kai, f"{y}.nc")) as f_:
+            n_ic = (len(f_.dimensions["time"]) - 2 - a.K) // 8 + 1
+        n_ic = min(n_ic, a.max_ics or n_ic)
+        if existing == set(here):  # saved by an earlier run: replay its noise draws (one per chunk) and skip
+            for c0 in range(0, n_ic, 4):
+                torch.randn((min(4, n_ic - c0) * a.members, a.K, contract.N_DYNAMIC, 32, 64), generator=g)
+            skipped.append(y)
+            log(f"  {y}: ensembles exist, skipped (noise replayed)")
+            continue
+        here = [arm for arm in here if arm not in existing]
+        keep = {arm: {"E": [], "O": [], "X0": [], "ics": []} for arm in (here if score else here[-1:])}
+        check_raw = "raw" in existing  # the replayed raw members must equal the saved ones
         x = data[y] if y == a.val_year else load_years(a.kai, [y], mean, std)[y]
         truth = climode_truth(era5, y)
-        here = arms if score else [q for q in ("raw", "pinn") if q in arms]  # validation: no guidance
-        keep = {arm: {"E": [], "O": [], "X0": [], "ics": []} for arm in (here if score else here[-1:])}
         clim = truth.mean(0)
-        n_ic = (len(x) - 2 - a.K) // 8 + 1
-        n_ic = min(n_ic, a.max_ics or n_ic)
         t0 = time.time()
         for c0 in range(0, n_ic, 4):
             if c0 and c0 % 40 == 0:
@@ -247,7 +270,8 @@ def main(argv=None):
                 orog.repeat_interleave(a.members, 0)
             x0m = hm[:, -1]
             ens, tc = {}, time.time()
-            branch = (guided or inloop) and score
+            need_guided = "guided" in here or "guided_pinn" in here
+            branch = score and (need_guided or "inloop" in here or "smoothed" in here)
             if a.model == "fm":
                 eps = model.noise(len(hm), g)
                 ens["raw"] = model.sample(hm, h0m, a.heun, eps=eps, keep_at=a.guide_s0 if branch else None)
@@ -256,18 +280,32 @@ def main(argv=None):
             else:
                 ens["raw"] = model.sample(hm, h0m, generator=g)
             cost["raw"] += time.time() - tc
-            if guided and score:
+            if check_raw and c0 == 0:
+                z_ = np.load(saved("raw", y))
+                sel0 = torch.tensor([k * 4 - 1 for k in range(1, a.K // 4 + 1)])
+                mem0 = (x0m[:, None] + ens["raw"][:, sel0]).view(B, a.members, len(sel0), *ens["raw"].shape[2:])
+                e0 = to_vars(hard_constraints(x0m, ens["raw"], mean, std)[0][:, sel0].add(x0m[:, None])
+                             .view_as(mem0).numpy()) - np.repeat(truth[ics][:, None], len(sel0), 1)[:, None]
+                ref = z_["E_minus_x0"][:B].astype(np.float32)
+                log(f"    replayed raw vs saved (first ICs): max |diff| {np.abs(e0 - ref).max():.3g}, "
+                    f"member scale {np.abs(ref).mean():.3g}")
+            if need_guided and score:
                 tc = time.time()
                 zero = torch.zeros_like(ens["raw"])
                 ens["guided"] = model.sample(
                     hm, h0m, a.heun, start=state, lam=a.guide_lam, s0=a.guide_s0, chunk=a.members,
                     physics=lambda q, j: sequence_residual_loss(guide, x0m[j], q, zero[j], om[j], pair_ids)[0])
                 cost["guided"] += time.time() - tc
-            if inloop and score:
+            if "inloop" in here and score:
                 tc = time.time()
                 ens["inloop"] = model.sample(hm, h0m, a.heun, start=state, s0=a.guide_s0, mu=a.inloop_mu,
                                              project=lambda q: P(x0m, q, h0m))
                 cost["inloop"] += time.time() - tc
+            if "smoothed" in here and score:
+                tc = time.time()
+                ens["smoothed"] = model.sample(hm, h0m, a.heun, start=state, lam=a.smooth_lam, s0=a.guide_s0,
+                                               chunk=a.members, physics=lambda q, j: laplacian_roughness(q))
+                cost["smoothed"] += time.time() - tc
             for src, arm in (("raw", "pinn"), ("guided", "guided_pinn")):
                 if arm in here:
                     tc = time.time()
@@ -280,7 +318,7 @@ def main(argv=None):
                     viol[arm].append(f)
             if score:
                 for arm, src in (("pinn", "raw"), ("guided_pinn", "guided"), ("inloop", "raw")):
-                    if arm in ens:
+                    if arm in ens and arm in here:
                         e0 = ens[src].view(B, a.members, *ens[src].shape[1:]).transpose(0, 1)
                         e1 = ens[arm].view(B, a.members, *ens[arm].shape[1:]).transpose(0, 1)
                         s0_, s1_ = band_spread(e0, P.cfg.k_lat, P.cfg.k_lon), band_spread(e1, P.cfg.k_lat, P.cfg.k_lon)
@@ -314,10 +352,12 @@ def main(argv=None):
                          O=np.concatenate(kp["O"]), X0=np.concatenate(kp["X0"]), ics=np.array(kp["ics"]),
                          leads=np.array(LEADS_H[:len(sel)]))
         log(f"  {'test' if score else 'val'} {y}: {n_ic} ICs {time.time() - t0:.0f}s")
-    n_ic = sum(len(v) for v in sc[arms[0]]["rmse"])
-    res["test"] = {"n_ic": n_ic, "truth_residual": {k: float(np.mean([q[k] for q in phys["truth"]]))
-                                                     for k in phys["truth"][0]}}
+    res["skipped_years"] = skipped
+    res["test"] = {"truth_residual": {k: float(np.mean([q[k] for q in phys["truth"]])) for k in phys["truth"][0]}}
     for arm in arms:
+        if not sc[arm]["rmse"]:  # every test year of this arm was saved by an earlier run
+            continue
+        n_ic = sum(len(v) for v in sc[arm]["rmse"])
         r = {k: np.concatenate(v) for k, v in sc[arm].items()}
         t = {k: {str(h): {v: float(r[k][:, j, i].mean()) for i, v in enumerate(VARS)}
                  for j, h in enumerate(LEADS_H[:r[k].shape[1]])} for k in r}
@@ -329,6 +369,7 @@ def main(argv=None):
         t["seconds_per_ic"] = cost[arm] / n_ic
         if arm in bands:
             t["spread_ratio_through_pinn"] = {k: float(np.mean([q[k] for q in bands[arm]])) for k in bands[arm][0]}
+        t["n_ic"] = n_ic
         res["test"][arm] = t
         log(f"[{arm}] z500 RMSE " + " ".join(f"{h}:{t['rmse'][h]['z']:.0f}" for h in t["rmse"])
             + " | t850 24h {:.2f} t2m 24h {:.2f}".format(t["rmse"]["24"]["t"], t["rmse"]["24"]["t2m"])
@@ -338,7 +379,8 @@ def main(argv=None):
             + f" | q/tcwv<0 {t['hard_violation_frac']:.4f} | {t['seconds_per_ic']:.1f} s/IC"
             + (f" | spread through P {t['spread_ratio_through_pinn']}" if arm in bands else ""))
     log("[truth residual] " + " ".join(f"{k} {v:.2f}" for k, v in res["test"]["truth_residual"].items()))
-    with open(os.path.join(a.out, f"{tag}{'_pinn' if P is not None else ''}{'_guided' if guided else ''}{'_inloop' if inloop else ''}.json"), "w") as f:
+    with open(os.path.join(a.out, f"{tag}{'_pinn' if P is not None else ''}{'_guided' if guided else ''}{'_inloop' if inloop else ''}"
+                           f"{'_smooth' if smoothed else ''}{'_resumed' if a.resume_ens else ''}.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
 

@@ -419,6 +419,16 @@ class SeqRegressor(nn.Module):
             self.errors.mean + self.errors.std * torch.randn(mu.shape, generator=generator, device=mu.device))
 
 
+def laplacian_roughness(d: torch.Tensor) -> torch.Tensor:
+    """Mean squared 5-point Laplacian of (..., H, W) (longitude periodic, latitude edges replicated):
+    the non-physical smoothing control for H3's guidance (steps 4 and 6: smoothing alone reproduced
+    the CRPS gain of the physics term)."""
+    up = torch.cat([d[..., :1, :], d[..., :-1, :]], -2)
+    down = torch.cat([d[..., 1:, :], d[..., -1:, :]], -2)
+    lap = up + down + d.roll(1, -1) + d.roll(-1, -1) - 4 * d
+    return (lap ** 2).mean()
+
+
 def hard_constraints(x0: torch.Tensor, d: torch.Tensor, mean, std):
     """q >= 0 and tcwv >= 0 on the frames x0 + d (normalized KAI units). Returns (d, fraction of
     member values that violated a constraint)."""

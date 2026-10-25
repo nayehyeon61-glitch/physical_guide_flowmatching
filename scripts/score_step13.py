@@ -57,50 +57,60 @@ def corr(a, b, axes):
     return (a * b).sum(axes) / np.sqrt((a ** 2).sum(axes) * (b ** 2).sum(axes))
 
 
-def score_year(prefix, year, era5, terc, lat, mx, mn):
+def score_year(prefix, year, era5, terc, lat, mx, mn, chunk=30):
+    """All axes for one year, ``chunk`` ICs at a time (a whole year of 8 members in float32 with the
+    tercile, rank and FFT temporaries took 13 GB)."""
     z = np.load(f"{prefix}_ens_{year}.npz")
-    E = z["E_minus_x0"].astype(np.float32) + z["X0"][:, None, None]  # (n, M, L, 5, H, W)
-    O, ics, leads = z["O"], z["ics"], z["leads"]
-    n, M, L = E.shape[:3]
+    E16, O_all, X0_all, ics_all, leads = z["E_minus_x0"], z["O"], z["X0"], z["ics"], z["leads"]
+    n, M, L = E16.shape[:3]
     w = np.cos(np.deg2rad(lat))
     w = (w / w.mean())[:, None]
     truth = climode_truth(era5, year)
     clim = truth.mean(0)  # ClimODE's ACC climatology (the test year's mean)
     scl = (mx - mn)[:, None, None]
-    out = {}
-    mu = E.mean(1)
-    out["rmse"] = np.sqrt(((mu - O) ** 2 * w).mean((-1, -2)))  # (n, L, 5)
-    out["spread2"] = ((E.var(1, ddof=1)) * w).mean((-1, -2))
-    out["crps"] = ps.crps_ensemble((O - mn[:, None, None]) / scl,
-                                   np.moveaxis((E - mn[:, None, None]) / scl, 1, -1)).mean((-1, -2))
-    # tercile Brier scores
     times = pd.date_range(f"{year}-01-01", periods=len(truth), freq="6h")
-    month = np.array([[times[i + h // 6].month for h in leads] for i in ics])  # (n, L)
-    th = terc[month - 1]  # (n, L, 2, 5, H, W)
-    lo_p, hi_p = (E < th[:, None, :, 0]).mean(1), (E > th[:, None, :, 1]).mean(1)
-    lo_o, hi_o = (O < th[:, :, 0]).astype(np.float32), (O > th[:, :, 1]).astype(np.float32)
-    out["brier_lower"] = ((lo_p - lo_o) ** 2 * w).mean((-1, -2))
-    out["brier_upper"] = ((hi_p - hi_o) ** 2 * w).mean((-1, -2))
-    out["obs_freq_lower"], out["obs_freq_upper"] = (lo_o * w).mean((-1, -2)), (hi_o * w).mean((-1, -2))
-    # rank histogram (ties broken at random)
     rng = np.random.default_rng(0)
-    below = (E < O[:, None]).sum(1) + rng.integers(0, 1 + (E == O[:, None]).sum(1))
-    hist = np.stack([(below == r).mean((0, -1, -2)) for r in range(M + 1)], -1)  # (L, 5, M + 1)
-    out["rank_hist"] = hist
-    # structure: zonal power of anomalies, cross-variable correlation, lag-24 h persistence
-    ea, oa = E - clim, O - clim
-    pe, po = zonal_power(ea).mean((0, 1)), zonal_power(oa).mean(0)  # (L, 5, W/2+1)
-    out["power_ratio"] = {b: pe[..., i:j].sum(-1) / po[..., i:j].sum(-1) for b, (i, j) in BANDS.items()}
     iz, it = VARS.index("z"), VARS.index("t")
-    out["zt_corr_member"] = corr(ea[:, :, :, iz], ea[:, :, :, it], (-1, -2)).mean(1)  # (n, L)
-    out["zt_corr_truth"] = corr(oa[:, :, iz], oa[:, :, it], (-1, -2))
-    out["lag24_member"] = corr(ea[:, :, :-1], ea[:, :, 1:], (-1, -2)).mean(1)  # (n, L - 1, 5)
-    out["lag24_truth"] = corr(oa[:, :-1], oa[:, 1:], (-1, -2))
-    # energy along the lead (24 h multiples): per member deviation energy and error energy of the mean
-    out["e_member"] = (((E - mu[:, None]) ** 2) * w).mean((-1, -2))  # (n, M, L, 5)
-    out["e_error"] = (((mu - O) ** 2) * w).mean((-1, -2))[:, None]  # (n, 1, L, 5)
-    out["M"], out["leads"] = M, leads
-    return out
+    parts, hist, pe, po = {}, 0.0, 0.0, 0.0
+    for c in range(0, n, chunk):
+        sl = slice(c, min(n, c + chunk))
+        O, X0, ics = O_all[sl], X0_all[sl], ics_all[sl]
+        E = E16[sl].astype(np.float32) + X0[:, None, None]  # (b, M, L, 5, H, W)
+        out = {}
+        mu = E.mean(1)
+        out["rmse"] = np.sqrt(((mu - O) ** 2 * w).mean((-1, -2)))  # (b, L, 5)
+        out["spread2"] = ((E.var(1, ddof=1)) * w).mean((-1, -2))
+        out["crps"] = ps.crps_ensemble((O - mn[:, None, None]) / scl,
+                                       np.moveaxis((E - mn[:, None, None]) / scl, 1, -1)).mean((-1, -2))
+        # tercile Brier scores
+        month = np.array([[times[i + h // 6].month for h in leads] for i in ics])  # (b, L)
+        th = terc[month - 1]  # (b, L, 2, 5, H, W)
+        lo_p, hi_p = (E < th[:, None, :, 0]).mean(1), (E > th[:, None, :, 1]).mean(1)
+        lo_o, hi_o = (O < th[:, :, 0]).astype(np.float32), (O > th[:, :, 1]).astype(np.float32)
+        out["brier_lower"] = ((lo_p - lo_o) ** 2 * w).mean((-1, -2))
+        out["brier_upper"] = ((hi_p - hi_o) ** 2 * w).mean((-1, -2))
+        out["obs_freq_lower"], out["obs_freq_upper"] = (lo_o * w).mean((-1, -2)), (hi_o * w).mean((-1, -2))
+        # rank histogram (ties broken at random)
+        below = (E < O[:, None]).sum(1) + rng.integers(0, 1 + (E == O[:, None]).sum(1))
+        hist = hist + np.stack([(below == r).sum((0, -1, -2)) for r in range(M + 1)], -1)  # (L, 5, M + 1) counts
+        # structure: zonal power of anomalies, cross-variable correlation, lag-24 h persistence
+        ea, oa = E - clim, O - clim
+        pe, po = pe + zonal_power(ea).sum((0, 1)) / M, po + zonal_power(oa).sum(0)  # (L, 5, W/2+1)
+        out["zt_corr_member"] = corr(ea[:, :, :, iz], ea[:, :, :, it], (-1, -2)).mean(1)  # (b, L)
+        out["zt_corr_truth"] = corr(oa[:, :, iz], oa[:, :, it], (-1, -2))
+        out["lag24_member"] = corr(ea[:, :, :-1], ea[:, :, 1:], (-1, -2)).mean(1)  # (b, L - 1, 5)
+        out["lag24_truth"] = corr(oa[:, :-1], oa[:, 1:], (-1, -2))
+        # energy along the lead (24 h multiples): per member deviation energy and error energy of the mean
+        out["e_member"] = (((E - mu[:, None]) ** 2) * w).mean((-1, -2))  # (b, M, L, 5)
+        out["e_error"] = (((mu - O) ** 2) * w).mean((-1, -2))[:, None]  # (b, 1, L, 5)
+        for k, v in out.items():
+            parts.setdefault(k, []).append(v)
+        del E, ea, oa, th, lo_p, hi_p, below
+    res = {k: np.concatenate(v) for k, v in parts.items()}
+    res["rank_hist"] = hist / hist.sum(-1, keepdims=True)
+    res["power_ratio"] = {k: pe[..., i:j].sum(-1) / po[..., i:j].sum(-1) for k, (i, j) in BANDS.items()}
+    res["M"], res["leads"] = M, leads
+    return res
 
 
 def doob(e):
