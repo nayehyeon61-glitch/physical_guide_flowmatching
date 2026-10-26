@@ -78,7 +78,7 @@
 
 ## 5. 학습을 건너뛰고 받은 가중치로 실행
 
-프로젝트 파일의 `step13/step13_checkpoints.zip`(95 MB)에 이 문서의 수치를 낸 가중치가 있습니다. `pinn_project.pt`, `pinn_project.json`, `seqfm_dct.pt`, `seqregress.pt`, `stats/`입니다. 출력 폴더에 풀고 실행하면 세 학습 단계가 가중치를 불러오고, 생성·보정·채점만 돌아갑니다(약 3시간).
+프로젝트 파일의 `step13/step13_checkpoints.zip`(95 MB)에 이 문서의 수치를 낸 가중치가 있습니다. `pinn_project.pt`, `pinn_project.json`, `seqfm_dct.pt`, `seqregress.pt`, `stats/`입니다. 출력 폴더에 풀고 실행하면 세 학습 단계가 가중치를 불러오고, 생성·보정·채점만 돌아갑니다(약 4시간, `SIGMA=0`이면 약 3시간).
 
     mkdir -p runs/step13_best && unzip step13_checkpoints.zip -d runs/step13_best
     bash scripts/run_step13_best.sh
