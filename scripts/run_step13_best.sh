@@ -92,6 +92,12 @@ run score "$OUT/score_best.json" python scripts/score_step13.py --era5 "$E" --ou
 # does the spread follow the case-to-case error? (CV of the spread, error by spread fifth; doc 7.6 and 4.3)
 run flowdep "$OUT/flowdep.json" python scripts/diag_step13_flowdep.py --runs "$OUT" \
     --arms $(for q in $ARMS; do basename "$q"; done) --leads 24 48 72 96 120 144
+if [ "$SIGMA" = 1 ]; then  # the spread-field arms against regm_band (bootstrap) and docs/step13/fig_flowdep.png
+    run score_sigma "$OUT/score_sigma.json" python scripts/score_step13.py --era5 "$E" --out "$OUT/score_sigma.json" \
+        --ref "${FM}_regm_band" --arms "${FM}_regm_band" "${FM}_regm_flow" "${FM}_regm_flowop" $SCORE_ARGS
+    run fig_flowdep "$OUT/fig/fig_flowdep.png" python scripts/plot_step13_flowdep.py --score "$OUT/score_sigma.json" \
+        --flowdep "$OUT/flowdep.json" --out "$OUT/fig"
+fi
 
 # 5. optional: ClimODE's published checkpoint on its first 8 ICs of each test year, then the paired comparison
 if [ "$CLIMODE" = 1 ] && [ "$SMOKE" != 1 ]; then
