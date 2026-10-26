@@ -25,6 +25,9 @@ FM + PINN ensembles, against classical calibration.
             regm_flow   ``--flow-sigma``: regm_band with a flow-dependent spread factor per case and cell
                         (pgcfm/flow_sigma.py: ClimODE's uncertainty network and NLL on the error of mu*,
                         every fifth validation IC held out for the checkpoint)
+            regm_flowop ``--flow-op``: the same with the owner's operator as the sigma network, pretrained
+                        on the regm_band members of the validation year (MSE to the truth), then
+                        fine-tuned with the NLL (head with the operator frozen, then all at lr 1e-4)
     energy  Doob-type control (owner): E[max_k |e_k|^2] / E|e_K|^2 of the member deviations and of
             the error of the mean (<= 4 if the energy is a submartingale in the lead), the energy by
             lead and the fraction of falling lead steps, for every arm
@@ -48,9 +51,10 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.ens_guide import (BandGuide, apply_gamma, band_counts, band_error2, band_index, band_spread2,  # noqa: E402
                              calibrated_energy, doob_stats, fair_crps, member_energy, monotone_gamma,
                              spread_skill_gamma)
-from pgcfm.core import static_features  # noqa: E402
+from pgcfm.core import static_features, time_features  # noqa: E402
 from pgcfm.ens_to_det import EnsembleToDeterministic, fit  # noqa: E402
-from pgcfm.flow_sigma import FlowSigma, fit_flow_sigma, flow_features, predict_sigma  # noqa: E402
+from pgcfm.flow_sigma import (FlowSigma, HeadOnly, OperatorSigma, fit_flow_sigma, flow_features,  # noqa: E402
+                              predict_sigma)
 from scripts.run_step10_deterministic import PersistenceMBM  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
@@ -140,6 +144,8 @@ def main(argv=None):
                    help="saved ensemble prefix whose member mean is mu* (runs/step13/seqregress_pinn): adds reg_*")
     p.add_argument("--reg-mbm", action="store_true", help="with --reg: also mu* = a + b mu_reg + c x0 (regm_*)")
     p.add_argument("--flow-sigma", action="store_true", help="with --reg --reg-mbm: adds regm_flow")
+    p.add_argument("--flow-op", action="store_true",
+                   help="with --reg --reg-mbm: adds regm_flowop (operator pretrained on the regm_band members)")
     p.add_argument("--sigma-epochs", type=int, default=30)
     p.add_argument("--save-arms", nargs="*", default=None, help="score and save only these arms (default all)")
     p.add_argument("--threads", type=int, default=4)
@@ -147,8 +153,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.quick:
         a.n_valid, a.width, a.modes, a.epochs, a.guide_epochs, a.sigma_epochs = 2, 8, 3, 1, 2, 1
-    if a.flow_sigma and not (a.reg and a.reg_mbm):
-        p.error("--flow-sigma needs --reg and --reg-mbm")
+    if (a.flow_sigma or a.flow_op) and not (a.reg and a.reg_mbm):
+        p.error("--flow-sigma and --flow-op need --reg and --reg-mbm")
     torch.set_num_threads(a.threads)
     torch.manual_seed(0)
     lat, lon, _, _ = load_static(a.era5)
@@ -271,15 +277,23 @@ def main(argv=None):
             log("[regm] val z500 RMSE of a + b mu_reg + c x0 by lead (normalized) "
                 + " ".join(f"{float(((mu_regm[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
                            for j in range(L)))
-    if a.flow_sigma:  # flow-dependent spread factor on top of regm_band (pgcfm/flow_sigma.py)
+    if a.flow_sigma or a.flow_op:  # flow-dependent spread factors on top of regm_band (pgcfm/flow_sigma.py)
         lat_, lon_, oro_, lsm_ = load_static(a.era5)
         static = static_features(lat_, lon_, oro_, lsm_)
         leads_t = torch.as_tensor(leads, dtype=torch.float32)
 
+        def hours(ics_):  # (n * L,) IC hours since Jan 1 and lead hours
+            n_ = len(ics_)
+            return (6.0 * torch.as_tensor(np.asarray(ics_), dtype=torch.float32)[torch.arange(n_ * L) // L],
+                    leads_t[torch.arange(n_ * L) % L])
+
         def sigma_inputs(ctx_, mu_, ics_):
-            n_ = len(ctx_) // L
-            ic_hour = 6.0 * torch.as_tensor(np.asarray(ics_), dtype=torch.float32)[torch.arange(n_ * L) // L]
-            return flow_features(ctx_[:, :5], mu_, leads_t[torch.arange(n_ * L) % L], ic_hour, static)
+            ic_hour, lead_h = hours(ics_)
+            return flow_features(ctx_[:, :5], mu_, lead_h, ic_hour, static)
+
+        def op_context(ctx_, ics_):  # the operator's context: x0, lead, and the valid time (pgcfm.core)
+            ic_hour, lead_h = hours(ics_)
+            return torch.cat([ctx_, time_features(ic_hour + lead_h, H, W)], 1)
 
         def case_corr(sig, absr):  # per lead: corr over ICs of sigma and |error|, area-weighted over cells
             q = []
@@ -289,20 +303,50 @@ def main(argv=None):
                 q.append(((c * area).sum((-1, -2)) / area.sum()).tolist())
             return q  # (L, 5)
 
-        feats_v = sigma_inputs(ctx, mu_regm, load(a.ens, a.val_year)[3][:n])
+        ics_v = load(a.ens, a.val_year)[3][:n]
         held = ic_of % 5 == 4
         tr_rows, va_rows = torch.arange(n * L)[~held], torch.arange(n * L)[held]
         r2 = (tgt - mu_regm) ** 2
         sigma_clim = torch.stack([r2[tr_rows[tr_rows % L == j]].mean(0).sqrt() for j in range(L)])
+        rho = {}
+
+        def report(name, sig_v):
+            rho[name] = torch.stack([(sig_v[j::L] ** 2).mean(0).sqrt() for j in range(L)])  # (L, 5, H, W)
+            res[name]["val_case_corr"] = case_corr(sig_v[va_rows], (tgt - mu_regm).abs()[va_rows])
+            log(f"[{name}] held-out 2016 case corr of sigma and |error|, z500 by lead "
+                + " ".join(f"{q[VARS.index('z')]:.3f}" for q in res[name]["val_case_corr"]))
+
+    if a.flow_sigma:  # ClimODE's uncertainty network on hand-made flow features
+        feats_v = sigma_inputs(ctx, mu_regm, ics_v)
         torch.manual_seed(2)
         fsig = FlowSigma(feats_v.shape[1], sigma_clim)
         res["flow_sigma"] = fit_flow_sigma(fsig, feats_v, mu_regm, tgt, lead_idx, tr_rows, va_rows,
                                            epochs=a.sigma_epochs, log=log)
-        sig_v = predict_sigma(fsig, feats_v, lead_idx)
-        rho = torch.stack([(sig_v[j::L] ** 2).mean(0).sqrt() for j in range(L)])  # (L, 5, H, W)
-        res["flow_sigma"]["val_case_corr"] = case_corr(sig_v[va_rows], (tgt - mu_regm).abs()[va_rows])
-        log("[flow sigma] held-out 2016 case corr of sigma and |error|, z500 by lead "
-            + " ".join(f"{q[VARS.index('z')]:.3f}" for q in res["flow_sigma"]["val_case_corr"]))
+        report("flow_sigma", predict_sigma(fsig, feats_v, lead_idx))
+    if a.flow_op:  # the owner's operator: pretrained on the energy-refined members, fine-tuned into sigma
+        with torch.no_grad():
+            cal_v = torch.cat([apply_gamma(mu_regm[j], mem[j], gam["regm_band"][lead_idx[j]], bidx)
+                               for j in torch.arange(n * L).split(64)])
+        ctx_op = op_context(ctx, ics_v)
+        torch.manual_seed(3)
+        op_s = EnsembleToDeterministic(5, context_channels=ctx_op.shape[1], width=a.width, modes=a.modes)
+        info = fit(op_s, (cal_v[tr_rows], tgt[tr_rows], ctx_op[tr_rows]), (cal_v[va_rows], tgt[va_rows], ctx_op[va_rows]),
+                   area, epochs=a.epochs)
+        log(f"[flow_op] pretrained operator best val mse {info['best_val_mse']:.4f}")
+        osig = OperatorSigma(op_s, sigma_clim)
+        op_s.requires_grad_(False)
+        with torch.no_grad():
+            f_v = torch.cat([osig.features(cal_v[j], ctx_op[j]) for j in torch.arange(n * L).split(64)])
+        head = fit_flow_sigma(HeadOnly(osig), f_v, mu_regm, tgt, lead_idx, tr_rows, va_rows, epochs=a.sigma_epochs,
+                              params=osig.head.parameters(), log=log)
+        del f_v
+        op_s.requires_grad_(True)
+        full = fit_flow_sigma(osig, (cal_v, ctx_op), mu_regm, tgt, lead_idx, tr_rows, va_rows,
+                              epochs=max(1, a.sigma_epochs // 3), lr=1e-4, log=log)
+        res["flow_op"] = {"pretrain_best_val_mse": info["best_val_mse"], "pretrain_val_mse": info["val_mse_history"],
+                          "head": head, "full": full}
+        report("flow_op", predict_sigma(osig, (cal_v, ctx_op), lead_idx))
+        del cal_v
     res.update(gamma={k: g.tolist() for k, g in gam.items()}, bands=list(range(nb)), band_counts=counts.tolist())
 
     # -- test years -----------------------------------------------------------------------------------
@@ -337,15 +381,19 @@ def main(argv=None):
             for k, (gd, src) in guides.items():
                 arms[k] = torch.cat([apply_gamma(mus[src][j], mem[j], gd(sp[j], lead_idx[j], lead_frac[j]), bidx)
                                      for j in torch.arange(n * L).split(64)])
+            sigmas = {}
             if a.flow_sigma:
-                sig = predict_sigma(fsig, sigma_inputs(ctx, mus["regm"], ics), lead_idx)
-                fac = sig / rho[lead_idx]
-                arms["regm_flow"] = mus["regm"][:, None] + fac[:, None] * (arms["regm_band"] - mus["regm"][:, None])
-                res["flow_sigma"].setdefault("test_case_corr", {})[str(y)] = case_corr(sig, (tgt - mus["regm"]).abs())
-                res["flow_sigma"].setdefault("factor_cv", {})[str(y)] = float(fac.std() / fac.mean())
-                log(f"[flow sigma] {y} case corr of sigma and |error|, z500 by lead "
-                    + " ".join(f"{q[VARS.index('z')]:.3f}" for q in res["flow_sigma"]["test_case_corr"][str(y)])
-                    + f" | factor CV {res['flow_sigma']['factor_cv'][str(y)]:.3f}")
+                sigmas["flow_sigma", "regm_flow"] = predict_sigma(fsig, sigma_inputs(ctx, mus["regm"], ics), lead_idx)
+            if a.flow_op:
+                sigmas["flow_op", "regm_flowop"] = predict_sigma(osig, (arms["regm_band"], op_context(ctx, ics)), lead_idx)
+            for (name, arm), sig in sigmas.items():
+                fac = sig / rho[name][lead_idx]
+                arms[arm] = mus["regm"][:, None] + fac[:, None] * (arms["regm_band"] - mus["regm"][:, None])
+                res[name].setdefault("test_case_corr", {})[str(y)] = case_corr(sig, (tgt - mus["regm"]).abs())
+                res[name].setdefault("factor_cv", {})[str(y)] = float(fac.std() / fac.mean())
+                log(f"[{name}] {y} case corr of sigma and |error|, z500 by lead "
+                    + " ".join(f"{q[VARS.index('z')]:.3f}" for q in res[name]["test_case_corr"][str(y)])
+                    + f" | factor CV {res[name]['factor_cv'][str(y)]:.3f}")
         if a.save_arms is not None:
             arms = {k: v for k, v in arms.items() if k in a.save_arms}
         for arm, ens in arms.items():

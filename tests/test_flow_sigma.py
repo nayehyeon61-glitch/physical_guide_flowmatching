@@ -32,3 +32,19 @@ def test_learns_a_flow_dependent_sigma():
     sig = predict_sigma(model, feats, lead_idx)[48:]
     a, b = sig.flatten() - sig.mean(), true_sd[48:].flatten() - true_sd[48:].mean()
     assert float((a * b).sum() / (a.norm() * b.norm())) > 0.5
+
+
+def test_operator_sigma_starts_at_sigma_clim_and_head_only_matches():
+    from pgcfm.ens_to_det import EnsembleToDeterministic
+    from pgcfm.flow_sigma import HeadOnly, OperatorSigma
+    torch.manual_seed(0)
+    members, ctx = torch.randn(4, 3, 5, H, W), torch.randn(4, 2, H, W)
+    op = EnsembleToDeterministic(5, context_channels=2, width=8, modes=3)
+    clim = torch.rand(6, 5, H, W) + 0.5
+    lead_idx = torch.tensor([0, 1, 2, 5])
+    sig = OperatorSigma(op, clim)
+    assert torch.allclose(predict_sigma(sig, (members, ctx), lead_idx), clim[lead_idx])
+    torch.nn.init.normal_(sig.head.weight, std=0.1)
+    f = sig.features(members, ctx).detach()
+    assert torch.allclose(predict_sigma(HeadOnly(sig), f, lead_idx), predict_sigma(sig, (members, ctx), lead_idx),
+                          atol=1e-6)
