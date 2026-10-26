@@ -10,6 +10,9 @@
     fig_hcl.png           diagnostic-closure operators (scripts/run_step13_diag.py): t2m, u10, v10 RMSE and the
                           change against the regression mean mu*
     fig_hres.png          the cores at 32 x 64, zero-shot at 64 x 128 and interpolated (scripts/run_step14_hres.py)
+    fig_hbal.png          balance projections (scripts/run_step13_pinn.py gates on 2016) against the size of the
+                          perturbation they correct instead of the lead: geostrophic and hydrostatic residual over
+                          ERA5's, the spread they keep, the fraction of negative moisture; the input dotted
 
     python scripts/plot_step14.py --era5 /home/claude/era5/era5_data --out docs/step14
 """
@@ -175,6 +178,56 @@ def fig_hres(hres, out):
                   os.path.join(out, "fig_hres.png"))
 
 
+HBAL = [  # (gate json in runs/step13, label, slot)
+    ("pinn_project_geo", "PINN projector (step 13, 8 × 16 DCT modes)", 0),
+    ("pibal_project_b0.8_g1_inmass", "Π = pos(x + N), full-mode FNO, B = 0.8, geostrophic loss", 1),
+    ("pibal_project_b0.8_g0", "Π, B = 0.8, no geostrophic loss", 3),
+    ("pibal_project_b1.4_g1", "Π, B = 1.4, geostrophic loss", 4),
+    ("pibal_project_b0_g1", "Π, no norm bound, geostrophic loss", 2),
+]
+ALPHAS = (0.25, 0.5, 1.0)
+
+
+def fig_hbal(gates, out):
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9.5), layout="constrained")
+    first = next(iter(gates.values()))  # the inputs are the same perturbations for every projector
+    for a_, c, title in ((ax[0, 0], "geo", "Geostrophic residual (ageostrophic wind, 200-850 hPa, |lat| ≥ 20°)"),
+                         (ax[0, 1], "hyd", "Hydrostatic residual")):
+        a_.axhline(1, color=MUTED, lw=2, ls=":", label="Not projected")
+        for k, lab, slot in HBAL:
+            if k in gates:
+                v = gates[k]
+                a_.plot((0,) + ALPHAS, [v["identity"]["residual_ratio"][c]]
+                        + [v[f"alpha_{x}"]["residual_ratio_out"][c] / v[f"alpha_{x}"]["residual_ratio_in"][c]
+                           for x in ALPHAS], "-o", color=SLOTS[slot], lw=1.8, ms=5, label=lab)
+        a_.set_title(title, fontsize=12), a_.set_ylabel("RMS residual after Π / before")
+    a_ = ax[1, 0]
+    for k, lab, slot in HBAL:
+        if k in gates:
+            for b, ls in (("high", "-o"), ("low", "--o")):
+                a_.plot(ALPHAS, [gates[k][f"alpha_{x}"]["spread_ratio"][b] for x in ALPHAS], ls, color=SLOTS[slot],
+                        lw=1.8, ms=5)
+    for y, lab in ((0.95, "Owner's pass (≥ 0.95)"), (0.9, "Owner's rejection (< 0.9)")):
+        a_.axhline(y, color=MUTED, lw=1.5, ls="-." if y == 0.9 else "--", label=lab)
+    a_.set_title("Spread kept (solid: DCT modes above 8 × 16, dashed: the low modes)", fontsize=12)
+    a_.set_ylabel("Spread of Π(perturbed) / spread of the perturbations")
+    a_ = ax[1, 1]
+    a_.plot(ALPHAS, [first[f"alpha_{x}"]["negative_fraction_in"] for x in ALPHAS], ":", color=MUTED, lw=2.5, zorder=5)
+    for k, lab, slot in HBAL:
+        if k in gates:
+            a_.plot(ALPHAS, [gates[k][f"alpha_{x}"]["negative_fraction_out"] for x in ALPHAS], "-o", color=SLOTS[slot],
+                    lw=1.8, ms=5)
+    a_.set_title("Negative moisture (q at 12 levels, tcwv)", fontsize=12), a_.set_ylabel("Fraction of grid values < 0")
+    for a_ in ax.ravel():
+        a_.set_xlabel("Perturbation size α (0 = ERA5 truth)")
+        a_.grid(True, color=GRID, lw=0.8)
+        for s_ in ("top", "right"):
+            a_.spines[s_].set_visible(False)
+    return finish(fig, ax, "Step 14 H-bal: full-mode norm-projected FNO projection Π against the PINN projector\n"
+                  "Validation 2016, 32 truths; α scales the FM-like perturbation of the 6 h sequence (α = 0: ERA5 itself)",
+                  os.path.join(out, "fig_hbal.png"), ncol=2)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--era5", required=True)
@@ -206,6 +259,9 @@ def main(argv=None):
     hres = j(a.runs, "hres.json")
     if hres:
         written.append(fig_hres(hres, a.out))
+    gates = {k: g["val"] for k, *_ in HBAL if (g := j(a.step13, k + ".json"))}
+    if gates:
+        written.append(fig_hbal(gates, a.out))
     return written
 
 

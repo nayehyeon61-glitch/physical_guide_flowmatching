@@ -73,10 +73,12 @@ class PositiveMass(nn.Module):
     def negative_fraction(self, x: torch.Tensor) -> float:
         return float((x[:, self.idx] * self.s + self.m < -1e-5 * self.s).float().mean())  # below rounding
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, ref: torch.Tensor = None) -> torch.Tensor:
+        """Clamp q at 0 and rescale every level to the global mass of ``ref`` (default: of x itself)."""
         q = x[:, self.idx] * self.s + self.m
         qp = q.clamp_min(0.0)
-        M, Mp = (q * self.w).mean((-2, -1), keepdim=True), (qp * self.w).mean((-2, -1), keepdim=True)
+        q_ref = q if ref is None else ref[:, self.idx] * self.s + self.m
+        M, Mp = (q_ref * self.w).mean((-2, -1), keepdim=True), (qp * self.w).mean((-2, -1), keepdim=True)
         qp = qp * torch.where(Mp > 0, M.clamp_min(0.0) / Mp.clamp_min(1e-30), torch.zeros_like(Mp))
         out = x.clone()
         out[:, self.idx] = (qp - self.m) / self.s
@@ -108,7 +110,7 @@ class BalanceProjector(nn.Module):
         for i in range(0, len(x), self.chunk):
             f = x[i:i + self.chunk]
             y = f + self.net(torch.cat([f, self.static.expand(len(f), -1, -1, -1)], 1)) * self.keep[0]
-            out.append(self.pos(y) if self.pos is not None else y)
+            out.append(self.pos(y, ref=f) if self.pos is not None else y)  # Pi keeps the input frame's mass
         return torch.cat(out)
 
     def forward(self, x0, d, hour0=None):
