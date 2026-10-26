@@ -50,6 +50,8 @@
 
 ## 2. 구현 (기존 구현 재사용)
 
+직접 학습하고 실행하는 방법(한 번에 돌리는 `scripts/run_step13_best.sh`, 단계별 시간, 받은 가중치로 건너뛰기)은 `docs/step13_reproduce.md`에 있습니다.
+
 | 부분 | 가져온 것 | 바꾼 것 |
 | --- | --- | --- |
 | 데이터 | 11단계 `scripts/wb2_to_kai.py` | `--all-hours`: 6 h마다 전부, `<out>/kai6h`, zlib (연 0.6 GB) |
