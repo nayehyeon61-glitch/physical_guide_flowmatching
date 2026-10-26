@@ -11,10 +11,17 @@ FM + PINN ensembles and ERA5.
              regm_aband_marg  the lead's climatological band spread instead of the realized one (ablation)
              regm_aband_clim  log s^2 = the climatological start (no case adaptation), realized spread: what
                               the realized normalization alone does
+             regm_sband<n>    the owner's second revision (pgcfm/space_band.py): band x cell multipliers
+                              T_c = sum_b P_b M_b(c) P_b, about n coefficients per cell (``--cell-nmin``),
+                              realized cell spread, Gamma_max = 1; the n with the lower held-out 2016 fair
+                              CRPS is also saved as regm_sband
     report   per band: held-out / test corr over cases of s_b^2 and Ebar_b, its ceiling and the ratio;
              n_eff (lead-mean reference and fitted residual ratio); per arm: fair CRPS, the fraction of
              Gamma at Gamma_max, ||T_c|| = max_b Gamma_b, the case spread/skill CV and the corr over cases
-             of the domain spread and the domain RMSE (z500, t850), against regm_band
+             of the domain spread and the domain RMSE (z500, t850), against regm_band; per cell for the
+             band x cell nets; and every model's predicted local variance (band scalar, band x cell, the
+             regm_flow sigma from ``--flow-sigma-pt``) pooled to common cell grids against the pooled
+             squared error: corr over cases per cell, mean over cells (1 x 1 up to the 32 x 64 grid)
     output   <out>/aband_<tag>.json, aband_<tag>.pt, <tag>_<arm>_ens_<year>.npz for ``--save-arms``
 
     python scripts/run_step13_aband.py --ens runs/step13/seqfm_dct_pinn --reg runs/step13/seqregress_pinn \
@@ -30,6 +37,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
@@ -38,7 +46,10 @@ from pgcfm.adaptive_band import (AdaptiveBandOperator, BandPool, CondBandVarianc
                                  band_corr_with_ceiling, case_ssr, chi2_band_nll, estimate_n_eff, radial_bands)
 from pgcfm.core import static_features, time_features  # noqa: E402
 from pgcfm.ens_guide import apply_gamma, band_error2, band_index, band_spread2, fair_crps  # noqa: E402
-from pgcfm.flow_sigma import flow_features  # noqa: E402
+from pgcfm.flow_sigma import FlowSigma, flow_features, predict_sigma  # noqa: E402
+from pgcfm.space_band import (BandProjector, CondSpaceBandVariance, SpaceBandOperator,  # noqa: E402
+                              band_cell_grids, cell_corr_and_ceiling, estimate_cell_n_eff, local_error_energy,
+                              space_band_nll, upsample_sphere)
 from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 from scripts.run_step13_guide import per_lead_gamma, reg_mbm_mean  # noqa: E402
@@ -70,7 +81,10 @@ def main(argv=None):
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch", type=int, default=16)
-    p.add_argument("--save-arms", nargs="*", default=["regm_aband", "regm_aband_clim"])
+    p.add_argument("--cell-nmin", type=int, nargs="*", default=[16, 32], help="band x cell nets (empty: none)")
+    p.add_argument("--flow-sigma-pt", default=None,
+                   help="regm_flow's sigma net for the comparison (default <out>/flow_sigma_<ens name>.pt if present)")
+    p.add_argument("--save-arms", nargs="*", default=["regm_aband", "regm_aband_clim", "regm_sband"])
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
@@ -129,35 +143,36 @@ def main(argv=None):
     res = {"args": vars(a), "n_b": pool.n_b.tolist(), "n_eff_lead_ref": n_eff0.tolist()}
     log(f"[aband] bands n_b {pool.n_b.long().tolist()} | n_eff (lead-mean reference) "
         + " ".join(f"{q:.1f}" for q in n_eff0.tolist()))
+    def fit_net(net, loss_of, name):  # AdamW, checkpoint on the held-out ICs
+        opt = torch.optim.AdamW(net.parameters(), lr=a.lr)
+
+        def val():
+            net.eval()
+            with torch.no_grad():
+                return sum(float(loss_of(i)) * len(i) for i in va.split(256)) / len(va)
+
+        best = start = val()
+        best_state, hist = copy.deepcopy(net.state_dict()), []
+        for ep in range(a.epochs):
+            net.train()
+            for i in tr[torch.randperm(len(tr))].split(a.batch):
+                loss = loss_of(i)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+            v = val()
+            hist.append(v)
+            if v < best:
+                best, best_state = v, copy.deepcopy(net.state_dict())
+            if ep % 10 == 9 or ep == a.epochs - 1:
+                log(f"[{name}] epoch {ep} held-out NLL {v:.4f} (start {start:.4f}, best {best:.4f})")
+        net.load_state_dict(best_state)
+        net.eval()
+        return {"val_nll_start": start, "val_nll": hist, "val_nll_best": best}
+
     torch.manual_seed(1)
     net = CondBandVariance(feats.shape[1], scal.shape[1], 5, nb, clim.log(), width=a.width)
-    opt = torch.optim.AdamW(net.parameters(), lr=a.lr)
-
-    held_out = feats[va], scal[va], lead_idx[va]
-
-    def val_loss():
-        net.eval()
-        with torch.no_grad():
-            return float(chi2_band_nll(net(*held_out), Ebar[va], n_eff0))
-
-    best, best_state, hist = val_loss(), copy.deepcopy(net.state_dict()), []
-    res["val_nll_start"] = best
-    for ep in range(a.epochs):
-        net.train()
-        for i in tr[torch.randperm(len(tr))].split(a.batch):
-            loss = chi2_band_nll(net(feats[i], scal[i], lead_idx[i]), Ebar[i], n_eff0)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-        v = val_loss()
-        hist.append(v)
-        if v < best:
-            best, best_state = v, copy.deepcopy(net.state_dict())
-        if ep % 10 == 9 or ep == a.epochs - 1:
-            log(f"[aband] epoch {ep} held-out chi2 NLL {v:.4f} (start {res['val_nll_start']:.4f}, best {best:.4f})")
-    net.load_state_dict(best_state)
-    net.eval()
-    res.update(val_nll=hist, val_nll_best=best)
+    res.update(fit_net(net, lambda i: chi2_band_nll(net(feats[i], scal[i], lead_idx[i]), Ebar[i], n_eff0), "aband"))
     with torch.no_grad():
         ls_v = torch.cat([net(feats[i], scal[i], lead_idx[i]) for i in torch.arange(n * L).split(256)])
     n_eff = estimate_n_eff(Ebar[tr], ls_v[tr].exp(), pool.n_b)
@@ -182,16 +197,63 @@ def main(argv=None):
                 "config": {"n_feats": feats.shape[1], "n_scalars": scal.shape[1], "C": 5, "n_bands": nb,
                            "width": a.width}}, os.path.join(a.out, f"aband_{tag}.pt"))
 
+    # -- band x cell nets (second revision) -----------------------------------------------------------
+    proj = BandProjector(dct, pool)
+    r_v = tgt - mu_v
+    sband = {}
+    for nmin in a.cell_nmin:
+        grids = band_cell_grids(pool.n_b, H, W, nmin)
+        Ev = [torch.cat(q) for q in zip(*[local_error_energy(proj, r_v[i], grids) for i in torch.arange(n * L).split(256)])]
+        clim_c = [torch.stack([E[tr][lead_idx[tr] == j].mean(0) for j in range(L)]) for E in Ev]
+        ne = estimate_cell_n_eff([E[tr] for E in Ev], clim_c, lead_idx[tr], pool.n_b, grids)
+        torch.manual_seed(1)
+        net_s = CondSpaceBandVariance(feats.shape[1], scal.shape[1], 5, grids, [c.log() for c in clim_c], width=a.width)
+        info = fit_net(net_s, lambda i, net_s=net_s, Ev=Ev, ne=ne: space_band_nll(
+            net_s(feats[i], scal[i], lead_idx[i]), [E[i] for E in Ev], ne), f"sband{nmin}")
+        with torch.no_grad():
+            ls_s = [torch.cat(q) for q in zip(*[net_s(feats[i], scal[i], lead_idx[i]) for i in va.split(256)])]
+        cc = [cell_corr_and_ceiling([q[(va % L) == j] for q in ls_s], [E[va][(va % L) == j] for E in Ev], ne)
+              for j in range(L)]  # [lead][band] -> (corr (C,), ceiling (C,))
+        T = SpaceBandOperator(proj, grids, gamma_max=1.0)
+        crps_v = 0.0
+        for k0 in range(0, len(va), 64):
+            i = va[k0:k0 + 64]
+            ens_, _ = T(mem[i], mu_v[i], [q[k0:k0 + 64] for q in ls_s])
+            crps_v += float(fair_crps(ens_, tgt[i], w)) * len(i)
+        info.update(grids=grids, n_eff=ne.tolist(), held_out_fair_crps=crps_v / len(va),
+                    held_out_cell_corr=[[c.tolist() for c, _ in q] for q in cc],
+                    held_out_cell_ceiling=[[e.tolist() for _, e in q] for q in cc])
+        res[f"sband{nmin}"] = info
+        log(f"[sband{nmin}] cells {grids} | n_eff " + " ".join(f"{q:.1f}" for q in ne.tolist())
+            + " | held-out corr / ceiling z500 by band " + " ".join(
+                f"{np.mean([cc[j][b][0][iz] for j in range(L)]):.3f}/{np.mean([cc[j][b][1][iz] for j in range(L)]):.3f}"
+                for b in range(nb)) + f" | held-out fair CRPS {crps_v / len(va):.5f}")
+        torch.save({"state_dict": net_s.state_dict(), "grids": grids, "n_eff": ne, "norm_mean": m, "norm_std": s,
+                    "config": {"n_feats": feats.shape[1], "n_scalars": scal.shape[1], "C": 5, "width": a.width}},
+                   os.path.join(a.out, f"aband_cells{nmin}_{tag}.pt"))
+        sband[nmin] = (net_s, grids)
+    best_nmin = min(sband, key=lambda q: res[f"sband{q}"]["held_out_fair_crps"]) if sband else None
+    res["sband_saved_nmin"] = best_nmin
+    fsig = None
+    a.flow_sigma_pt = a.flow_sigma_pt or os.path.join(a.out, f"flow_sigma_{os.path.basename(a.ens)}.pt")
+    if os.path.exists(a.flow_sigma_pt):
+        d_ = torch.load(a.flow_sigma_pt, weights_only=False)
+        fsig = FlowSigma(d_["in_channels"], torch.zeros(L, 5, H, W))
+        fsig.load_state_dict(d_["state_dict"])
+        fsig.eval()
+
     # regm_band (baseline) and the marginal spread on the validation year
     base_gam = per_lead_gamma(band_error2(mu_v, tgt, bidx_r, nb_r), band_spread2(mem, bidx_r, nb_r), L, M)
     T_r = AdaptiveBandOperator(dct, pool)
     sp_v = torch.cat([T_r.ensemble_band_spread(dct(mem[i] - mem[i].mean(1, keepdim=True)))
                       for i in torch.arange(n * L).split(128)])
     sig_marg = torch.stack([sp_v[lead_idx == j].mean(0) for j in range(L)])  # (L, C, nb)
-    del mem, feats, ctx, sp_v
+    del mem, ctx, sp_v
 
     # -- test years -----------------------------------------------------------------------------------
-    names = ["regm_band"] + list(ARMS)
+    names = ["regm_band"] + list(ARMS) + [f"regm_sband{q}" for q in sband]
+    GRIDS = [(1, 1), (2, 4), (5, 10), (H, W)]
+    pooled = {}  # model -> per grid: chunks of (pooled predicted variance, pooled squared error, lead)
     acc = {k: {"crps": [], "clip": [], "opn": [], "ssr": [], "dsp": [], "derr": [], "lead": []} for k in names}
     tcorr = {"ls": [], "Eb": []}
     for y in ([a.val_year] if a.quick else a.test_years):
@@ -208,6 +270,22 @@ def main(argv=None):
             ls = torch.cat([net(feats[i], scal[i], li[i]) for i in torch.arange(n * L).split(256)])
         Eb = pool.mean_energy(dct(tgt - mu))
         tcorr["ls"].append(ls), tcorr["Eb"].append(Eb)
+        with torch.no_grad():
+            ls_sb = {q: [torch.cat(z) for z in zip(*[net_s(feats[i], scal[i], li[i]) for i in torch.arange(n * L).split(256)])]
+                     for q, (net_s, _) in sband.items()}
+        sig_f = predict_sigma(fsig, feats, li) if fsig is not None else None
+        # every model's predicted local variance against the squared error, pooled to common cell grids
+        r2 = (tgt - mu) ** 2
+        models = {"aband": (ls.exp() * pool.n_b / (H * W)).sum(-1)[..., None, None].expand_as(r2)}
+        for q in sband:
+            models[f"sband{q}"] = sum(upsample_sphere(z.exp(), H, W) for z in ls_sb[q])
+        if sig_f is not None:
+            models["regm_flow"] = sig_f ** 2
+        for k, v in models.items():
+            pooled.setdefault(k, [[] for _ in GRIDS])
+            for gi, g in enumerate(GRIDS):
+                pooled[k][gi].append((F.adaptive_avg_pool2d(v, g), F.adaptive_avg_pool2d(r2, g), li))
+        del models, sig_f, r2
         keep = {k: [] for k in a.save_arms}
         for i in torch.arange(n * L).split(64):
             out = {"regm_band": (apply_gamma(mu[i], mem[i], base_gam[li[i]], bidx_r), None)}
@@ -215,6 +293,9 @@ def main(argv=None):
                 T = AdaptiveBandOperator(dct, pool, gamma_max=gmax, normalize=norm)
                 ens, g, info = T(mem[i], mu[i], ls[i] if adapt else clim.log()[li[i]], sig_marg[li[i]])
                 out[k] = (ens, (g, info))
+            for q, (_, grids) in sband.items():
+                ens, info = SpaceBandOperator(proj, grids, gamma_max=1.0)(mem[i], mu[i], [z[i] for z in ls_sb[q]])
+                out[f"regm_sband{q}"] = (ens, (None, {"clip_frac": info["clip_frac"], "op_norm": info["op_norm_bound"]}))
             for k, (ens, gi) in out.items():
                 d = acc[k]
                 d["crps"].append(float(fair_crps(ens, tgt[i], w)) * len(i))
@@ -225,8 +306,9 @@ def main(argv=None):
                 d["dsp"].append((((dev ** 2).sum(1) / (M - 1)) * wn).sum((-1, -2)).sqrt())  # (b, C) domain spread
                 d["derr"].append((((tgt[i] - mu[i]) ** 2) * wn).sum((-1, -2)).sqrt())
                 d["lead"].append(li[i])
-                if k in keep:
-                    keep[k].append(unz(ens))
+                save_as = "regm_sband" if k == f"regm_sband{best_nmin}" else k
+                if save_as in keep:
+                    keep[save_as].append(unz(ens))
         for k, v in keep.items():
             phys = torch.cat(v).view(n, L, M, 5, H, W).transpose(1, 2).numpy()
             if not a.quick:
@@ -234,7 +316,7 @@ def main(argv=None):
                          E_minus_x0=(phys - X0[:, None, None]).astype(np.float16), O=O, X0=X0,
                          ics=np.asarray(ics), leads=np.asarray(leads))
             del phys
-        del keep, mem, feats, ctx
+        del keep, mem, ctx, ls_sb
         log(f"  {y}: fair CRPS so far " + " ".join(
             f"{k} {sum(acc[k]['crps']) / sum(len(q_) for q_ in acc[k]['lead']):.5f}" for k in names))
     ls, Eb = torch.cat(tcorr["ls"]), torch.cat(tcorr["Eb"])
@@ -243,6 +325,16 @@ def main(argv=None):
     log("[aband] test corr(s2, Ebar) z500 by band " + " ".join(f"{x:.3f}" for x in q["corr_mean"][iz])
         + " | ceiling " + " ".join(f"{x:.3f}" for x in q["ceiling_mean"][iz])
         + " | t850 " + " ".join(f"{x:.3f}" for x in q["corr_mean"][it]))
+    res["cell_grid_corr"] = {}
+    for k, per_grid in pooled.items():
+        res["cell_grid_corr"][k] = {}
+        for gi, g in enumerate(GRIDS):
+            v, e, ld = (torch.cat(z) for z in zip(*per_grid[gi]))
+            res["cell_grid_corr"][k][f"{g[0]}x{g[1]}"] = [corr(v[ld == j], e[ld == j]).mean((-1, -2)).tolist()
+                                                         for j in range(L)]  # (L, C)
+        log(f"[cells {k:9s}] corr over cases of predicted local variance and squared error, z500 mean over leads: "
+            + " ".join(f"{g}: {np.mean([q_[iz] for q_ in res['cell_grid_corr'][k][g]]):.3f}"
+                       for g in res["cell_grid_corr"][k]))
     res["test"] = {}
     for k in names:
         d = acc[k]
