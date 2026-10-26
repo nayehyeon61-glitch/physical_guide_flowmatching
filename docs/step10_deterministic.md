@@ -27,7 +27,7 @@
 
 context는 모든 학습 arm에서 같습니다: x_0(초기장), 지형, lead/10.
 
-파일: `pgcfm/ens_to_det.py`, `scripts/run_step10_deterministic.py`, `tests/test_deterministic.py`, 원시 결과 `docs/step10/results.json`.
+파일: `pgcfm/ens_to_det.py`, `scripts/run_step10_deterministic.py`, `tests/test_deterministic.py`, 원시 결과 `docs/step10_deterministic/results.json`.
 
 ## 실험 설정 (split 위생)
 
@@ -64,7 +64,7 @@ MBM은 operator의 검증·시험 기간을 보지 않습니다. 점수는 정�
 | MBM+persistence + CNN | 0.720 / 1.127 / 1.213 | 1.085 | 0.781 | 0.379 | 1.068 | 0.558 | 1.02 / 7.45 | 0.25 / 0.23 / 0.19 |
 | MBM+persistence + FNO pooling | 0.715 / 1.156 / 1.238 | 1.107 | 0.793 | 0.336 | 1.092 | 0.567 | 0.99 / 7.39 | 0.22 / 0.22 / 0.18 |
 
-학습 arm에 접공간 사영을 하면 RMSE는 소수 셋째 자리까지 같고 정역학 잔차는 원래 수준으로 돌아갑니다(예: MBM + FNO pooling 3.40/6.53 → 0.94/1.05 K, MBM+persistence + CNN 1.02/7.45 → 0.97/1.31 K). 전체 수치는 `docs/step10/results.json`의 `*_tan` 항목에 있습니다.
+학습 arm에 접공간 사영을 하면 RMSE는 소수 셋째 자리까지 같고 정역학 잔차는 원래 수준으로 돌아갑니다(예: MBM + FNO pooling 3.40/6.53 → 0.94/1.05 K, MBM+persistence + CNN 1.02/7.45 → 0.97/1.31 K). 전체 수치는 `docs/step10_deterministic/results.json`의 `*_tan` 항목에 있습니다.
 
 ### 판정
 
@@ -96,8 +96,8 @@ MBM은 operator의 검증·시험 기간을 보지 않습니다. 점수는 정�
 ## 재현
 
     python scripts/run_step7_latent.py --out runs/step7 --arms lat_serial    # 직렬 사슬 (CPU 약 45분)
-    python scripts/run_step10_deterministic.py --out runs/step10 --step7 runs/step7
-    python scripts/run_step10_deterministic.py --out runs/step10 --step7 runs/step7 --epochs 8 \
+    python scripts/run_step10_deterministic.py --out runs/step10_det --step7 runs/step7
+    python scripts/run_step10_deterministic.py --out runs/step10_det --step7 runs/step7 --epochs 8 \
         --arms mbmx member_mbm mbmx_cnn mbmx_fno_ens member_chain member_chain_mw
 
 첫 번째 step10 실행은 25 epoch, 두 번째는 8 epoch입니다(이 arm들이 모두 첫 epoch에서 최고라 결과에 거의 영향이 없습니다). CPU 4코어에서 rollout 약 1분, 학습 arm마다 5–12분 걸립니다.

@@ -27,7 +27,7 @@ Arms (deterministic outputs):
     *_tan           a learned arm with its correction projected on the hydrostatic tangent space
 The operator is the owner's file (``pgcfm/ens_to_det.py``, official neuraloperator FNO), unchanged.
 
-    python scripts/run_step10_deterministic.py --out runs/step10 --step7 runs/step7 [--quick]
+    python scripts/run_step10_deterministic.py --out runs/step10_det --step7 runs/step7 [--quick]
 """
 
 import argparse
@@ -134,7 +134,7 @@ class MemberChain(nn.Module):
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default="runs/step10")
+    p.add_argument("--out", default="runs/step10_det")  # runs/step10 belongs to run_step10_baselines.py
     p.add_argument("--step7", default="runs/step7")
     p.add_argument("--arms", nargs="+", default=["mean", "bias", "bias_grid", "mbm", "mbm_tan", "member_mbm", "mbmx", "mbmx_tan",
                                                      *LEARNED])
