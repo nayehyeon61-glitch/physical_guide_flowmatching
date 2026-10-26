@@ -25,7 +25,8 @@ built on the KAI-α ERA5 data contract (1.5°, 121×240, 67 channels).
 | `scripts/run_step2_cfm.py`, `scripts/step3_residual_experiment.py`, `scripts/run_step4_pgcfm.py`, `scripts/eval_synthetic_demo.py` | Per-step small experiments (docs/) |
 | `docs/RUN_ON_GPU.md` | How to train and evaluate on the GPU server |
 | `pgcfm/seqdct.py`, `pgcfm/ens_guide.py` | Step 13: sequence 3-D DCT, PINN projector, sequence FM / regression, band-energy calibration guide |
-| `scripts/run_step13_best.sh` | Step 13 reported ensemble (regm_band) end to end: ERA5 download, PINN, FM, regression, calibration, scores |
+| `pgcfm/flow_sigma.py` | Step 13: flow-dependent spread field on the calibrated members (ClimODE's uncertainty net, or the pretrained operator fine-tuned into sigma) |
+| `scripts/run_step13_best.sh` | Step 13 reported ensembles (regm_band, regm_flow, regm_flowop) end to end: ERA5 download, PINN, FM, regression, calibration, spread field, scores |
 | `docs/step13_reproduce.md` | How to run step 13 yourself, with timings and the expected scores |
 | `docs/` | Per-step implementation notes and weakness analysis (`docs/step4_pgcfm.md`: coupling results) |
 

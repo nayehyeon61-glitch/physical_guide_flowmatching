@@ -4,7 +4,7 @@
     bottom   RMS error in the largest-spread fifth of cases / in the smallest-spread fifth (1 = the spread
              says nothing about the error), from scripts/diag_step13_flowdep.py --leads 24 48 72 96 120 144
 
-    python scripts/plot_step13_flowdep.py --score runs/step13/score_flowop.json \
+    python scripts/plot_step13_flowdep.py --score runs/step13/score_flowop30.json \
         --flowdep runs/step13/flowdep_all.json --out docs/step13
 """
 
@@ -24,11 +24,13 @@ from scripts.plot_step13 import GRID, LEADS_H, MUTED, SLOTS  # noqa: E402
 
 REF = "seqfm_dct_pinn_regm_band"
 LINES = [  # (arm, label, categorical slot)
-    ("seqfm_dct_pinn_regm_band", "regm_band: band Γ only (reported model)", 7),
+    ("seqfm_dct_pinn_regm_band", "regm_band: band Γ only", 7),
     ("seqfm_dct_pinn_regm_flow", "regm_flow: + σ field, ClimODE uncertainty net", 0),
-    ("seqfm_dct_pinn_regm_flowop", "regm_flowop: + σ field, pretrained operator fine-tuned", 2),
-    ("seqregress_pinn", "Regression + statistical errors (fixed covariance)", 5),
+    ("seqfm_dct_pinn_regm_flowop", "regm_flowop: + σ field, pretrained operator fine-tuned (30 epochs)", 2),
+    ("seqfm_dct_pinn_regm_flowop10", "regm_flowop, 10-epoch fine-tune", 2),
+    ("seqregress_pinn", "Regression + statistical errors (fixed covariance)", 6),
 ]
+DASHED = ("seqfm_dct_pinn_regm_flowop10", "seqregress_pinn")
 
 
 def main(argv=None):
@@ -47,11 +49,13 @@ def main(argv=None):
         vi = V.index(v)
         a_ = ax[0, col]
         a_.axhline(0, color=SLOTS[7], lw=1.8, label=LINES[0][1])
-        for arm, lab, slot in LINES[1:3]:
+        for arm, lab, slot in LINES[1:4]:
             if arm in boot:
                 b = {k: 100 * np.asarray(boot[arm]["crps"][k])[:, vi] / base[:, vi] for k in ("mean", "lo", "hi")}
-                a_.fill_between(days, b["lo"], b["hi"], color=SLOTS[slot], alpha=0.18, lw=0)
-                a_.plot(days, b["mean"], "-", color=SLOTS[slot], lw=1.8, marker="o", ms=4, label=lab)
+                if arm not in DASHED:
+                    a_.fill_between(days, b["lo"], b["hi"], color=SLOTS[slot], alpha=0.18, lw=0)
+                a_.plot(days, b["mean"], "--" if arm in DASHED else "-", color=SLOTS[slot], lw=1.8, marker="o", ms=4,
+                        label=lab)
         a_.set_title(name, fontsize=13)
         a_.set_ylabel("Ensemble CRPS change vs regm_band (%)")
         a_ = ax[1, col]
@@ -60,7 +64,7 @@ def main(argv=None):
             if arm in fd:
                 leads = [h for h in LEADS_H if f"{key}_{h}" in fd[arm]]
                 r = [fd[arm][f"{key}_{h}"]["bin_rmse"] for h in leads]
-                a_.plot(np.array(leads) / 24, [q[4] / q[0] for q in r], "--" if arm == "seqregress_pinn" else "-",
+                a_.plot(np.array(leads) / 24, [q[4] / q[0] for q in r], "--" if arm in DASHED else "-",
                         color=SLOTS[slot], lw=1.8, marker="o", ms=4, label=lab)
         a_.axhline(1, color=MUTED, ls=":", lw=2, label="No flow dependence")
         a_.set_title(name, fontsize=13)
@@ -72,7 +76,7 @@ def main(argv=None):
         for s_ in ("top", "right"):
             a_.spines[s_].set_visible(False)
     fig.legend(*ax[1, 0].get_legend_handles_labels(), loc="outside lower center", ncol=3, fontsize=9, frameon=False)
-    fig.suptitle("Step 13: flow-dependent spread field on top of the reported model (same mean, same band Γ)\n"
+    fig.suptitle("Step 13: flow-dependent spread field on top of regm_band (same mean, same band Γ)\n"
                  "Real ERA5 5.625°, test 2017-2018 (ClimODE's 360 ICs), 8 members; σ fitted on 2016", fontsize=13)
     os.makedirs(a.out, exist_ok=True)
     path = os.path.join(a.out, "fig_flowdep.png")
