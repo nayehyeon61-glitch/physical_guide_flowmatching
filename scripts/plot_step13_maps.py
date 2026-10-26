@@ -10,6 +10,10 @@
     fig_basis.png        the owner's DCT basis against the grid control (same FM, same frozen PINN): z500 CRPS,
                          lag-24 h member correlation, small-scale power, and band spread / error energy
                          (score_b.json from scripts/score_step13.py, band energies from the saved ensembles)
+    fig_flow_fm.png      what the flow-dependent spread field (docs/step13_sequence.md 4.3) does to the FM
+                         members: spread maps of the raw FM + PINN members, regm_band and the sigma arms with
+                         their factor f, on the hardest and the easiest 2017 case (error of mu* at 72 h), and
+                         the case-to-case domain-mean spread against the RMSE (``--only flow``)
 
     python scripts/plot_step13_maps.py --era5 /path/era5_data --out docs/step13
 """
@@ -121,6 +125,94 @@ def plot_maps(v, year, era5, cp, out, leads_show=(24, 72, 144)):
     fig.savefig(p, dpi=130)
     plt.close(fig)
     print(f"[maps] {p}")
+    return p
+
+
+FLOW = [  # (prefix, short name, title, slot); slots as in scripts/plot_step13_flowdep.py
+    (f"{O_}/seqfm_dct_pinn", "fm", "FM + PINN members (raw)", 0),
+    (f"{O_}/seqfm_dct_pinn_regm_band", "band", "regm_band: FM deviations × band Γ", 7),
+    (f"{O_}/seqfm_dct_pinn_regm_flow", "flow", "regm_flow: × f(x), ClimODE net", 0),
+    (f"{O_}/seqfm_dct_pinn_regm_flowop", "flowop", "regm_flowop: × f(x), operator", 2),
+]
+
+
+def plot_flow(year, era5, out, v="z", lead=72):
+    from datetime import datetime, timedelta
+    from matplotlib.colors import LogNorm
+    lat, lon, _, lsm = load_static(era5)
+    ext = [lon[0], lon[-1], lat[0], lat[-1]]
+    w = np.cos(np.deg2rad(lat))[:, None] * np.ones((1, len(lon)))
+    w = w / w.mean()
+    arms = [q for q in FLOW if os.path.exists(f"{q[0]}_ens_{year}.npz")]
+    mem, obs = {}, None
+    for prefix, k, *_ in arms:
+        ens, obs, ics, leads = load_var(prefix, year, v)
+        mem[k] = ens[:, :, leads.index(lead)]
+    obs = obs[:, leads.index(lead)]
+    sd = {k: m.std(1, ddof=1) for k, m in mem.items()}
+    err = {k: m.mean(1) - obs for k, m in mem.items()}  # regm_* share mu*
+    dom = lambda f: (f * w).mean((-1, -2))  # noqa: E731
+    rmse = np.sqrt(dom(err["band"] ** 2))
+    cases = [("Hardest case", int(rmse.argmax())), ("Easiest case", int(rmse.argmin()))]
+    sig = [k for k in ("flow", "flowop") if k in mem]
+    cols = [("|μ* − truth|", None)] + [(t, k) for _, k, t, _ in arms] + [(f"factor f (regm_{k})", k) for k in sig]
+    fig = plt.figure(figsize=(4.1 * len(cols) + 2, 15.5), layout="constrained")
+    top, bot = fig.subfigures(2, 1, height_ratios=[2, 1.15])
+    ax = top.subplots(2, len(cols))
+    u = UNITS[v]
+    for row, (name, r) in enumerate(cases):
+        mags = [np.abs(err["band"][r])] + [sd[k][r] for _, k, *_ in arms]
+        vmax = np.percentile(np.stack(mags), 99)
+        for c, f in enumerate(mags):
+            a_ = ax[row, c]
+            im = a_.imshow(f, origin="lower", extent=ext, cmap="Purples", vmin=0, vmax=vmax, aspect="auto")
+            note = f"mean {dom(f):.3g}"
+            if c and arms[c - 1][1] != "fm":
+                note += f", corr with |err| {np.corrcoef(f.ravel(), mags[0].ravel())[0, 1]:.2f}"
+            a_.text(0.02, 0.04, note, transform=a_.transAxes, fontsize=9, color=INK,
+                    bbox=dict(facecolor="white", alpha=0.75, lw=0, pad=1.5))
+        top.colorbar(im, ax=ax[row, :len(mags)], shrink=0.85, pad=0.01, label=f"{u}")
+        for c, k in enumerate(sig):
+            a_ = ax[row, len(mags) + c]
+            fac = sd[k][r] / sd["band"][r]
+            imf = a_.imshow(fac, origin="lower", extent=ext, cmap="RdBu_r", norm=LogNorm(0.5, 2), aspect="auto")
+            a_.text(0.02, 0.04, f"domain mean {dom(fac):.2f}", transform=a_.transAxes, fontsize=9, color=INK,
+                    bbox=dict(facecolor="white", alpha=0.75, lw=0, pad=1.5))
+        if sig:
+            top.colorbar(imf, ax=ax[row, len(mags):], shrink=0.85, pad=0.01, label="f = spread / regm_band spread")
+        for c in range(len(cols)):
+            ax[row, c].contour(lon, lat, lsm, levels=[0.5], colors=INK, linewidths=0.4, alpha=0.5)
+            style(ax[row, c])
+            if row == 0:
+                ax[row, c].set_title(cols[c][0], fontsize=11)
+        day = (datetime(year, 1, 1) + timedelta(hours=6 * int(ics[r]))).strftime("%Y-%m-%d %H UTC")
+        ax[row, 0].set_ylabel(f"{name}\nIC {day}", fontsize=11)
+    bx = bot.subplots(1, len(arms))
+    for c, (_, k, title, slot) in enumerate(arms):
+        a_ = bx[c]
+        x, y = np.sqrt(dom(sd[k] ** 2)), np.sqrt(dom(err[k] ** 2))
+        a_.scatter(x, y, s=14, color=SLOTS[slot], alpha=0.7, lw=0)
+        for (name, r), mk in zip(cases, ("^", "s")):
+            a_.scatter(x[r], y[r], s=80, marker=mk, facecolor="none", edgecolor=INK, lw=1.4, label=name)
+        lim = [0.9 * min(x.min(), y.min()), 1.05 * max(x.max(), y.max())]
+        a_.plot(lim, lim, ":", color=MUTED, lw=1.5, label="spread = RMSE")
+        a_.set_xlim(lim)
+        a_.set_ylim(lim)
+        a_.set_title(f"{title}\ncase corr {np.corrcoef(x, y)[0, 1]:.2f}, spread CV {x.std() / x.mean():.2f}",
+                     fontsize=11)
+        a_.set_xlabel(f"domain-mean spread ({u})")
+        a_.grid(True, color=GRID, lw=0.8)
+        for s_ in ("top", "right"):
+            a_.spines[s_].set_visible(False)
+    bx[0].set_ylabel(f"RMSE of the ensemble mean ({u})")
+    bx[0].legend(fontsize=9, frameon=False, loc="upper left")
+    fig.suptitle(f"Step 13: what the flow-dependent spread field does to the FM members, {TITLES[v]}, +{lead // 24} d, "
+                 f"{year} ({len(ics)} ICs)\nThe FM is not retrained: f(x) = σ(x) / ρ rescales its member deviations "
+                 "after the flow and band Γ, case by case; the mean μ* is unchanged", fontsize=13)
+    p = os.path.join(out, "fig_flow_fm.png")
+    fig.savefig(p, dpi=120)
+    plt.close(fig)
+    print(f"[flow] {p}: " + ", ".join(k for _, k, *_ in arms))
     return p
 
 
@@ -288,11 +380,13 @@ def main(argv=None):
     p.add_argument("--year", type=int, default=2017)
     p.add_argument("--climode", default="runs/step11/climode/climode_pred.npz")
     p.add_argument("--out", default="docs/step13")
-    p.add_argument("--only", choices=["maps", "energy", "basis"], default=None)
+    p.add_argument("--only", choices=["maps", "energy", "basis", "flow"], default=None)
     a = p.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     if a.only == "basis":
         return [plot_basis(a.era5, a.out)]
+    if a.only == "flow":
+        return [plot_flow(a.year, a.era5, a.out)]
     cp = dict(np.load(a.climode))
     out = [plot_maps(v, a.year, a.era5, cp, a.out) for v in ("z", "t")] if a.only in (None, "maps") else []
     if a.only in (None, "energy"):
