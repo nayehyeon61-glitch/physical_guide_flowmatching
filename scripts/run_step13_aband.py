@@ -15,6 +15,11 @@ FM + PINN ensembles and ERA5.
                               T_c = sum_b P_b M_b(c) P_b, about n coefficients per cell (``--cell-nmin``),
                               realized cell spread, Gamma_max = 1; the n with the lower held-out 2016 fair
                               CRPS is also saved as regm_sband
+             regm_sband<n>_clim  the same operator with the per-lead cell climatology only (no case adaptation):
+                              what the band x cell climatology of the spread does by itself
+             regm_sband<n>_clim_flow  regm_sband<n>_clim times regm_flow's case factor sigma / rho (the sigma net of
+                              ``--flow-sigma-pt``, rho = its 2016 RMS per lead and cell): cell climatology from
+                              the bands, case modulation from the grid-point sigma
     report   per band: held-out / test corr over cases of s_b^2 and Ebar_b, its ceiling and the ratio;
              n_eff (lead-mean reference and fitted residual ratio); per arm: fair CRPS, the fraction of
              Gamma at Gamma_max, ||T_c|| = max_b Gamma_b, the case spread/skill CV and the corr over cases
@@ -241,6 +246,9 @@ def main(argv=None):
         fsig = FlowSigma(d_["in_channels"], torch.zeros(L, 5, H, W))
         fsig.load_state_dict(d_["state_dict"])
         fsig.eval()
+        sig_v = predict_sigma(fsig, feats, lead_idx)
+        rho_f = torch.stack([(sig_v[lead_idx == j] ** 2).mean(0).sqrt() for j in range(L)])  # (L, C, H, W)
+        del sig_v
 
     # regm_band (baseline) and the marginal spread on the validation year
     base_gam = per_lead_gamma(band_error2(mu_v, tgt, bidx_r, nb_r), band_spread2(mem, bidx_r, nb_r), L, M)
@@ -251,7 +259,8 @@ def main(argv=None):
     del mem, ctx, sp_v
 
     # -- test years -----------------------------------------------------------------------------------
-    names = ["regm_band"] + list(ARMS) + [f"regm_sband{q}" for q in sband]
+    names = ["regm_band"] + list(ARMS) + [f"regm_sband{q}{c}" for q in sband
+                                          for c in ("", "_clim") + (("_clim_flow",) if fsig is not None else ())]
     GRIDS = [(1, 1), (2, 4), (5, 10), (H, W)]
     pooled = {}  # model -> per grid: chunks of (pooled predicted variance, pooled squared error, lead)
     acc = {k: {"crps": [], "clip": [], "opn": [], "ssr": [], "dsp": [], "derr": [], "lead": []} for k in names}
@@ -285,7 +294,7 @@ def main(argv=None):
             pooled.setdefault(k, [[] for _ in GRIDS])
             for gi, g in enumerate(GRIDS):
                 pooled[k][gi].append((F.adaptive_avg_pool2d(v, g), F.adaptive_avg_pool2d(r2, g), li))
-        del models, sig_f, r2
+        del models, r2
         keep = {k: [] for k in a.save_arms}
         for i in torch.arange(n * L).split(64):
             out = {"regm_band": (apply_gamma(mu[i], mem[i], base_gam[li[i]], bidx_r), None)}
@@ -293,9 +302,15 @@ def main(argv=None):
                 T = AdaptiveBandOperator(dct, pool, gamma_max=gmax, normalize=norm)
                 ens, g, info = T(mem[i], mu[i], ls[i] if adapt else clim.log()[li[i]], sig_marg[li[i]])
                 out[k] = (ens, (g, info))
-            for q, (_, grids) in sband.items():
-                ens, info = SpaceBandOperator(proj, grids, gamma_max=1.0)(mem[i], mu[i], [z[i] for z in ls_sb[q]])
-                out[f"regm_sband{q}"] = (ens, (None, {"clip_frac": info["clip_frac"], "op_norm": info["op_norm_bound"]}))
+            for q, (net_s, grids) in sband.items():
+                T = SpaceBandOperator(proj, grids, gamma_max=1.0)
+                for c, ls_ in (("", [z[i] for z in ls_sb[q]]),  # _clim: the per-lead cell climatology, no adaptation
+                               ("_clim", [getattr(net_s, f"log_clim_{b}")[li[i]] for b in range(len(grids))])):
+                    ens, info = T(mem[i], mu[i], ls_)
+                    out[f"regm_sband{q}{c}"] = (ens, (None, {"clip_frac": info["clip_frac"], "op_norm": info["op_norm_bound"]}))
+                if sig_f is not None:  # c == "_clim" here: the cell-climatology ensemble
+                    fac = sig_f[i] / rho_f[li[i]]
+                    out[f"regm_sband{q}_clim_flow"] = (mu[i][:, None] + fac[:, None] * (ens - mu[i][:, None]), None)
             for k, (ens, gi) in out.items():
                 d = acc[k]
                 d["crps"].append(float(fair_crps(ens, tgt[i], w)) * len(i))
@@ -306,7 +321,8 @@ def main(argv=None):
                 d["dsp"].append((((dev ** 2).sum(1) / (M - 1)) * wn).sum((-1, -2)).sqrt())  # (b, C) domain spread
                 d["derr"].append((((tgt[i] - mu[i]) ** 2) * wn).sum((-1, -2)).sqrt())
                 d["lead"].append(li[i])
-                save_as = "regm_sband" if k == f"regm_sband{best_nmin}" else k
+                base = f"regm_sband{best_nmin}"
+                save_as = "regm_sband" + k[len(base):] if k == base or k.startswith(base + "_") else k
                 if save_as in keep:
                     keep[save_as].append(unz(ens))
         for k, v in keep.items():
@@ -316,7 +332,7 @@ def main(argv=None):
                          E_minus_x0=(phys - X0[:, None, None]).astype(np.float16), O=O, X0=X0,
                          ics=np.asarray(ics), leads=np.asarray(leads))
             del phys
-        del keep, mem, ctx, ls_sb
+        del keep, mem, ctx, ls_sb, sig_f
         log(f"  {y}: fair CRPS so far " + " ".join(
             f"{k} {sum(acc[k]['crps']) / sum(len(q_) for q_ in acc[k]['lead']):.5f}" for k in names))
     ls, Eb = torch.cat(tcorr["ls"]), torch.cat(tcorr["Eb"])
