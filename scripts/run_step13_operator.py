@@ -8,12 +8,18 @@ forecast, against the classical regression that beat every learned corrector in 
              shared member encoder, member pooling, global FNO, zero head = the ensemble mean), one
              operator for all leads, context = x(t) and the lead
     arms     mean (ensemble mean), mbmx (a + b mu + c x0 per lead and variable, step 10), operator,
-             operator_mean_only (the same model fed the mean only: does the ensemble add anything?)
+             operator_mean_only (the same model fed the mean only: does the ensemble add anything?),
+             operator_norm<B> (``--norm-bounds``: the owner's hard L2 operator-norm projection after every
+             step, max_k ||R(k)|| <= B / 2 and ||W_skip|| <= B / 2 in every FNO block, pgcfm/ens_relation.py)
+    lipschitz per arm on the test years: |change of the learned correction| / |change of the members| for
+             a step of eps (0.01 and 1) from each IC towards the next IC at the same lead, and the
+             per-block norms (max_k ||R(k)||, ||W_skip||)
     weights  <out>/operator_<ens name>.pt and operator_mean_only_<ens name>.pt: state_dict, config and the
              per-variable normalization (inputs and target are (x - norm_mean) / norm_std)
 
     python scripts/run_step13_operator.py --ens runs/step13/seqfm_dct_pinn --era5 /home/claude/era5/era5_data \
         --out runs/step13 [--quick]
+    python scripts/run_step13_operator.py ... --arms operator --norm-bounds 1 2 --load-existing
 """
 
 import argparse
@@ -27,6 +33,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 from pgcfm import contract  # noqa: E402
+from pgcfm.ens_relation import fno_norms, project_fno_  # noqa: E402
 from pgcfm.ens_to_det import EnsembleToDeterministic, fit  # noqa: E402
 from scripts.run_step10_deterministic import PersistenceMBM  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_minmax, climode_scores, climode_truth  # noqa: E402
@@ -63,8 +70,13 @@ def main(argv=None):
     p.add_argument("--modes", type=int, default=8)
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--arms", nargs="+", default=["operator", "operator_mean_only"])
+    p.add_argument("--norm-bounds", type=float, nargs="*", default=[], help="adds operator_norm<B> arms")
+    p.add_argument("--load-existing", action="store_true", help="load <arm>_<tag>.pt instead of training if present")
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
+    arms = list(a.arms) + [f"operator_norm{b:g}" for b in a.norm_bounds]
+    default_arms = arms == ["operator", "operator_mean_only"]
     if a.quick:
         a.n_valid, a.width, a.modes, a.epochs = 1, 8, 3, 2
     torch.set_num_threads(a.threads)
@@ -82,20 +94,37 @@ def main(argv=None):
     res = {"args": vars(a), "mbmx_coef": mbmx.coef.tolist()}
     tag = os.path.basename(a.ens) + ("_quick" if a.quick else "")
     models = {}
-    for arm, use_ens in (("operator", True), ("operator_mean_only", False)):
+    for arm in arms:
+        use_ens = arm != "operator_mean_only"
+        bound = float(arm[len("operator_norm"):]) if arm.startswith("operator_norm") else None
         torch.manual_seed(0)
         op = EnsembleToDeterministic(5, context_channels=6, width=a.width, modes=a.modes)
-        info = fit(op, samples(E[tr], O[tr], X0[tr], leads, m, s), samples(E[va], O[va], X0[va], leads, m, s),
-                   area, epochs=a.epochs, use_ensemble=use_ens)
-        res[arm] = {"best_val_mse": info["best_val_mse"], "val_history": info["val_mse_history"]}
+        path = os.path.join(a.out, f"{arm}_{tag}.pt")
+        if a.load_existing and os.path.exists(path):
+            op.load_state_dict(torch.load(path, weights_only=False)["state_dict"])
+            op.eval()
+            res[arm] = {"loaded": path}
+            print(f"[{arm}] loaded {path}", flush=True)
+        else:
+            post = None
+            if bound is not None:
+                project_fno_(op, bound)
+                post = lambda model, b=bound: project_fno_(model, b)  # noqa: E731
+            info = fit(op, samples(E[tr], O[tr], X0[tr], leads, m, s), samples(E[va], O[va], X0[va], leads, m, s),
+                       area, epochs=a.epochs, use_ensemble=use_ens, post_step=post)
+            res[arm] = {"best_val_mse": info["best_val_mse"], "val_history": info["val_mse_history"]}
+            torch.save({"state_dict": op.state_dict(), "use_ensemble": use_ens, "norm_mean": m, "norm_std": s,
+                        "norm_bound": bound,
+                        "config": {"channels": 5, "context_channels": 6, "width": a.width, "modes": a.modes}}, path)
+            print(f"[{arm}] best val mse {info['best_val_mse']:.4f} (epoch {int(np.argmin(info['val_mse_history']))})",
+                  flush=True)
+        res[arm]["fno_norms"] = fno_norms(op)
+        print(f"[{arm}] FNO block norms (max_k |R(k)|, |W_skip|) "
+              + " ".join(f"({r:.2f}, {w_:.2f})" for r, w_ in res[arm]["fno_norms"]), flush=True)
         models[arm] = (op, use_ens)
-        torch.save({"state_dict": op.state_dict(), "use_ensemble": use_ens, "norm_mean": m, "norm_std": s,
-                    "config": {"channels": 5, "context_channels": 6, "width": a.width, "modes": a.modes}},
-                   os.path.join(a.out, f"{arm}_{tag}.pt"))
-        print(f"[{arm}] best val mse {info['best_val_mse']:.4f} (epoch {int(np.argmin(info['val_mse_history']))})",
-              flush=True)
     mx, mn = climode_minmax(a.era5)
-    sc = {k: {"rmse": [], "acc": []} for k in ("mean", "mbmx", "operator", "operator_mean_only", "persistence")}
+    sc = {k: {"rmse": [], "acc": []} for k in ["mean", "mbmx", *arms, "persistence"]}
+    lip = {arm: {"0.01": [], "1": []} for arm in arms}
     for y in a.test_years:
         E, O, X0, _, leads = load(a.ens, y)
         clim = climode_truth(a.era5, y).mean(0)
@@ -108,15 +137,31 @@ def main(argv=None):
                 x = mem if use_ens else mem.mean(1, keepdim=True).expand_as(mem)
                 out = torch.cat([op(x[i:i + 64], ctx[i:i + 64]) for i in range(0, len(x), 64)]).numpy()
                 preds[arm] = out.reshape(n, L, *out.shape[1:]) * s + m
+                # empirical Lipschitz of the learned correction along real IC-to-IC changes
+                for i0 in torch.arange((n - 1) * L)[:: max(1, (n - 1) * L // 256)].split(32):
+                    x0_, c0 = x[i0], ctx[i0]
+                    dx, dc = x[i0 + L] - x0_, ctx[i0 + L] - c0
+                    corr0 = op(x0_, c0) - x0_.mean(1)
+                    for eps in ("0.01", "1"):
+                        e = float(eps)
+                        corr1 = op(x0_ + e * dx, c0 + e * dc) - (x0_ + e * dx).mean(1)
+                        lip[arm][eps].append(((corr1 - corr0).flatten(1).norm(dim=1)
+                                              / (e * dx.flatten(1).norm(dim=1))).numpy())
         for arm, P in preds.items():
             q = climode_scores(P, O, np.full_like(P, 1e-6), clim, lat, mx, mn)
             sc[arm]["rmse"].append(q["rmse"]), sc[arm]["acc"].append(q["acc"])
+    res["lipschitz"] = {arm: {e: {"mean": float(np.concatenate(v).mean()), "max": float(np.concatenate(v).max())}
+                              for e, v in d.items()} for arm, d in lip.items()}
+    for arm, d in res["lipschitz"].items():
+        print(f"[{arm}] correction Lipschitz along IC changes: eps 0.01 mean {d['0.01']['mean']:.3f} max "
+              f"{d['0.01']['max']:.3f} | eps 1 mean {d['1']['mean']:.3f} max {d['1']['max']:.3f}", flush=True)
     res["test"] = {arm: {k: {str(h): {v: float(np.concatenate(r[k])[:, j, i].mean()) for i, v in enumerate(VARS)}
                              for j, h in enumerate(leads)} for k in r} for arm, r in sc.items()}
     for arm, r in res["test"].items():
         print(f"[{arm:18s}] z500 RMSE " + " ".join(f"{h}:{r['rmse'][h]['z']:.0f}" for h in r["rmse"])
               + " | t850 " + " ".join(f"{r['rmse'][h]['t']:.2f}" for h in r["rmse"]), flush=True)
-    with open(os.path.join(a.out, f"operator_{tag}.json"), "w") as f:
+    name = f"operator_{tag}" + ("" if default_arms else "_" + "_".join(arms))
+    with open(os.path.join(a.out, name + ".json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
 

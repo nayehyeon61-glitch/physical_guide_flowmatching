@@ -74,7 +74,7 @@
     python scripts/diag_step13_flowdep.py --runs $O --leads 24 48 72 96 120 144 \
         --arms seqfm_dct_pinn seqfm_dct_pinn_regm_band seqfm_dct_pinn_regm_flow seqfm_dct_pinn_regm_flowop
 
-`run_step13_seqfm.py`는 한 번 실행에서 학습과 앙상블 생성을 함께 합니다. 출력 폴더에 `seqfm_dct.pt`(회귀는 `seqregress.pt`)가 있으면 학습을 건너뛰고 그 가중치로 생성만 하므로, 학습만 다시 하고 싶으면 그 파일을 지우고, 시험만 하고 싶으면 아래 5절처럼 가중치를 넣어 두면 됩니다. 보정 단계는 학습된 가중치를 따로 남기지 않고 매번 2016년에서 a, b, c, Γ, σ 장을 다시 맞춥니다.
+`run_step13_seqfm.py`는 한 번 실행에서 학습과 앙상블 생성을 함께 합니다. 출력 폴더에 `seqfm_dct.pt`(회귀는 `seqregress.pt`)가 있으면 학습을 건너뛰고 그 가중치로 생성만 하므로, 학습만 다시 하고 싶으면 그 파일을 지우고, 시험만 하고 싶으면 아래 5절처럼 가중치를 넣어 두면 됩니다. 보정 단계는 매번 2016년에서 a, b, c, Γ, σ 장을 다시 맞춥니다. σ 장 망의 가중치는 기록용으로 `flow_sigma_<앙상블>.pt`, `flow_op_<앙상블>.pt`에 남습니다(6절).
 
 ## 5. 학습을 건너뛰고 받은 가중치로 실행
 
@@ -85,7 +85,41 @@
 
 생성 잡음은 고정 seed에서 해마다 같은 순서로 나오므로, 같은 가중치로 모든 초기장을 돌리면 이 문서와 같은 앙상블이 나옵니다. 받은 가중치로 돌린 확인 실행에서 2016년 FM과 회귀 멤버가 원래 실행과 비트 단위로 같았습니다. `SMOKE=1`처럼 초기장 수를 줄이면 다음 해의 잡음 순서가 바뀌어 같지 않습니다. 처음부터 학습하면 seed는 같지만 스레드 수나 라이브러리 버전에 따라 학습 결과가 조금 달라질 수 있습니다.
 
-## 6. 결과 확인
+## 6. 신경연산자 실험
+
+소유자의 연산자 `EnsembleToDeterministic`(`pgcfm/ens_to_det.py`, 공식 neuraloperator FNO)은 두 곳에서 학습됩니다. 둘 다 2–4절의 앙상블(`seqfm_dct_pinn_ens_*.npz`, `seqregress_pinn_ens_*.npz`)이 출력 폴더에 있어야 합니다.
+
+| 실험 | 명령 | 학습 방향과 손실 | 저장되는 가중치 | 시간 |
+| --- | --- | --- | --- | --- |
+| 3단계: 앙상블 → 결정론 예보 | `run_step13_operator.py --ens $O/seqfm_dct_pinn` (회귀 앙상블은 `--ens $O/seqregress_pinn`) | 출력 = 앙상블 평균 + 보정(헤드 0 초기화). 위도 가중 MSE, Adam 3e-3, 배치 8, 40 epoch, 2016년 마지막 33개 초기장으로 체크포인트. 대조군: 같은 모델에 평균만 입력 | `operator_<앙상블>.pt`, `operator_mean_only_<앙상블>.pt` | 약 45분 |
+| 4.3: 연산자 σ 장 | `run_step13_guide.py … --reg-mbm --flow-op --sigma-full-epochs 30 --save-arms regm_band regm_flowop` | 위와 같은 사전학습을 regm_band 멤버에서 한 뒤, 출력 헤드 앞 특징에 새 σ 헤드: ClimODE 가우시안 NLL, 헤드만 30 epoch, 그다음 전체를 lr 1e-4로 30 epoch | `flow_op_<앙상블>.pt` (사전학습 연산자, 미세조정한 OperatorSigma, ρ) | 약 1시간 |
+
+    O=runs/step13_best; E=data/era5_5p625/era5_data
+    python scripts/run_step13_operator.py --ens $O/seqfm_dct_pinn --era5 $E --out $O --width 32 --modes 8 --epochs 40
+    python scripts/run_step13_guide.py --ens $O/seqfm_dct_pinn --era5 $E --out $O --reg $O/seqregress_pinn --reg-mbm \
+        --flow-op --sigma-full-epochs 30 --save-arms regm_band regm_flowop
+    python scripts/score_step13.py --era5 $E --out $O/score_op.json --ref $O/seqfm_dct_pinn_regm_band \
+        --arms $O/seqfm_dct_pinn_regm_band $O/seqfm_dct_pinn_regm_flowop
+
+첫 명령의 결과는 `operator_seqfm_dct_pinn.json`과 로그 마지막 줄들(앙상블 평균, a + b·μ + c·x0, 연산자, 평균만 입력, persistence의 z500·t850 RMSE)입니다. 이 문서의 값은 z500 144 h 앙상블 평균 997, a + b·μ + c·x0 912, 연산자 839, 평균만 835입니다. 같은 앙상블로 처음부터 다시 학습한 결과도 lead마다 똑같았습니다(seed 고정, 4스레드).
+
+바꿔 볼 수 있는 것:
+- `--width`, `--modes`, `--epochs`(사전학습), `--sigma-epochs`(σ 헤드만), `--sigma-full-epochs`(전체 미세조정). `--quick`은 몇 분짜리 점검입니다.
+- 입력: σ 버전의 맥락은 `run_step13_guide.py`의 `op_context`(x(t), lead, 연중·하루 시각), 3단계는 `run_step13_operator.py`의 `samples`(x(t), lead)에서 만듭니다. 지형·해륙 같은 정적 장은 아직 넣지 않았습니다.
+- 손실: `pgcfm/ens_to_det.py`의 `fit`에는 물리 손실 자리(`physics_fn`, `physics_weight`)가 있지만 지금은 0입니다.
+
+저장한 가중치 다시 불러오기:
+
+    import torch
+    from pgcfm.ens_to_det import EnsembleToDeterministic
+    from pgcfm.flow_sigma import OperatorSigma
+    d = torch.load("runs/step13_best/operator_seqfm_dct_pinn.pt", weights_only=False)
+    op = EnsembleToDeterministic(**d["config"]); op.load_state_dict(d["state_dict"])  # 입력은 (x - norm_mean) / norm_std
+    f = torch.load("runs/step13_best/flow_op_seqfm_dct_pinn.pt", weights_only=False)
+    sig = OperatorSigma(EnsembleToDeterministic(**f["config"]), f["operator_sigma"]["sigma_clim"])
+    sig.load_state_dict(f["operator_sigma"])  # sig(members, context, lead_idx) -> σ, 배율은 σ / f["rho"][lead_idx]
+
+## 7. 결과 확인
 
 `$OUT/score.log`의 마지막 줄들에 팔마다 z500 CRPS, SSR, 작은 규모 파워, 멤버 z–t 상관이 나옵니다. 이 문서의 수치(360개 초기장)는 다음과 같습니다.
 
@@ -100,7 +134,7 @@
 
 `score_best.json`의 `bootstrap_vs_seqregress_pinn`에는 회귀 대비 CRPS 차이와 95% 구간이 lead·변수마다 있습니다. 그래프는 기존 그림 스크립트로 그릴 수 있습니다(`docs/step13_sequence.md` 6절의 명령에 `--scores $OUT/score_best.json`).
 
-## 7. 알아 둘 것
+## 8. 알아 둘 것
 
 - 저장된 앙상블에는 ClimODE의 5변수(z500, t850, t2m, u10, v10)만 24 h 간격으로 들어 있습니다. 66채널 전체 멤버가 필요하면 `run_step13_seqfm.py`에서 저장할 변수를 늘려야 합니다.
 - 보정 단계는 매번 2016년에서 a, b, c와 Γ를 닫힌 형으로, σ 장 망은 NLL로 다시 맞춥니다(학습된 가중치가 따로 없음). 다른 해에 적용하려면 그 해의 FM·회귀 앙상블을 같은 방법으로 만든 뒤 `--test-years`를 바꾸면 됩니다.
