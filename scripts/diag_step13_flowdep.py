@@ -1,7 +1,7 @@
 """Step 13 flow-dependence check: does the ensemble spread vary from case to case, and where the error does?
 
-For each arm, test years 2017-2018 (ClimODE's 360 ICs), z500 and t850 at 24 / 72 / 144 h, per grid point
-over the ICs:
+For each arm, test years 2017-2018 (ClimODE's 360 ICs), z500 and t850 at 24 / 72 / 144 h (``--leads``), per
+grid point over the ICs:
     cv_spread    std / mean of the member spread (M = 8). A spread that is the same for every case still
                  shows about 1 / sqrt(2 (M - 1)) = 0.27 from sampling; seqregress_pinn (statistical errors
                  with a fixed covariance) is that baseline
@@ -9,9 +9,10 @@ over the ICs:
     case_corr    correlation of spread and |error| over the ICs
     bin_*        spread normalized by its grid-point mean, pooled, cut into quintiles; mean normalized
                  spread and RMS normalized error per quintile (a flow-dependent ensemble has rising error)
-Area-weighted means over grid points. Writes <runs>/flowdep.json.
+Area-weighted means over grid points. Writes <runs>/flowdep.json (``--out``).
 
     python scripts/diag_step13_flowdep.py [--runs runs/step13] [--arms seqregress_pinn seqfm_dct_pinn ...]
+        [--leads 24 48 72 96 120 144] [--out runs/step13/flowdep_all.json]
 """
 
 import argparse
@@ -20,7 +21,7 @@ import os
 
 import numpy as np
 
-LEADS = ((0, 24), (2, 72), (5, 144))
+STEP_H = 24  # the saved ensembles hold leads 24, 48, ..., 144 h
 
 
 def main(argv=None):
@@ -29,6 +30,8 @@ def main(argv=None):
     p.add_argument("--arms", nargs="+",
                    default=["seqregress_pinn", "seqfm_dct_pinn", "seqfm_grid_pinn", "seqfm_dct_pinn_regm_band"])
     p.add_argument("--years", type=int, nargs="+", default=[2017, 2018])
+    p.add_argument("--leads", type=int, nargs="+", default=[24, 72, 144], help="hours")
+    p.add_argument("--out", default=None, help="default <runs>/flowdep.json")
     a = p.parse_args(argv)
     lat = np.linspace(-87.1875, 87.1875, 32)
     wl = np.cos(np.deg2rad(lat))[:, None] * np.ones((1, 64))
@@ -43,7 +46,8 @@ def main(argv=None):
             Eabs.append(np.abs(d.mean(1) + z["X0"][:, None, :2] - z["O"][:, :, :2]))
         S, Eabs = np.concatenate(S), np.concatenate(Eabs)
         res = {}
-        for li, lead in LEADS:
+        for lead in a.leads:
+            li = lead // STEP_H - 1
             for vi, v in enumerate(("z500", "t850")):
                 s, e = S[:, li, vi], Eabs[:, li, vi]
                 sc, ec = s - s.mean(0), e - e.mean(0)
@@ -59,7 +63,7 @@ def main(argv=None):
                       f"corr {r['case_corr']:.3f}  bins spread {r['bin_spread'][0]:.2f}->{r['bin_spread'][4]:.2f}  "
                       f"rmse {r['bin_rmse'][0]:.2f}->{r['bin_rmse'][4]:.2f}", flush=True)
         out[arm] = res
-    with open(os.path.join(a.runs, "flowdep.json"), "w") as f:
+    with open(a.out or os.path.join(a.runs, "flowdep.json"), "w") as f:
         json.dump(out, f, indent=1)
 
 

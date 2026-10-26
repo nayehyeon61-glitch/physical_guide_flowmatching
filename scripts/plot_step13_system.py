@@ -2,8 +2,10 @@
 run_step13_pinn.py, run_step13_seqfm.py, run_step13_guide.py and run_step13_operator.py.
 ``--best`` draws fig_system_best.png: the same system with the parts the best ensemble (regm_band:
 a + b * regression mean + c * x(t), FM + PINN deviations, closed-form band Gamma) does not use faded.
+``--sigma`` draws fig_system_sigma.png: how the flow-dependent spread field of regm_flowop is trained
+(docs/step13_sequence.md 4.3, pgcfm/flow_sigma.py: OperatorSigma).
 
-    python scripts/plot_step13_system.py --out docs/step13 [--best]
+    python scripts/plot_step13_system.py --out docs/step13 [--best | --sigma]
 """
 
 import argparse
@@ -88,11 +90,103 @@ def stage_band(ax, y0, y1, n, name, color):
             weight="bold", color=color)
 
 
+def sigma_system(out):
+    """regm_flowop: the owner's operator pretrained on the energy-refined members, fine-tuned into sigma(x)."""
+    fig = plt.figure(figsize=(20, 14.0))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(-0.5, 100.5)
+    ax.set_ylim(6.5, 77)
+    ax.axis("off")
+    ax.text(4, 73.6, "Flow-dependent spread field", fontsize=30, weight="bold", color=TITLE, va="center")
+    ax.text(4, 70.3, "regm_flowop: the operator learns the main stream on the energy-refined ensemble, then a new head "
+            "turns its features into σ(x)", fontsize=15, color=BODY, va="center")
+    ax.text(99, 73.6, "Fitted on 2016 (every 5th IC held out)", fontsize=12.5, color=BODY, ha="right", va="center")
+    ax.text(99, 71.2, "Stages 1-2 (PINN, FM, regression) and band Γ frozen", fontsize=11.5, color=BODY, ha="right",
+            va="center")
+    ax.text(99, 69.0, "Test 2017–2018 (ClimODE's 360 ICs), 8 members", fontsize=11.5, color=BODY, ha="right",
+            va="center")
+    ax.plot([4, 99], [67.2, 67.2], color=RULE, lw=1.2)
+
+    g = STAGE[2]
+    stage_band(ax, 53.3, 65.2, 1, "PRETRAIN", g)
+    sublabel(ax, 4, 64.6, "Step 1 · operator: energy-refined ensemble → deterministic forecast", g)
+    y = 58
+    box(ax, 0, y, "regm_band members", ["μ* + IDCT(Γ_b · DCT(x_m − x̄))", "8 per IC, 2016", "weights frozen"], "energy",
+        frozen=True)
+    box(ax, 1, y, "Member encoder", ["FNO on [member, member − mean]", "mean pooling over 8", "→ spread structure"],
+        "net")
+    box(ax, 2, y, "Global FNO", ["[ensemble mean, pooled code,", "x(t), lead, time of year / day]",
+                                 "width 32, 8 modes"], "net")
+    box(ax, 3, y, "Old head", ["mean + 1×1 conv (zero init)", "deterministic field per lead"], "op")
+    box(ax, 4, y, "MSE to the truth", ["latitude weighted, 40 epochs", "checkpoint on held-out ICs"], "loss")
+    for c in range(4):
+        row(ax, c, c + 1, y, g)
+
+    o = STAGE[3]
+    stage_band(ax, 37.5, 49.6, 2, "FINE-TUNE", o)
+    yl = 50.6
+    arrow(ax, [(cx(2), 58 - H / 2 - 0.2), (cx(2), yl), (cx(0), yl), (cx(0), 42 + H / 2 + 0.35)], g,
+          ls=(0, (4, 2.5)), label="pretrained weights", lpos=(cx(0) + 0.8, 48.6))
+    sublabel(ax, cx(0) + 13.5, 48.6, "Step 2 · new head: features → σ(x), the old head is dropped", o)
+    y = 42
+    box(ax, 0, y, "Operator features f", ["global FNO output", "before the old head", "frozen in a), tuned in b)"],
+        "net", frozen=True)
+    box(ax, 1, y, "New σ head", ["1×1 conv, zero init → g", "σ = σ_clim · exp(g), |g| ≤ 3",
+                                 "starts at the climatology"], "net")
+    box(ax, 2, y, "Gaussian NLL", ["log σ + (O − μ*)² / (2σ²)", "ClimODE's utils.nll", "no spread label needed"],
+        "loss")
+    box(ax, 3, y, "Two training stages", ["a) operator frozen: head, 30 ep", "b) everything, lr 1e-4, 10 ep",
+                                          "best held-out 2016 NLL"], "op")
+    box(ax, 4, y, "Checks", ["corr(σ, |error|) per grid point", "factor CV over cases", "rank histogram, CRPS"],
+        "data")
+    for c in range(4):
+        row(ax, c, c + 1, y, o)
+
+    v = STAGE[1]
+    stage_band(ax, 21.8, 34.0, 3, "APPLY", v)
+    sublabel(ax, COLS[2], 33.4, "Step 3 · rescale the members case by case, mean and average spread unchanged", v)
+    y = 27
+    box(ax, 0, y, "regm_band members", ["y_m, 2017–2018", "same members as the", "reported model"], "energy",
+        frozen=True)
+    box(ax, 1, y, "σ(x) per case", ["operator + new head", "per lead · variable", "· grid point"], "net",
+        frozen=True)
+    box(ax, 2, y, "Factor f = σ / ρ", ["ρ² = 2016 mean of σ²", "so E₂₀₁₆ f² = 1"], "energy")
+    box(ax, 3, y, "μ* + f ⊙ (y_m − μ*)", ["mean μ* unchanged (same RMSE)", "band Γ spread kept on average",
+                                         "f moves it between cases"], "energy")
+    box(ax, 4, y, "regm_flowop", ["8 members, 6 days", "spread follows the flow"], "data")
+    for c in range(4):
+        row(ax, c, c + 1, y, v)
+    arrow(ax, [(cx(1), 42 - H / 2 - 0.2), (cx(1), 27 + H / 2 + 0.35)], o, ls=(0, (4, 2.5)), label="trained head",
+          lpos=(cx(1) + 0.8, 33.4), halo=True)
+
+    fill, edge = KIND["data"]
+    ax.add_patch(FancyBboxPatch((4, 11.6), 95, 6.6, boxstyle="round,pad=0,rounding_size=0.9", fc=fill, ec=edge, lw=1.6))
+    ax.text(51.5, 16.2, "Option 1 for comparison (regm_flow)", ha="center", va="center", fontsize=14, weight="bold",
+            color=TITLE)
+    ax.text(51.5, 13.4, "the same σ = σ_clim · exp(g), NLL, factor and members, but g from ClimODE's uncertainty ResNet "
+            "on hand-made features [x(t), μ*, μ* − x(t), lead, time, static]", ha="center", va="center", fontsize=11.5,
+            color=BODY)
+    ax.plot([4, 99], [10.3, 10.3], color=RULE, lw=1.2)
+    ax.text(4, 9.0, "Solid: data / loss flow.  Dashed border: weights frozen from an earlier step.  "
+            "Orange: training losses.  Purple: energy control.", fontsize=11.5, color=BODY, va="center")
+    ax.text(4, 7.4, "The NLL is smallest when σ matches the size of the actual error in each case, so the truth "
+            "error of μ* teaches the spread; FM, PINN, μ* and Γ_b stay fixed.", fontsize=11.5, color=BODY, va="center")
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "fig_system_sigma.png")
+    fig.savefig(path, dpi=100, facecolor="white")
+    plt.close(fig)
+    print(f"[system] {path}")
+    return path
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="docs/step13")
     p.add_argument("--best", action="store_true", help="fade what the best ensemble (regm_band) does not use")
+    p.add_argument("--sigma", action="store_true", help="the flow-dependent spread field (regm_flowop) instead")
     a = p.parse_args(argv)
+    if a.sigma:
+        return sigma_system(a.out)
     best = FADE["on"] = a.best
     fig = plt.figure(figsize=(20, 22.4))
     ax = fig.add_axes([0, 0, 1, 1])
