@@ -35,6 +35,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 from pgcfm import contract  # noqa: E402
+from pgcfm.balance import BalanceProjector, PositiveMass, ageostrophic  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
 from pgcfm.seqdct import (PINNConfig, PINNProjector, SeqDCT, band_spread, residual_rms,  # noqa: E402
@@ -93,16 +94,28 @@ def main(argv=None):
     p.add_argument("--val-chunk", type=int, default=4)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--projector", default="pinn", choices=["pinn", "balance"],
+                   help="balance: step 14 H-bal, the full-mode norm-projected FNO Pi_theta of pgcfm/balance.py")
+    p.add_argument("--bound", type=float, default=0.8, help="balance: per-block operator norm bound B (0 = none)")
+    p.add_argument("--fno-width", type=int, default=32)
+    p.add_argument("--fno-modes", type=int, nargs=2, default=[32, 33], help="all modes of the doubled 64 x 64 grid")
+    p.add_argument("--fno-layers", type=int, default=4)
+    p.add_argument("--no-positive", action="store_true", help="balance: without the mass-conserving q >= 0 layer")
+    p.add_argument("--lambda-geo", type=float, default=0.0,
+                   help="weight of the ageostrophic wind (in units of ERA5's own) inside the physics loss")
+    p.add_argument("--json-suffix", default="", help="appended to the json name (gates rerun on a checkpoint)")
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
         a.train_years, a.iters, a.K, a.hidden, a.n_val = a.train_years[:1], 3, 4, 8, 4
-        a.val_chunk = 2
+        a.val_chunk, a.fno_width, a.fno_layers = 2, 8, 2
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     os.makedirs(a.out, exist_ok=True)
-    tag = f"pinn_{a.objective}" + ("_quick" if a.quick else "")
+    tag = f"pinn_{a.objective}" if a.projector == "pinn" else \
+        f"pibal_{a.objective}_b{a.bound:g}_g{a.lambda_geo:g}" + ("_nopos" if a.no_positive else "")
+    tag += "_quick" if a.quick else ""
     log = lambda s: print(s, flush=True)  # noqa: E731
 
     # -- data, normalization, physics guide at a 6 h step ------------------------------------
@@ -129,10 +142,20 @@ def main(argv=None):
     pert = SeqDCT(a.K, contract.N_DYNAMIC, 32, 64, spatial=True)
     pert.fit(sample(data, a.train_years, a.K, rng, 16)[1] for _ in range(16))
     cfg = PINNConfig(K=a.K, k_lat=a.k_lat, k_lon=a.k_lon, hidden=a.hidden)
-    P = PINNProjector(cfg, static_features(lat, lon, oro, lsm))
-    res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "scales": vars(guide.scales),
+    if a.projector == "pinn":
+        P = PINNProjector(cfg, static_features(lat, lon, oro, lsm))
+    else:
+        P = BalanceProjector(static_features(lat, lon, oro, lsm), mean[DYN], std[DYN], lat, width=a.fno_width,
+                             modes=a.fno_modes, n_layers=a.fno_layers, bound=a.bound or None,
+                             positive=not a.no_positive)
+    pm = PositiveMass(mean[DYN], std[DYN], lat)
+    with torch.no_grad():  # ERA5's own ageostrophic wind, the unit of the R_geo loss
+        x0, d, orog, _ = sample(data, a.train_years, 1, rng, 16)
+        b_geo = float(ageostrophic(guide, x0 + d[:, 0], orog)[0].pow(2).mean().sqrt())
+    res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "scales": vars(guide.scales), "b_geo": b_geo,
            "n_params": sum(q.numel() for q in P.parameters())}
-    log(f"[stage 1 {a.objective}] {res['n_params']} parameters, b_j {res['scales']}")
+    log(f"[stage 1 {a.objective} {a.projector}] {res['n_params']} parameters, b_j {res['scales']}, "
+        f"ERA5 ageostrophic wind {b_geo:.2f} m/s")
 
     # -- training ---------------------------------------------------------------------------------
     ck = os.path.join(a.out, f"{tag}.pt")
@@ -162,12 +185,18 @@ def main(argv=None):
             data_term = wmse(out, dt_ if a.objective == "project" else d, w, t6)
             pairs = torch.from_numpy(rng.choice(a.K, a.pairs, replace=False))
             phys, _ = sequence_residual_loss(guide, x0, out, d, orog, pairs)
+            if a.lambda_geo > 0:  # the frames after each pair's step
+                f = (x0[:, None] + out[:, pairs]).flatten(0, 1)
+                ageo, _ = ageostrophic(guide, f, orog.repeat_interleave(len(pairs), 0))
+                phys = phys + a.lambda_geo * ((ageo / b_geo) ** 2).mean().to(phys.dtype)
             loss = data_term + a.lambda_p * phys
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(P.parameters(), 1.0)
             opt.step()
             sched.step()
+            if a.projector == "balance" and a.bound:
+                P.project_()
             hist.append({"data": data_term.item(), "phys": phys.item()})
             if (it + 1) % max(1, a.iters // 20) == 0:
                 h = hist[-50:]
@@ -190,6 +219,21 @@ def main(argv=None):
     def add(key, v, wgt):
         ms[key] = ms.get(key, 0.0) + float(v) * wgt
 
+    def rms_all(x0, f, d, orog):
+        """residual_rms plus the ageostrophic wind of the frames 1..K over ERA5's (key geo)."""
+        r = residual_rms(guide, x0, f, d, orog, pairs)
+        fr = (x0[:, None] + f).flatten(0, 1)
+        r["geo"] = float(ageostrophic(guide, fr, orog.repeat_interleave(f.shape[1], 0))[0].pow(2).mean().sqrt())
+        return r
+
+    def moisture(x0, f):
+        """negative q / tcwv fraction, the global moisture mass a clamp would add (relative), the mass (N, 13)."""
+        fr = (x0[:, None] + f).flatten(0, 1)
+        cl = fr.clone()
+        cl[:, pm.idx] = torch.maximum(fr[:, pm.idx], -pm.m / pm.s)
+        m, mc = pm.mass(fr), pm.mass(cl)
+        return pm.negative_fraction(fr), float(((mc - m) / m.abs().clamp_min(1e-12)).mean()), m
+
     with torch.no_grad():
         X0, D, OR, H0 = sample(data, [a.val_year], a.K, vr, a.n_val)
         for i in range(0, a.n_val, a.val_chunk):
@@ -198,14 +242,20 @@ def main(argv=None):
             pd = P(x0, d, hour0)
             add(("identity_change",), wmse(pd, d, w, t6), wgt)
             for name, f in (("base", d), ("identity", pd)):
-                for k, v in residual_rms(guide, x0, f, d, orog, pairs).items():
+                for k, v in rms_all(x0, f, d, orog).items():
                     add((name, k), v ** 2, wgt)
             for alpha in alphas:
                 dt_ = d + alpha * pert.noise(d.shape, g) * P.keep
                 out = P(x0, dt_, hour0)
+                masses = {}
                 for name, f in (("in", dt_), ("out", out)):
-                    for k, v in residual_rms(guide, x0, f, d, orog, pairs).items():
+                    for k, v in rms_all(x0, f, d, orog).items():
                         add((alpha, name, k), v ** 2, wgt)
+                    neg, clamp_add, masses[name] = moisture(x0, f)
+                    add((alpha, "neg_" + name), neg, wgt)
+                    add((alpha, "clampmass_" + name), clamp_add, wgt)
+                rel = (masses["out"] - masses["in"]) / masses["in"].abs().clamp_min(1e-12)
+                add((alpha, "mass_change"), float(rel.abs().mean()), wgt)
                 add((alpha, "err_in"), wmse(dt_, d, w, t6), wgt)
                 add((alpha, "err_out"), wmse(out, d, w, t6), wgt)
                 add((alpha, "change"), wmse(out, dt_, w, t6), wgt)
@@ -230,15 +280,25 @@ def main(argv=None):
             "residual_ratio_out": {k: x / base[k] for k, x in sub(alpha, "out").items()},
             "error_ratio": rms[(alpha, "err_out")] / rms[(alpha, "err_in")],
             "change_over_error": rms[(alpha, "change")] / rms[(alpha, "err_in")],
-            "spread_ratio": {b: s_out[b] / s_in[b] for b in s_in}}
+            "spread_ratio": {b: s_out[b] / s_in[b] for b in s_in},
+            "negative_fraction_in": ms[(alpha, "neg_in")], "negative_fraction_out": ms[(alpha, "neg_out")],
+            "clamp_mass_added_in": ms[(alpha, "clampmass_in")], "clamp_mass_added_out": ms[(alpha, "clampmass_out")],
+            "mass_change_by_P": ms[(alpha, "mass_change")]}
         log(f"[val alpha {alpha}] residual in/out " + " ".join(
             f"{k} {v['residual_ratio_in'][k]:.2f}/{v['residual_ratio_out'][k]:.2f}" for k in base)
             + f" | error ratio {v['error_ratio']:.3f} change/err {v['change_over_error']:.3f}"
-            + f" | spread low {v['spread_ratio']['low']:.3f} high {v['spread_ratio']['high']:.3f}")
+            + f" | spread low {v['spread_ratio']['low']:.3f} high {v['spread_ratio']['high']:.3f}"
+            + f" | q<0 {v['negative_fraction_in']:.3f}->{v['negative_fraction_out']:.3f}"
+            + f" mass change {v['mass_change_by_P']:.2e}")
     log(f"[val identity] change {val['identity']['change_over_t6']:.4f} x t6, residual ratio " +
         " ".join(f"{k} {v:.3f}" for k, v in val["identity"]["residual_ratio"].items()))
+    if a.projector == "balance":
+        val["lipschitz_bound_Pi"] = P.lipschitz_bound()
+        val["clip_frac"] = {"first100": float(np.mean(P.net.clip_log[:100])) if P.net.clip_log else None,
+                            "last100": float(np.mean(P.net.clip_log[-100:])) if P.net.clip_log else None}
+        log(f"[val balance] a priori Lip(Pi) <= {val['lipschitz_bound_Pi']:.3f}, clipped {val['clip_frac']}")
     res["val"] = val
-    with open(os.path.join(a.out, f"{tag}.json"), "w") as f:
+    with open(os.path.join(a.out, f"{tag}{a.json_suffix}.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
 
