@@ -78,7 +78,7 @@
 
 ## 5. 학습을 건너뛰고 받은 가중치로 실행
 
-프로젝트 파일의 `step13/step13_checkpoints.zip`(102 MB)에 이 문서의 수치를 낸 가중치가 있습니다. 학습 단계의 `pinn_project.pt`, `pinn_project.json`, `seqfm_dct.pt`, `seqregress.pt`, `stats/`와, 6절의 신경연산자 가중치 `operator_seqfm_dct_pinn.pt`, `operator_mean_only_seqfm_dct_pinn.pt`, `flow_sigma_seqfm_dct_pinn.pt`, `flow_op_seqfm_dct_pinn.pt`입니다. 출력 폴더에 풀고 실행하면 세 학습 단계가 가중치를 불러오고, 생성·보정·채점만 돌아갑니다(약 4시간, `SIGMA=0`이면 약 3시간). 연산자와 σ 장 가중치는 실행 스크립트가 다시 학습하므로 불러 쓰려면 6절의 코드나 `run_step13_operator.py --load-existing`을 씁니다. 이 네 파일로 다시 학습한 결과도 regm_flow 0.17877, regm_flowop 0.17896(정규화 fair CRPS)으로 원래 실행과 같았습니다.
+프로젝트 파일의 `step13/step13_checkpoints.zip`(102 MB)에 이 문서의 수치를 낸 가중치가 있습니다. 학습 단계의 `pinn_project.pt`, `pinn_project.json`, `seqfm_dct.pt`, `seqregress.pt`, `stats/`와, 6절의 신경연산자 가중치 `operator_seqfm_dct_pinn.pt`, `operator_mean_only_seqfm_dct_pinn.pt`, `flow_sigma_seqfm_dct_pinn.pt`, `flow_op_seqfm_dct_pinn.pt`입니다. 출력 폴더에 풀고 실행하면 세 학습 단계가 가중치를 불러오고, 생성·보정·채점만 돌아갑니다(약 4시간, `SIGMA=0`이면 약 3시간). 연산자와 σ 장 가중치는 실행 스크립트가 다시 학습하므로 불러 쓰려면 6절의 코드나 `run_step13_operator.py --load-existing`을 씁니다. 이 네 파일을 만든 재학습의 점수도 regm_flow 0.17877, regm_flowop 0.17896(정규화 fair CRPS)으로 원래 실행과 같았습니다.
 
     mkdir -p runs/step13_best && unzip step13_checkpoints.zip -d runs/step13_best
     bash scripts/run_step13_best.sh
