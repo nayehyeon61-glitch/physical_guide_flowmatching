@@ -22,6 +22,9 @@ FM + PINN ensembles, against classical calibration.
             reg_guide   regression, runs/step13/seqregress_pinn: trained 2012-2015), closed form / guide
             regm_band   ``--reg --reg-mbm``: mu* = a + b mu_reg + c x0 (step 10's PersistenceMBM fitted on
             regm_guide  the validation year's regression ensemble), closed form / guide
+            regm_flow   ``--flow-sigma``: regm_band with a flow-dependent spread factor per case and cell
+                        (pgcfm/flow_sigma.py: ClimODE's uncertainty network and NLL on the error of mu*,
+                        every fifth validation IC held out for the checkpoint)
     energy  Doob-type control (owner): E[max_k |e_k|^2] / E|e_K|^2 of the member deviations and of
             the error of the mean (<= 4 if the energy is a submartingale in the lead), the energy by
             lead and the fraction of falling lead steps, for every arm
@@ -45,7 +48,9 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.ens_guide import (BandGuide, apply_gamma, band_counts, band_error2, band_index, band_spread2,  # noqa: E402
                              calibrated_energy, doob_stats, fair_crps, member_energy, monotone_gamma,
                              spread_skill_gamma)
+from pgcfm.core import static_features  # noqa: E402
 from pgcfm.ens_to_det import EnsembleToDeterministic, fit  # noqa: E402
+from pgcfm.flow_sigma import FlowSigma, fit_flow_sigma, flow_features, predict_sigma  # noqa: E402
 from scripts.run_step10_deterministic import PersistenceMBM  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
@@ -134,12 +139,16 @@ def main(argv=None):
     p.add_argument("--reg", default=None,
                    help="saved ensemble prefix whose member mean is mu* (runs/step13/seqregress_pinn): adds reg_*")
     p.add_argument("--reg-mbm", action="store_true", help="with --reg: also mu* = a + b mu_reg + c x0 (regm_*)")
+    p.add_argument("--flow-sigma", action="store_true", help="with --reg --reg-mbm: adds regm_flow")
+    p.add_argument("--sigma-epochs", type=int, default=30)
     p.add_argument("--save-arms", nargs="*", default=None, help="score and save only these arms (default all)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
-        a.n_valid, a.width, a.modes, a.epochs, a.guide_epochs = 2, 8, 3, 1, 2
+        a.n_valid, a.width, a.modes, a.epochs, a.guide_epochs, a.sigma_epochs = 2, 8, 3, 1, 2, 1
+    if a.flow_sigma and not (a.reg and a.reg_mbm):
+        p.error("--flow-sigma needs --reg and --reg-mbm")
     torch.set_num_threads(a.threads)
     torch.manual_seed(0)
     lat, lon, _, _ = load_static(a.era5)
@@ -262,6 +271,38 @@ def main(argv=None):
             log("[regm] val z500 RMSE of a + b mu_reg + c x0 by lead (normalized) "
                 + " ".join(f"{float(((mu_regm[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
                            for j in range(L)))
+    if a.flow_sigma:  # flow-dependent spread factor on top of regm_band (pgcfm/flow_sigma.py)
+        lat_, lon_, oro_, lsm_ = load_static(a.era5)
+        static = static_features(lat_, lon_, oro_, lsm_)
+        leads_t = torch.as_tensor(leads, dtype=torch.float32)
+
+        def sigma_inputs(ctx_, mu_, ics_):
+            n_ = len(ctx_) // L
+            ic_hour = 6.0 * torch.as_tensor(np.asarray(ics_), dtype=torch.float32)[torch.arange(n_ * L) // L]
+            return flow_features(ctx_[:, :5], mu_, leads_t[torch.arange(n_ * L) % L], ic_hour, static)
+
+        def case_corr(sig, absr):  # per lead: corr over ICs of sigma and |error|, area-weighted over cells
+            q = []
+            for j in range(L):
+                s_, e_ = sig[j::L] - sig[j::L].mean(0), absr[j::L] - absr[j::L].mean(0)
+                c = (s_ * e_).mean(0) / (s_.std(0, unbiased=False) * e_.std(0, unbiased=False) + 1e-12)
+                q.append(((c * area).sum((-1, -2)) / area.sum()).tolist())
+            return q  # (L, 5)
+
+        feats_v = sigma_inputs(ctx, mu_regm, load(a.ens, a.val_year)[3][:n])
+        held = ic_of % 5 == 4
+        tr_rows, va_rows = torch.arange(n * L)[~held], torch.arange(n * L)[held]
+        r2 = (tgt - mu_regm) ** 2
+        sigma_clim = torch.stack([r2[tr_rows[tr_rows % L == j]].mean(0).sqrt() for j in range(L)])
+        torch.manual_seed(2)
+        fsig = FlowSigma(feats_v.shape[1], sigma_clim)
+        res["flow_sigma"] = fit_flow_sigma(fsig, feats_v, mu_regm, tgt, lead_idx, tr_rows, va_rows,
+                                           epochs=a.sigma_epochs, log=log)
+        sig_v = predict_sigma(fsig, feats_v, lead_idx)
+        rho = torch.stack([(sig_v[j::L] ** 2).mean(0).sqrt() for j in range(L)])  # (L, 5, H, W)
+        res["flow_sigma"]["val_case_corr"] = case_corr(sig_v[va_rows], (tgt - mu_regm).abs()[va_rows])
+        log("[flow sigma] held-out 2016 case corr of sigma and |error|, z500 by lead "
+            + " ".join(f"{q[VARS.index('z')]:.3f}" for q in res["flow_sigma"]["val_case_corr"]))
     res.update(gamma={k: g.tolist() for k, g in gam.items()}, bands=list(range(nb)), band_counts=counts.tolist())
 
     # -- test years -----------------------------------------------------------------------------------
@@ -296,6 +337,15 @@ def main(argv=None):
             for k, (gd, src) in guides.items():
                 arms[k] = torch.cat([apply_gamma(mus[src][j], mem[j], gd(sp[j], lead_idx[j], lead_frac[j]), bidx)
                                      for j in torch.arange(n * L).split(64)])
+            if a.flow_sigma:
+                sig = predict_sigma(fsig, sigma_inputs(ctx, mus["regm"], ics), lead_idx)
+                fac = sig / rho[lead_idx]
+                arms["regm_flow"] = mus["regm"][:, None] + fac[:, None] * (arms["regm_band"] - mus["regm"][:, None])
+                res["flow_sigma"].setdefault("test_case_corr", {})[str(y)] = case_corr(sig, (tgt - mus["regm"]).abs())
+                res["flow_sigma"].setdefault("factor_cv", {})[str(y)] = float(fac.std() / fac.mean())
+                log(f"[flow sigma] {y} case corr of sigma and |error|, z500 by lead "
+                    + " ".join(f"{q[VARS.index('z')]:.3f}" for q in res["flow_sigma"]["test_case_corr"][str(y)])
+                    + f" | factor CV {res['flow_sigma']['factor_cv'][str(y)]:.3f}")
         if a.save_arms is not None:
             arms = {k: v for k, v in arms.items() if k in a.save_arms}
         for arm, ens in arms.items():
