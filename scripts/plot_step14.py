@@ -3,7 +3,8 @@
     fig_hdyn.png          rollout ensembles from isotropic IC perturbations (scripts/run_step14_hdyn.py) against the
                           step 13 baseline: z500 / t850 ensemble-mean RMSE, z500 CRPS, z500 spread-error ratio
     fig_hdyn_flowdep.png  the owner's flow-dependence criteria (scripts/diag_step13_flowdep.py): noise-removed
-                          case-to-case variation of the grid-point spread, of the domain spread, the RMS error of
+                          case-to-case variation of the grid-point spread (pooled over the grid, so without the
+                          floor of the per-point clipped estimate), of the domain spread, the RMS error of
                           the largest-spread fifth over the smallest, for z500 and t850; the owner's pass and
                           rejection thresholds in grey
     fig_hcl.png           diagnostic-closure operators (scripts/run_step13_diag.py): t2m, u10, v10 RMSE and the
@@ -30,12 +31,15 @@ from scripts.run_step11_climode import VARS, climode_minmax  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 
 S13 = "seqfm_dct_pinn_"
-ARMS = [  # (score key, label, line style, slot)
-    ("core_jump6", "ResNet core, isotropic IC perturbations (no Γ)", "-", 0),
+ARMS = [  # (score key, label, line style, slot): color = core, dashed = fine-tuned on the fair CRPS of perturbed rollouts
+    ("core_jump6", "ResNet core (MSE), isotropic IC perturbations, no Γ", "-", 0),
+    ("core_jump6_crps", "ResNet core + fair-CRPS fine-tune", "--", 0),
     ("core_jump6_fno", "FNO core, unconstrained", "-", 1),
+    ("core_jump6_fno_crps", "FNO core, unconstrained + fair-CRPS fine-tune", "--", 1),
+    ("core_jump6_fno_b2", "FNO core, norm-projected B = 2", "-", 3),
+    ("core_jump6_fno_b2_crps", "FNO core, B = 2 + fair-CRPS fine-tune", "--", 3),
     ("core_jump6_fno_b1", "FNO core, norm-projected B = 1", "-", 2),
-    (S13 + "regm_band", "Step 13 regm_band (FM + Γ)", "--", 7),
-    (S13 + "regm_sband_clim_flow", "Step 13 best: regm_sband_clim_flow (−1.17 %)", "--", 6),
+    (S13 + "regm_sband_clim_flow", "Step 13 best: regm_sband_clim_flow (FM + Γ + σ field)", "-.", 6),
 ]
 DAYS = np.array(LEADS_H) / 24
 
@@ -83,6 +87,7 @@ def fig_hdyn(arms, flow, p_rmse, p_crps, mx, mn, out):
             a_.plot(DAYS, pers, ":", color=MUTED, lw=2, label="Persistence")
         style(a_, title, ylab)
     ax[1, 1].axhspan(0.9, 1.2, color=GRID, alpha=0.6, lw=0, label="Owner's H-dyn range 0.9-1.2 (no Γ)")
+    ax[1, 1].set_ylim(0, 1.4)
     return finish(fig, ax, "Step 14 H-dyn: spread made by the rollout of a learned vector field\n"
                   "Real ERA5 5.625°, test 2017-2018 (ClimODE's 360 ICs), 8 members", os.path.join(out, "fig_hdyn.png"))
 
@@ -91,7 +96,7 @@ def fig_flowdep(flow, out):
     fig, ax = plt.subplots(2, 2, figsize=(13, 9.5), layout="constrained")
     ratio = lambda r: r["bin_rmse"][4] / r["bin_rmse"][0]  # noqa: E731
     panels = [(ax[0, 0], "z500: case-to-case variation of the grid-point spread", "Noise-removed CV",
-               "z500", lambda r: r["cv_spread_true"], (0.08, 0.05)),
+               "z500", lambda r: r["cv_spread_true_pooled"], (0.08, 0.05)),
               (ax[0, 1], "z500: case-to-case variation of the domain spread", "Noise-removed CV",
                "z500", lambda r: r["dom_spread_cv_true"], (0.06, 0.05)),
               (ax[1, 0], "z500: error of the largest-spread fifth / smallest", "RMS error ratio",
@@ -108,7 +113,7 @@ def fig_flowdep(flow, out):
         style(a_, title, ylab)
     for k, lab, ls, slot in ARMS[:1]:  # the error's own case-to-case variation, for scale
         if k in flow:
-            ax[0, 1].plot(DAYS, [flow[k][f"z500_{h}"]["dom_rmse_cv"] for h in LEADS_H], "-.", color=INK, lw=1,
+            ax[0, 1].plot(DAYS, [flow[k][f"z500_{h}"]["dom_rmse_cv"] for h in LEADS_H], "-", color=INK, lw=1,
                           label="Domain RMSE CV of the ResNet core (scale)")
     return finish(fig, ax, "Step 14 H-dyn: is the spread flow dependent? (grey: the owner's criteria)\n"
                   "Real ERA5 5.625°, test 2017-2018, 8 members split 4 + 4 to remove the sampling noise",
@@ -143,9 +148,9 @@ def fig_hcl(diag, out):
 
 
 def fig_hres(hres, out):
-    tags = [("core_jump6", "ResNet", 0), ("core_jump6_fno", "FNO", 1), ("core_jump6_fno_b1", "FNO B = 1", 2)]
+    tags = [("core_jump6", "ResNet", 0), ("core_jump6_fno", "FNO", 1), ("core_jump6_fno_b2", "FNO B = 2", 3)]
     kinds = [("coarse", "32 × 64 (training grid)", "-"), ("native", "64 × 128 zero-shot", "--"),
-             ("interp", "32 × 64 run, interpolated", ":")]
+             ("interp", "32 × 64 run, interpolated", "-.")]
     fig, ax = plt.subplots(2, 2, figsize=(13, 9.5), layout="constrained")
     first = next(iter(t for t, _, _ in tags if t in hres))
     for a_, v, q, ylab, title in ((ax[0, 0], "z", "rmse", "RMSE (m²/s²)", "Geopotential at 500 hPa"),
@@ -183,15 +188,17 @@ def main(argv=None):
     mx, mn = climode_minmax(a.era5)
     written = []
     arms = {}
-    for s in (j(a.step13, "score_aband_relation.json"), j(a.runs, "score_hdyn.json")):
+    for s in (j(a.step13, "score_aband_relation.json"), j(a.runs, "score_hdyn.json"), j(a.runs, "score_hdyn_b.json"),
+              j(a.runs, "score_hdyn_crps.json")):
         arms.update(s["arms"] if s else {})
     flow = {}
-    for s in (j(a.runs, "flowdep_step13_base.json"), j(a.runs, "flowdep_hdyn.json")):
+    for s in (j(a.runs, "flowdep_step13_base.json"), j(a.runs, "flowdep_hdyn.json"), j(a.runs, "flowdep_hdyn_b.json"),
+              j(a.runs, "flowdep_hdyn_crps.json")):
         flow.update(s or {})
-    if any(k in arms for k, *_ in ARMS[:3]):
+    if any(k in arms for k, *_ in ARMS[:-1]):
         p_rmse, p_crps = persistence(a.era5, [2017, 2018], lat, mx, mn)
         written.append(fig_hdyn(arms, flow, p_rmse, p_crps, mx, mn, a.out))
-    if any(k in flow for k, *_ in ARMS[:3]):
+    if any(k in flow for k, *_ in ARMS[:-1]):
         written.append(fig_flowdep(flow, a.out))
     diag = j(a.step13, "diag_seqregress_pinn.json")
     if diag:

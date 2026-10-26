@@ -90,6 +90,7 @@ def main(argv=None):
     p.add_argument("--eps", type=float, default=0.5, help="perturbation size in units of the 6 h tendency std")
     p.add_argument("--corr-cells", type=float, default=1.5, help="Gaussian filter width of the perturbation")
     p.add_argument("--suffix", default="", help="appended to the output names (e.g. a second --eps)")
+    p.add_argument("--json", default=None, help="summary file name (default hdyn<suffix>.json)")
     p.add_argument("--max-ics", type=int, default=None)
     p.add_argument("--threads", type=int, default=4)
     a = p.parse_args(argv)
@@ -134,7 +135,7 @@ def main(argv=None):
               + " | case CV " + " ".join(f"{v:.2f}" for v in g.std(0) / g.mean(0))
               + (f" | a priori Lip(D) <= {r['lipschitz_bound_D']:.3g}" if r["lipschitz_bound_D"] else ""),
               flush=True)
-    with open(os.path.join(a.out, f"hdyn{a.suffix}.json"), "w") as f:
+    with open(os.path.join(a.out, a.json or f"hdyn{a.suffix}.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res
 

@@ -11,7 +11,9 @@ grid point over the ICs:
                  spread and RMS normalized error per quintile (a flow-dependent ensemble has rising error)
     cv_spread_true  the case-to-case CV of the spread without the sampling noise (step 14, the owner's H-dyn
                  criterion): the spreads of two disjoint half-ensembles have independent sampling noise, so
-                 their covariance over the ICs is the variance of the true spread
+                 their covariance over the ICs is the variance of the true spread. Per grid point clipped at 0
+                 (biased up: ~0.04 for a spread that does not vary); cv_spread_true_pooled averages the
+                 relative covariance over the grid first (RMS of the true CV, unbiased before the root)
     dom_*        per IC the domain spread sqrt(area mean of the member variance) and the domain RMSE of the
                  ensemble mean: CV over the ICs (dom_spread_cv_true by the same split-half covariance) and
                  their correlation
@@ -68,7 +70,11 @@ def main(argv=None):
                          bin_rmse=[float(np.sqrt(e2n[b == k].mean())) for k in range(5)])
                 s1, s2 = np.sqrt(H1[:, li, vi]), np.sqrt(H2[:, li, vi])
                 cov = ((s1 - s1.mean(0)) * (s2 - s2.mean(0))).mean(0)
-                r["cv_spread_true"] = float((np.sqrt(np.clip(cov, 0, None)) / (0.5 * (s1 + s2).mean(0)) * wl).sum())
+                m12 = 0.5 * (s1 + s2).mean(0)
+                r["cv_spread_true"] = float((np.sqrt(np.clip(cov, 0, None)) / m12 * wl).sum())
+                # clipping each grid point at 0 leaves a positive floor (~0.04 for 360 ICs, M = 4 + 4);
+                # pooling the relative covariance over the grid before the square root does not
+                r["cv_spread_true_pooled"] = float(np.sqrt(max((cov / m12 ** 2 * wl).sum(), 0.0)))
                 ds1, ds2 = np.sqrt((H1[:, li, vi] * wl).sum((-2, -1))), np.sqrt((H2[:, li, vi] * wl).sum((-2, -1)))
                 ds, de = np.sqrt((S[:, li, vi] ** 2 * wl).sum((-2, -1))), np.sqrt((e ** 2 * wl).sum((-2, -1)))
                 dcov = ((ds1 - ds1.mean()) * (ds2 - ds2.mean())).mean()
@@ -78,7 +84,8 @@ def main(argv=None):
                 res[f"{v}_{lead}"] = r
                 print(f"{arm:28s} {v} {lead:3d}h  CV spread {r['cv_spread']:.3f} (|err| {r['cv_abs_err']:.2f})  "
                       f"corr {r['case_corr']:.3f}  bins spread {r['bin_spread'][0]:.2f}->{r['bin_spread'][4]:.2f}  "
-                      f"rmse {r['bin_rmse'][0]:.2f}->{r['bin_rmse'][4]:.2f}  CV true {r['cv_spread_true']:.3f}  "
+                      f"rmse {r['bin_rmse'][0]:.2f}->{r['bin_rmse'][4]:.2f}  CV true {r['cv_spread_true']:.3f} "
+                      f"(pooled {r['cv_spread_true_pooled']:.3f})  "
                       f"domain CV {r['dom_spread_cv']:.3f} (true {r['dom_spread_cv_true']:.3f}, RMSE "
                       f"{r['dom_rmse_cv']:.3f}) corr {r['dom_corr']:.2f}", flush=True)
         out[arm] = res

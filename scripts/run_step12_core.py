@@ -86,6 +86,11 @@ def main(argv=None):
     p.add_argument("--bound", type=float, default=None, help="fno: operator-norm bound B per block")
     p.add_argument("--fno-width", type=int, default=32)
     p.add_argument("--fno-modes", type=int, default=12)
+    p.add_argument("--init", default=None, help="step 14: start from a trained core (.pt of the same config)")
+    p.add_argument("--crps-members", type=int, default=0,
+                   help="step 14 H-dyn: train on the fair CRPS of this many perturbed rollouts per IC (0 = MSE)")
+    p.add_argument("--eps", type=float, default=0.5, help="perturbation size (x 6 h tendency std), as run_step14_hdyn")
+    p.add_argument("--corr-cells", type=float, default=1.5)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
@@ -95,7 +100,7 @@ def main(argv=None):
     rng = np.random.default_rng(a.seed)
     os.makedirs(a.out, exist_ok=True)
     tag = a.mode + ("" if a.net == "resnet" else "_fno" + ("" if a.bound is None else f"_b{a.bound:g}")) \
-        + ("_quick" if a.quick else "")
+        + ("_crps" if a.crps_members else "") + ("_quick" if a.quick else "")
     era5 = os.path.join(a.data, "era5_data")
 
     # -- data: physical -> z-score per variable over the training years -------------------------
@@ -122,6 +127,13 @@ def main(argv=None):
         core.load_state_dict(torch.load(ck))
         res["resumed"] = True
     else:
+        if a.init:
+            core.load_state_dict(torch.load(a.init))
+            res["init"] = a.init
+        if a.crps_members:
+            from scripts.run_step14_hdyn import smooth_field
+            gen = torch.Generator().manual_seed(a.seed + 7)
+            eps = a.eps * core.s6.view(-1)
         opt = torch.optim.Adam(core.parameters(), lr=a.lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
         hist, t0, start = [], time.time(), 0
@@ -145,7 +157,16 @@ def main(argv=None):
             else:
                 tg = torch.stack([norm[y][i + 1:i + 1 + need] for y, i in zip(ys, idx)])
             hours = torch.tensor([6.0 * i for i in idx])
-            loss = rollout_loss(core, frames, hours, tg, w)
+            if a.crps_members:  # the same perturbations as the H-dyn ensembles, fair CRPS over the members
+                M = a.crps_members
+                pert = smooth_field((len(idx) * M,) + frames.shape[2:], a.corr_cells, gen) * eps.view(1, -1, 1, 1)
+                fm = frames.repeat_interleave(M, 0) + pert[:, None]
+                pred = core.rollout(fm, hours.repeat_interleave(M), tg.shape[1]).view(len(idx), M, *tg.shape[1:])
+                skill = (pred - tg[:, None]).abs().mean(1)
+                spread = (pred[:, :, None] - pred[:, None]).abs().sum((1, 2)) / (2 * M * (M - 1))
+                loss = ((skill - spread) * w).mean()
+            else:
+                loss = rollout_loss(core, frames, hours, tg, w)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(core.parameters(), 1.0)
