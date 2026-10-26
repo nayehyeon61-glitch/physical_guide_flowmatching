@@ -9,6 +9,8 @@ forecast, against the classical regression that beat every learned corrector in 
              operator for all leads, context = x(t) and the lead
     arms     mean (ensemble mean), mbmx (a + b mu + c x0 per lead and variable, step 10), operator,
              operator_mean_only (the same model fed the mean only: does the ensemble add anything?)
+    weights  <out>/operator_<ens name>.pt and operator_mean_only_<ens name>.pt: state_dict, config and the
+             per-variable normalization (inputs and target are (x - norm_mean) / norm_std)
 
     python scripts/run_step13_operator.py --ens runs/step13/seqfm_dct_pinn --era5 /home/claude/era5/era5_data \
         --out runs/step13 [--quick]
@@ -78,6 +80,7 @@ def main(argv=None):
     # classical control fitted on the whole validation year (it has no checkpoint to pick)
     mbmx = PersistenceMBM(5, L).fit(torch.from_numpy(E), torch.from_numpy(O), torch.from_numpy(X0))
     res = {"args": vars(a), "mbmx_coef": mbmx.coef.tolist()}
+    tag = os.path.basename(a.ens) + ("_quick" if a.quick else "")
     models = {}
     for arm, use_ens in (("operator", True), ("operator_mean_only", False)):
         torch.manual_seed(0)
@@ -86,6 +89,9 @@ def main(argv=None):
                    area, epochs=a.epochs, use_ensemble=use_ens)
         res[arm] = {"best_val_mse": info["best_val_mse"], "val_history": info["val_mse_history"]}
         models[arm] = (op, use_ens)
+        torch.save({"state_dict": op.state_dict(), "use_ensemble": use_ens, "norm_mean": m, "norm_std": s,
+                    "config": {"channels": 5, "context_channels": 6, "width": a.width, "modes": a.modes}},
+                   os.path.join(a.out, f"{arm}_{tag}.pt"))
         print(f"[{arm}] best val mse {info['best_val_mse']:.4f} (epoch {int(np.argmin(info['val_mse_history']))})",
               flush=True)
     mx, mn = climode_minmax(a.era5)
@@ -110,7 +116,6 @@ def main(argv=None):
     for arm, r in res["test"].items():
         print(f"[{arm:18s}] z500 RMSE " + " ".join(f"{h}:{r['rmse'][h]['z']:.0f}" for h in r["rmse"])
               + " | t850 " + " ".join(f"{r['rmse'][h]['t']:.2f}" for h in r["rmse"]), flush=True)
-    tag = os.path.basename(a.ens) + ("_quick" if a.quick else "")
     with open(os.path.join(a.out, f"operator_{tag}.json"), "w") as f:
         json.dump(res, f, indent=1)
     return res

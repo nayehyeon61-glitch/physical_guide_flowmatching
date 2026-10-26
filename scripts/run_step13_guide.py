@@ -325,6 +325,8 @@ def main(argv=None):
         res["flow_sigma"] = fit_flow_sigma(fsig, feats_v, mu_regm, tgt, lead_idx, tr_rows, va_rows,
                                            epochs=a.sigma_epochs, log=log)
         report("flow_sigma", predict_sigma(fsig, feats_v, lead_idx))
+        torch.save({"state_dict": fsig.state_dict(), "rho": rho["flow_sigma"], "in_channels": feats_v.shape[1]},
+                   os.path.join(a.out, f"flow_sigma_{tag}.pt"))
     if a.flow_op:  # the owner's operator: pretrained on the energy-refined members, fine-tuned into sigma
         with torch.no_grad():
             cal_v = torch.cat([apply_gamma(mu_regm[j], mem[j], gam["regm_band"][lead_idx[j]], bidx)
@@ -335,6 +337,7 @@ def main(argv=None):
         info = fit(op_s, (cal_v[tr_rows], tgt[tr_rows], ctx_op[tr_rows]), (cal_v[va_rows], tgt[va_rows], ctx_op[va_rows]),
                    area, epochs=a.epochs)
         log(f"[flow_op] pretrained operator best val mse {info['best_val_mse']:.4f}")
+        pretrained = {k: v.clone() for k, v in op_s.state_dict().items()}
         osig = OperatorSigma(op_s, sigma_clim)
         op_s.requires_grad_(False)
         with torch.no_grad():
@@ -348,6 +351,9 @@ def main(argv=None):
         res["flow_op"] = {"pretrain_best_val_mse": info["best_val_mse"], "pretrain_val_mse": info["val_mse_history"],
                           "head": head, "full": full}
         report("flow_op", predict_sigma(osig, (cal_v, ctx_op), lead_idx))
+        torch.save({"pretrained_operator": pretrained, "operator_sigma": osig.state_dict(), "rho": rho["flow_op"],
+                    "config": {"channels": 5, "context_channels": ctx_op.shape[1], "width": a.width, "modes": a.modes}},
+                   os.path.join(a.out, f"flow_op_{tag}.pt"))
         del cal_v
     res.update(gamma={k: g.tolist() for k, g in gam.items()}, bands=list(range(nb)), band_counts=counts.tolist())
 
