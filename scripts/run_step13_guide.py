@@ -147,6 +147,8 @@ def main(argv=None):
     p.add_argument("--flow-op", action="store_true",
                    help="with --reg --reg-mbm: adds regm_flowop (operator pretrained on the regm_band members)")
     p.add_argument("--sigma-epochs", type=int, default=30)
+    p.add_argument("--sigma-full-epochs", type=int, default=None,
+                   help="--flow-op: epochs of the stage that trains the whole operator (default sigma_epochs // 3)")
     p.add_argument("--save-arms", nargs="*", default=None, help="score and save only these arms (default all)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--quick", action="store_true")
@@ -342,7 +344,7 @@ def main(argv=None):
         del f_v
         op_s.requires_grad_(True)
         full = fit_flow_sigma(osig, (cal_v, ctx_op), mu_regm, tgt, lead_idx, tr_rows, va_rows,
-                              epochs=max(1, a.sigma_epochs // 3), lr=1e-4, log=log)
+                              epochs=a.sigma_full_epochs or max(1, a.sigma_epochs // 3), lr=1e-4, log=log)
         res["flow_op"] = {"pretrain_best_val_mse": info["best_val_mse"], "pretrain_val_mse": info["val_mse_history"],
                           "head": head, "full": full}
         report("flow_op", predict_sigma(osig, (cal_v, ctx_op), lead_idx))
