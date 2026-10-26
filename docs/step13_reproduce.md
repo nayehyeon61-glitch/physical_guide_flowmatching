@@ -1,6 +1,6 @@
 # 13단계 best model 직접 학습하고 실행하기
 
-보고 모델 regm_band(`docs/step13/fig_system_best.png`)와 그 위에 흐름 조건 퍼짐장을 더한 regm_flow, regm_flowop(`docs/step13/fig_system_sigma.png`)를 데이터 내려받기부터 점수까지 다시 만드는 방법입니다. 확률 점수가 가장 좋은 것은 regm_flow입니다. 결과와 해석은 `docs/step13_sequence.md` 4.2, 4.3, 5절에 있습니다.
+보고 모델 regm_band(`docs/step13/fig_system_best.png`)와 그 위에 흐름 조건 퍼짐장을 더한 regm_flow, regm_flowop(`docs/step13/fig_system_sigma.png`), 그리고 대역 × 셀 기후 배율에 regm_flow의 사례 배율을 곱한 regm_sband_clim_flow를 데이터 내려받기부터 점수까지 다시 만드는 방법입니다. 확률 점수가 가장 좋은 것은 regm_sband_clim_flow입니다. 결과와 해석은 `docs/step13_sequence.md` 4.2, 4.3, 4.4, 5절에 있습니다.
 
 ## 1. 코드와 환경
 
@@ -26,7 +26,8 @@
 | `OUT` | `runs/step13_best` | 체크포인트, 앙상블, 점수 |
 | `THREADS` | 4 | CPU 스레드 |
 | `CONTROL=1` | 끔 | 논문 대조군: 같은 평균과 Γ를 회귀 자신의 편차에 씌운 팔도 만들고 함께 채점 |
-| `SIGMA=0` | 켬 (1) | 흐름 조건 퍼짐장 팔(regm_flow, regm_flowop)을 빼고 regm_band만 만듦 |
+| `SIGMA=0` | 켬 (1) | 흐름 조건 퍼짐장 팔(regm_flow, regm_flowop, regm_sband_clim_flow)을 빼고 regm_band만 만듦 |
+| `SBAND=0` | 켬 (1) | regm_sband_clim_flow를 빼고 만듦 (약 15분 절약) |
 | `CLIMODE=1` | 끔 | ClimODE 공개 체크포인트를 시험 해마다 첫 8개 초기장에서 돌리고 같은 초기장으로 짝 비교 (초기장 쌍당 약 18분, 모두 약 2.5시간) |
 | `SMOKE=1` | 끔 | 반복 2회, 해마다 초기장 6개: 전체 사슬이 돌아가는지만 확인 (데이터가 있으면 약 15분, 수치는 의미 없음) |
 
@@ -41,7 +42,8 @@
 | 2a. FM | `run_step13_seqfm.py --basis dct --pinn … --save-ens` (3000 반복, 멤버 8) | `seqfm_dct.pt`, `seqfm_dct_pinn_ens_{2016,2017,2018}.npz` | 학습 70분 + 생성 해마다 30–50분 |
 | 2b. 회귀 | `run_step13_seqfm.py --model regress --pinn … --save-ens` | `seqregress.pt`, `seqregress_pinn_ens_*.npz` | 학습 20분 + 생성 해마다 약 5분 |
 | 3. 보정 | `run_step13_guide.py --ens seqfm_dct_pinn --reg seqregress_pinn --reg-mbm --flow-sigma --flow-op --sigma-full-epochs 30 --save-arms regm_band regm_flow regm_flowop` | `seqfm_dct_pinn_regm_{band,flow,flowop}_ens_{2017,2018}.npz`, `guide_*.json` (Γ, 대역 에너지, σ 학습 기록) | 약 1시간 10분 (`SIGMA=0`이면 약 26분) |
-| 4. 채점 | `score_step13.py --ref seqregress_pinn --arms seqregress_pinn seqfm_dct_pinn_regm_band …regm_flow …regm_flowop` | `score_best.json` | 약 5분 |
+| 3b. 대역 × 셀 | `run_step13_aband.py --ens seqfm_dct_pinn --reg seqregress_pinn --save-arms regm_sband_clim_flow` (`SIGMA=1`, `SBAND=1`일 때) | `seqfm_dct_pinn_regm_sband_clim_flow_ens_{2017,2018}.npz`, `aband_seqfm_dct_pinn.json` (소유자의 사례 적응 대역·대역 × 셀 망과 대조군 점수) | 약 15분 |
+| 4. 채점 | `score_step13.py --ref seqregress_pinn --arms seqregress_pinn seqfm_dct_pinn_regm_band …regm_flow …regm_flowop …regm_sband_clim_flow` | `score_best.json` | 약 5분 |
 | 5. 흐름 의존성 | `diag_step13_flowdep.py --leads 24 48 72 96 120 144` | `flowdep.json` (퍼짐 변동계수, 퍼짐 오분위별 오차) | 1분 |
 | 6. 퍼짐장 비교 | `score_step13.py --ref …regm_band`, `plot_step13_flowdep.py` (`SIGMA=1`일 때) | `score_sigma.json`, `fig/fig_flowdep.png` | 약 4분 |
 
@@ -67,12 +69,17 @@
     # 보정 (2016에 맞추고 2017-2018에 적용): regm_band, regm_flow, regm_flowop
     python scripts/run_step13_guide.py --ens $O/seqfm_dct_pinn --era5 $E --out $O --reg $O/seqregress_pinn \
         --reg-mbm --flow-sigma --flow-op --sigma-full-epochs 30 --save-arms regm_band regm_flow regm_flowop
+    # 대역 × 셀 기후 배율 × regm_flow 사례 배율 (위 실행이 남긴 flow_sigma_seqfm_dct_pinn.pt를 씀)
+    python scripts/run_step13_aband.py --ens $O/seqfm_dct_pinn --reg $O/seqregress_pinn --era5 $E --out $O \
+        --save-arms regm_sband_clim_flow
 
     # 시험 (2017-2018 ClimODE 초기장 360개)
     python scripts/score_step13.py --era5 $E --out $O/score_best.json --ref $O/seqregress_pinn \
-        --arms $O/seqregress_pinn $O/seqfm_dct_pinn_regm_band $O/seqfm_dct_pinn_regm_flow $O/seqfm_dct_pinn_regm_flowop
+        --arms $O/seqregress_pinn $O/seqfm_dct_pinn_regm_band $O/seqfm_dct_pinn_regm_flow $O/seqfm_dct_pinn_regm_flowop \
+        $O/seqfm_dct_pinn_regm_sband_clim_flow
     python scripts/diag_step13_flowdep.py --runs $O --leads 24 48 72 96 120 144 \
-        --arms seqfm_dct_pinn seqfm_dct_pinn_regm_band seqfm_dct_pinn_regm_flow seqfm_dct_pinn_regm_flowop
+        --arms seqfm_dct_pinn seqfm_dct_pinn_regm_band seqfm_dct_pinn_regm_flow seqfm_dct_pinn_regm_flowop \
+        seqfm_dct_pinn_regm_sband_clim_flow
 
 `run_step13_seqfm.py`는 한 번 실행에서 학습과 앙상블 생성을 함께 합니다. 출력 폴더에 `seqfm_dct.pt`(회귀는 `seqregress.pt`)가 있으면 학습을 건너뛰고 그 가중치로 생성만 하므로, 학습만 다시 하고 싶으면 그 파일을 지우고, 시험만 하고 싶으면 아래 5절처럼 가중치를 넣어 두면 됩니다. 보정 단계는 매번 2016년에서 a, b, c, Γ, σ 장을 다시 맞춥니다. σ 장 망의 가중치는 기록용으로 `flow_sigma_<앙상블>.pt`, `flow_op_<앙상블>.pt`에 남습니다(6절).
 
@@ -129,8 +136,9 @@
 | `seqfm_dct_pinn_regm_band` (보고 모델) | 0.0108 / 0.0226 / 0.0327 | 244 / 522 / 778 | 1.13–1.21 | 0.51 |
 | `seqfm_dct_pinn_regm_flow` (+ ClimODE 망 σ 장) | 0.0108 / 0.0226 / 0.0326 | 244 / 522 / 778 | 1.14–1.23 | 0.51 |
 | `seqfm_dct_pinn_regm_flowop` (+ 연산자 σ 장, 30 epoch) | 0.0108 / 0.0226 / 0.0327 | 244 / 522 / 778 | 1.14–1.22 | 0.51 |
+| `seqfm_dct_pinn_regm_sband_clim_flow` (대역 × 셀 기후 배율 × regm_flow 배율) | 0.0107 / 0.0225 / 0.0326 | 244 / 522 / 778 | 1.19–1.26 | 0.49 |
 
-5변수 CRPS는 regm_band 0.02580, regm_flow 0.02564(−0.63 %), regm_flowop 0.02566(−0.54 %)입니다. 퍼짐장의 효과는 CRPS보다 `flowdep.json`에서 잘 보입니다. 퍼짐이 가장 큰 사례 20%와 가장 작은 20%의 오차 비(`bin_rmse` 마지막 / 처음)가 z500 24 h에서 regm_band 1.05, regm_flow 1.29, regm_flowop 1.18입니다.
+5변수 CRPS는 regm_band 0.02580, regm_flow 0.02564(−0.63 %), regm_flowop 0.02566(−0.54 %), regm_sband_clim_flow 0.02550(−1.17 %)입니다. 퍼짐장의 효과는 CRPS보다 `flowdep.json`에서 잘 보입니다. 퍼짐이 가장 큰 사례 20%와 가장 작은 20%의 오차 비(`bin_rmse` 마지막 / 처음)가 z500 24 h에서 regm_band 1.05, regm_flow 1.29, regm_flowop 1.18입니다.
 
 `score_best.json`의 `bootstrap_vs_seqregress_pinn`에는 회귀 대비 CRPS 차이와 95% 구간이 lead·변수마다 있습니다. 그래프는 기존 그림 스크립트로 그릴 수 있습니다(`docs/step13_sequence.md` 6절의 명령에 `--scores $OUT/score_best.json`).
 

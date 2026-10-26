@@ -3,7 +3,8 @@
 # ERA5 download -> stage 1 PINN -> stage 2 sequence FM and sequence regression (frozen PINN on every member)
 # -> calibration (mu* = a + b mu_reg + c x(t), FM + PINN deviations, closed-form band Gamma = regm_band; then
 # the flow-dependent spread field on top: regm_flow with ClimODE's uncertainty net, regm_flowop with the
-# operator pretrained on the regm_band members, docs/step13_sequence.md 4.3) -> scores. Each step is skipped
+# operator pretrained on the regm_band members, docs/step13_sequence.md 4.3; then regm_sband_clim_flow, the
+# band x cell climatological multipliers times regm_flow's case factor, 4.4) -> scores. Each step is skipped
 # when its output exists, so a stopped run resumes where it stopped (the trainers also keep their own .train
 # checkpoints). Step by step: docs/step13_reproduce.md.
 #
@@ -12,6 +13,7 @@
 #   CONTROL=1 bash scripts/run_step13_best.sh          # + the same mean and Gamma on the regression's deviations
 #   CLIMODE=1 bash scripts/run_step13_best.sh          # + ClimODE's checkpoint on its first 16 test ICs, paired
 #   SIGMA=0 bash scripts/run_step13_best.sh            # regm_band only, without the spread-field arms
+#   SBAND=0 bash scripts/run_step13_best.sh            # without regm_sband_clim_flow (saves ~15 min)
 #   SMOKE=1 bash scripts/run_step13_best.sh            # 2 iterations, 6 ICs a year: checks the chain (~15 min)
 #
 # Trained weights: put pinn_project.pt, pinn_project.json, seqfm_dct.pt, seqregress.pt and stats/ in $OUT
@@ -26,6 +28,7 @@ THREADS=${THREADS:-4}
 CONTROL=${CONTROL:-0}
 CLIMODE=${CLIMODE:-0}
 SIGMA=${SIGMA:-1}
+SBAND=${SBAND:-1}
 K=$DATA/kai6h
 E=$DATA/era5_data
 FM=$OUT/seqfm_dct_pinn
@@ -33,8 +36,9 @@ REG=$OUT/seqregress_pinn
 if [ "$SMOKE" = 1 ]; then
     PINN_ARGS="--iters 2 --n-val 4"; GEN_ARGS="--iters 2 --max-ics 6"
     GUIDE_ARGS="--n-valid 1 --epochs 1 --guide-epochs 1 --sigma-epochs 1"; SCORE_ARGS="--n-boot 20"; SIGMA_FULL=1
+    ABAND_ARGS="--epochs 1 --width 8"
 else
-    PINN_ARGS=""; GEN_ARGS=""; GUIDE_ARGS=""; SCORE_ARGS=""; SIGMA_FULL=30
+    PINN_ARGS=""; GEN_ARGS=""; GUIDE_ARGS=""; SCORE_ARGS=""; SIGMA_FULL=30; ABAND_ARGS=""
 fi
 mkdir -p "$OUT"
 run() {  # run <name> <done-file> <command...>: skip when <done-file> exists, log to $OUT/<name>.log
@@ -75,6 +79,17 @@ if [ "$SIGMA" = 1 ]; then
         --out "$OUT" --reg "$REG" --reg-mbm --flow-sigma --flow-op --sigma-full-epochs "$SIGMA_FULL" \
         --save-arms regm_band regm_flow regm_flowop --threads "$THREADS" $GUIDE_ARGS
     ARMS="$REG ${FM}_regm_band ${FM}_regm_flow ${FM}_regm_flowop"
+    SIG_ARMS="${FM}_regm_band ${FM}_regm_flow ${FM}_regm_flowop"
+    if [ "$SBAND" = 1 ]; then
+        # band x cell multipliers T = sum_b P_b M_b P_b with the per-lead cell climatology of the truth's error
+        # energy (about 16 or 32 DCT coefficients per cell, the better on the held-out 2016 ICs), Gamma_max = 1,
+        # times regm_flow's case factor sigma / rho. The same run fits the owner's case-adaptive band and
+        # band x cell nets and reports them in aband_seqfm_dct_pinn.json (docs/step13_sequence.md 4.4).
+        run aband "${FM}_regm_sband_clim_flow_ens_2018.npz" python scripts/run_step13_aband.py --ens "$FM" \
+            --reg "$REG" --era5 "$E" --out "$OUT" --save-arms regm_sband_clim_flow --threads "$THREADS" $ABAND_ARGS
+        ARMS="$ARMS ${FM}_regm_sband_clim_flow"
+        SIG_ARMS="$SIG_ARMS ${FM}_regm_sband_clim_flow"
+    fi
 else
     run guide_regm "${FM}_regm_band_ens_2018.npz" python scripts/run_step13_guide.py --ens "$FM" --era5 "$E" \
         --out "$OUT" --reg "$REG" --reg-mbm --save-arms regm_band --threads "$THREADS" $GUIDE_ARGS
@@ -94,7 +109,7 @@ run flowdep "$OUT/flowdep.json" python scripts/diag_step13_flowdep.py --runs "$O
     --arms $(for q in $ARMS; do basename "$q"; done) --leads 24 48 72 96 120 144
 if [ "$SIGMA" = 1 ]; then  # the spread-field arms against regm_band (bootstrap) and docs/step13/fig_flowdep.png
     run score_sigma "$OUT/score_sigma.json" python scripts/score_step13.py --era5 "$E" --out "$OUT/score_sigma.json" \
-        --ref "${FM}_regm_band" --arms "${FM}_regm_band" "${FM}_regm_flow" "${FM}_regm_flowop" $SCORE_ARGS
+        --ref "${FM}_regm_band" --arms $SIG_ARMS $SCORE_ARGS
     run fig_flowdep "$OUT/fig/fig_flowdep.png" python scripts/plot_step13_flowdep.py --score "$OUT/score_sigma.json" \
         --flowdep "$OUT/flowdep.json" --out "$OUT/fig"
 fi
