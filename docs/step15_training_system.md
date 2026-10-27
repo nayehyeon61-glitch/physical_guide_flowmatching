@@ -116,3 +116,33 @@ python scripts/run_step13_seqfm.py --kai $K --era5 $E --out $OUT --basis dct --p
 6. broad 프로파일에서는 tercile 기후 연도(2006–2015)가 모두 학습 연도입니다. 기후는 학습 데이터에서 나와도 테스트 누출은 아니지만, 4년 run과 BSS를 비교할 때 기후가 다릅니다.
 7. 37년 캐시는 디스크 30 GB입니다. 압축하지 않았습니다(memmap은 비압축이어야 하므로). 디스크가 모자라면 `CACHE=0`으로 RAM 적재(30 GB RAM 필요).
 8. `report_step13_broad.py`의 2절 결론 문장은 숫자를 json에서 채우지만 문장 틀은 고정이고, 9절 다음 단계는 2026-10-27 run 기준 소유자의 판단을 그대로 둔 것입니다.
+
+## 7. 비교 실험: ClimODE 연도 vs 37년 vs 긴 학습 (소유자 GPU용)
+
+소유자 질문(2026-10-27 02:51, "epoch를 늘려보면? ClimODE와 같은 기준으로 학습하려면?")에 대한 답을 실행 가능한 형태로 넣었습니다.
+
+- 학습량: broad run(40000 it × batch 16, 24 step 창)은 37년 창 약 5.4만 개의 약 12 epoch이고, 6시간 step 표본으로 1,540만 개입니다. ClimODE 300 epoch(10년 × 1460 step = 440만 개)의 3.5배이므로 "ClimODE만큼 덜 돌렸다"는 아닙니다. 다만 4년 run의 회귀 손실은 3000 it 끝에서도 떨어지고 있었고(5분위 평균 0.57 → 0.36), broad run에는 학습 곡선이 없어 포화 여부를 모릅니다.
+- ClimODE 프로토콜(`third_party/climode/train_global.py`): 학습 2006–2015(원저자 코드는 2016 포함), 검증 2016, 테스트 2017–2018, 5변수, AdamW 5e-4 + cosine 300 epoch, batch = 연속 8 step × 10년, Gaussian NLL + 분산 벌점 + L2. 변수와 손실까지 맞추면 ClimODE 자체를 학습하는 것이므로(`docs/RUN_ON_GPU.md` 11절), 여기서는 **데이터 연도만** 맞춥니다.
+
+| 프로파일 | 학습 연도 | FM / 회귀 | 검증 / patience | 무엇을 보나 |
+| --- | --- | --- | --- | --- |
+| `climode` | 2006–2015 | 40000 it × 16 | 1000 it마다 / 0 | ClimODE와 같은 데이터에서의 공정 비교 |
+| `broad` | 1979–2015 | 40000 it × 16 | 1000 it마다 / 0 | 소유자 2026-10-27 run 재현 |
+| `broad_long` | 1979–2015 | 120000 it × 16 | 1000 it마다 / 10 | 학습량을 늘리면 좋아지나 (best 선택) |
+
+```bash
+# 두 프로파일을 차례로 돌리고, 각자 보고서 + 소유자 broad run과 나란히 비교
+DATA=/path/era5_5p625 BROAD=runs/step13_broad bash scripts/run_step15_compare.sh
+# 시간 제한 job: MAX_HOURS=11 을 붙이고, 종료 코드 75면 같은 명령을 다시 실행
+# 하나만: ONLY=climode bash scripts/run_step15_compare.sh
+```
+
+출력: `docs/step15/compare.md`(설정·best it·종료 이유, z500/t850 RMSE, 5변수 CRPS, SSR, 첫 run 대비 차이), `docs/step15/fig_compare.png`(2×2 lead별 z500 RMSE, t850 RMSE, z500 CRPS, z500 spread, persistence 점선, ClimODE 논문 값), `docs/step15/fig_compare_training.png`(FM·회귀의 학습·검증 손실), `docs/step15/<profile>/step13_broad_report.pdf`.
+
+읽는 법과 주의:
+- `climode`와 `broad`의 차이 = 27년 추가 데이터의 몫. 논문에서 ClimODE와 비교할 숫자는 `climode`입니다.
+- `broad_long`의 cosine 스케줄은 120000 it 전체에 걸리므로, patience로 일찍 멈추면 학습률이 아직 높은 상태의 best가 선택됩니다. 그 경우 "더 길게"가 아니라 "같은 길이에서 검증 선택"의 효과에 가깝습니다(`stopped`와 `best_it`이 표에 나옴).
+- FM의 과분산(SSR ≈ 2)은 학습량보다 손실·잡음 구조의 문제로 보이므로, epoch로 풀리지 않을 가능성이 큽니다. 회귀 평균의 단기 오차가 주로 움직일 것으로 예상합니다.
+- best 선택과 보정이 같은 2016년을 씁니다(6절 약점 5).
+- 디스크: memmap 캐시 climode 약 8 GB, broad_long 약 30 GB(통계가 학습 연도마다 달라 공유 불가), 앙상블 arm-연도당 228 MB.
+- 비교 스크립트는 여기서 smoke 출력 두 개로만 시험했습니다. 세 프로파일의 실제 결과는 아직 없습니다.

@@ -21,7 +21,11 @@
 #   PROFILE=broad             train 1979-2015 on a GPU: PINN 8000 it batch 8, FM / regression 40000 it batch 16,
 #                             validation every 1000 steps with 4-member z500 RMSE, memory-mapped years,
 #                             DEVICE=auto (the 2026-10-27 broad run, docs/step13_broad)
+#   PROFILE=broad_long        broad with FM / regression 120000 it and PATIENCE=10 (stop after 10 validations
+#                             without improvement, the best state is selected)
+#   PROFILE=climode           ClimODE's years: train 2006-2015 (validation 2016, test 2017-2018), broad settings
 #   PROFILE=smoke             = SMOKE=1
+#   Comparing profiles: scripts/run_step15_compare.sh (climode + broad_long, then the reports side by side)
 # Every profile value can be overridden: TRAIN_YEARS="1990 ... 2015" PINN_ITERS GEN_ITERS GEN_BATCH VAL_EVERY
 # VAL_MEMBERS PATIENCE MAX_HOURS (per trainer invocation: saves and exits 75, rerun to resume) DEVICE CACHE
 # (1 = memory-mapped years under $OUT/cache) AMP (1 = bf16 autocast on cuda). Each step appends a line to
@@ -51,13 +55,21 @@ case "$PROFILE" in
         GEN_ITERS=${GEN_ITERS:-3000}; GEN_BATCH=${GEN_BATCH:-4}
         VAL_EVERY=${VAL_EVERY:-0}; VAL_MEMBERS=${VAL_MEMBERS:-0}
         DEVICE=${DEVICE:-cpu}; CACHE=${CACHE:-0} ;;
-    broad)
-        TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 1979 2015)"}
+    broad|broad_long|climode)
+        # broad: the owner's 2026-10-27 GPU run (37 years). broad_long: the same data, 3x the FM / regression
+        # steps (cosine over 120000) with early stopping on the validation loss. climode: ClimODE's data
+        # years (train 2006-2015, validation 2016, test 2017-2018) with the broad training settings, so the
+        # comparison with broad isolates the 27 extra years (docs/step15_training_system.md 7).
+        case "$PROFILE" in
+            climode) TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 2006 2015)"} ;;
+            *) TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 1979 2015)"} ;;
+        esac
         PINN_ITERS=${PINN_ITERS:-8000}; PINN_BATCH=${PINN_BATCH:-8}
-        GEN_ITERS=${GEN_ITERS:-40000}; GEN_BATCH=${GEN_BATCH:-16}
+        GEN_ITERS=${GEN_ITERS:-$([ "$PROFILE" = broad_long ] && echo 120000 || echo 40000)}; GEN_BATCH=${GEN_BATCH:-16}
         VAL_EVERY=${VAL_EVERY:-1000}; VAL_MEMBERS=${VAL_MEMBERS:-4}
+        PATIENCE=${PATIENCE:-$([ "$PROFILE" = broad_long ] && echo 10 || echo 0)}
         DEVICE=${DEVICE:-auto}; CACHE=${CACHE:-1} ;;
-    *) echo "unknown PROFILE $PROFILE (small, broad, smoke)"; exit 2 ;;
+    *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, smoke)"; exit 2 ;;
 esac
 PATIENCE=${PATIENCE:-0}
 MAX_HOURS=${MAX_HOURS:-0}

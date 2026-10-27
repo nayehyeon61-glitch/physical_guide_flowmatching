@@ -2,7 +2,7 @@
 
 Inputs under --runs (a missing file drops its section, the PDF says so):
   score_best.json                score_step13.py: arms (crps/rmse/ssr/..., leads x vars), bootstrap vs the reference
-  seqfm_dct_pinn.json            stage 2 FM: args, "test" (raw / pinn arms, truth residual), run record, best_it
+  seqfm_dct_pinn[_resumed].json  stage 2 FM: args, "test" (raw / pinn arms, truth residual), run record, best_it
   seqregress_pinn.json           stage 2 regression ensemble, same layout
   pinn_project.json              stage 1 PINN: args, run record, train_seconds
   flowdep.json                   diag_step13_flowdep.py: spread-error diagnostics per arm
@@ -201,9 +201,9 @@ def build(runs, out_dir, scores_name="score_best.json"):
     scores = load(runs, scores_name)
     stages = {tag: load(runs, f"{tag}.json") for tag, _ in STAGES}
     fm, reg = stages["seqfm_dct"], stages["seqregress"]
-    for tag in ("seqfm_dct", "seqregress"):  # stage 2 writes <tag>_pinn.json when it ran through the PINN
+    for tag in ("seqfm_dct", "seqregress"):  # stage 2: <tag>_pinn.json, or <tag>_pinn_resumed.json (--resume-ens)
         if stages[tag] is None:
-            stages[tag] = load(runs, f"{tag}_pinn.json")
+            stages[tag] = load(runs, f"{tag}_pinn.json") or load(runs, f"{tag}_pinn_resumed.json")
     fm, reg = stages["seqfm_dct"], stages["seqregress"]
     flowdep, operator = load(runs, "flowdep.json"), load(runs, "operator_seqfm_dct_pinn.json")
     paper = load(os.path.join(os.path.dirname(__file__), "..", "docs", "step11"), "climode_paper_tables.json")
