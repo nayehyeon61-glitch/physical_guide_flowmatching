@@ -94,6 +94,9 @@ def main(argv=None):
     p.add_argument("--model", default="fm", choices=["fm", "regress"])
     p.add_argument("--basis", default="dct", choices=["dct", "grid"], help="fm only")
     p.add_argument("--pinn", default=None, help="stage-1 checkpoint (pinn_<objective>.pt); none = no PINN")
+    p.add_argument("--core-mean", default=None, help="step 16 DynCore prefix (runs/step16/dyn_lp0): the FM learns "
+                   "the residual d - Delta_core(x0) of the core's 6 h rollout and every member adds Delta_core back "
+                   "(owner's residual flow, 2026-10-27); tisr stays with the FM. Tag suffix _core")
     p.add_argument("--guide-lam", type=float, default=0.0, help="H3 guidance strength (fraction of |v|); 0 = off")
     p.add_argument("--guide-s0", type=float, default=0.75)
     p.add_argument("--inloop-mu", type=float, default=0.0, help="PINN inside the generation ODE (needs --pinn); 0 = off")
@@ -142,7 +145,8 @@ def main(argv=None):
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     dev = device_from(a.device)
-    tag = (f"seqfm_{a.basis}" if a.model == "fm" else "seqregress") + ("_quick" if a.quick else "")
+    tag = (f"seqfm_{a.basis}" if a.model == "fm" else "seqregress") + ("_core" if a.core_mean else "") \
+        + ("_quick" if a.quick else "")
     log = lambda s: print(s, flush=True)  # noqa: E731
     stats = os.path.join(a.out, "stats")  # written by run_step13_pinn.py on the same training years
     mean, std = np.load(os.path.join(stats, "global_mean.npy")), np.load(os.path.join(stats, "global_std.npy"))
@@ -161,22 +165,72 @@ def main(argv=None):
     draws = lambda years, n: (batch(data, random_picks(data, years, a.K, rng, 8), a.K) for _ in range(n))  # noqa: E731
     to_dev = lambda b: tuple(q.to(dev) for q in b)  # noqa: E731
 
+    core_incr = None
+    if a.core_mean:  # the deterministic tangent path of the step 16 core, in this run's normalization
+        from pgcfm.cfm import TISR_DYN
+        from pgcfm.dyncore import DynCore, DynCoreConfig
+        cinfo = json.load(open(a.core_mean + ".json"))
+        cstats = os.path.join(os.path.dirname(a.core_mean), "stats")
+        cm, cs = np.load(os.path.join(cstats, "global_mean.npy")), np.load(os.path.join(cstats, "global_std.npy"))
+        ccfg = DynCoreConfig(**{**cinfo["cfg"], "blocks": tuple(cinfo["cfg"]["blocks"])})
+        core = DynCore(ccfg, static, torch.ones(contract.N_DYNAMIC), cm[DYN], cs[DYN], lat)
+        core.load_state_dict(torch.load(a.core_mean + ".pt", map_location="cpu"))
+        core.to(dev).eval()
+        for q in core.parameters():
+            q.requires_grad_(False)
+        eps_ = contract.KAI_STD_EPS
+        f_mean, f_std = (torch.from_numpy(q[DYN]).float().to(dev).view(1, -1, 1, 1) for q in (mean, std + eps_))
+        c_mean, c_std = (torch.from_numpy(q[DYN]).float().to(dev).view(1, -1, 1, 1) for q in (cm, cs + eps_))
+
+        def _core_incr(h, d, hour0):
+            """Delta_core (B, K, 66, H, W) in this run's units from the core's rollout of x(t) with the data's
+            tisr; the tisr channel is left to the FM (0 here)."""
+            with torch.no_grad():
+                x0 = (h[:, -1] * f_std + f_mean - c_mean) / c_std
+                tisr = ((h[:, -1][:, None] + d)[:, :, TISR_DYN] * f_std[0, TISR_DYN] + f_mean[0, TISR_DYN]
+                        - c_mean[0, TISR_DYN]) / c_std[0, TISR_DYN]
+                mu = (core.rollout(x0, hour0, a.K, tisr) - x0[:, None]) * (c_std / f_std)[None]
+                mu[:, :, TISR_DYN] = 0.0
+            return mu
+
+        core_incr = _core_incr
+
+        def resid(b):  # a CPU batch -> the FM's target d - Delta_core, on the CPU
+            h, d, _, hour0 = to_dev(b)
+            return (d - core_incr(h, d, hour0)).cpu()
+
+        with torch.no_grad():  # overfit check: residual RMS on the last training year vs the validation year
+            cr = {}
+            for name, ys in (("train", a.train_years[-1:]), ("val", [a.val_year])):
+                acc = 0.0
+                for b in draws(ys, 4):
+                    h, d, _, hour0 = to_dev(b)
+                    r_ = d - core_incr(h, d, hour0)
+                    acc = acc + ((r_ ** 2 * w).mean((0, 2, 3, 4)) / 4).cpu()
+                cr[name] = acc.sqrt().tolist()
+            res["core_residual_rms"] = cr
+            log("[core residual] RMS (normalized) train-year / val-year at 24 h {:.3f}/{:.3f}, {} h {:.3f}/{:.3f}".format(
+                cr["train"][min(3, a.K - 1)], cr["val"][min(3, a.K - 1)], 6 * a.K, cr["train"][-1], cr["val"][-1]))
+
     # -- training: each model's own loss (the FM is never trained through the PINN) -----------------
     ck = os.path.join(a.out, f"{tag}.pt")
     if os.path.exists(ck):
         model.load_state_dict(torch.load(ck, map_location="cpu"))
         model.to(dev)
     else:
+        target = (lambda q: resid(q)) if core_incr else (lambda q: q[1])
         if a.model == "fm":
-            model.fit_basis(q[1] for q in draws(a.train_years, 32))
+            model.fit_basis(target(q) for q in draws(a.train_years, 32))
         else:
-            model.fit_scale(q[1] for q in draws(a.train_years, 32))
+            model.fit_scale(target(q) for q in draws(a.train_years, 32))
         model.to(dev)
         opt = torch.optim.Adam(model.unet.parameters(), lr=a.lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
 
         def loss_of(b):
             h, d, _, hour0 = to_dev(b)
+            if core_incr:
+                d = d - core_incr(h, d, hour0)
             return model.loss(h, d, hour0) if a.model == "fm" else model.loss(h, d, hour0, w)
 
         # fixed validation windows; the FM loss draws its own tau and noise from a fixed seed each time
@@ -198,6 +252,8 @@ def main(argv=None):
                         e = model.sample(hm, h0m, a.heun, generator=gv) if a.model == "fm" \
                             else model.sample(hm, h0m, generator=gv)
                         mu = e.view(len(h), a.val_members, *e.shape[1:]).mean(1)
+                        if core_incr:
+                            mu = mu + core_incr(h, d, hour0)
                         for k in {min(3, a.K - 1), a.K - 1}:
                             se.setdefault(k, []).append(((mu[:, k, iz] - d[:, k, iz]) ** 2 * w[0, 0]).mean().item())
                     out.update({f"z500_rmse_{6 * (k + 1)}h": float(np.sqrt(np.mean(v))) for k, v in se.items()})
@@ -214,7 +270,8 @@ def main(argv=None):
             sys.exit(EXIT_BUDGET)
         if a.model == "regress":  # statistical errors: residuals of the regression on the validation year
             with torch.no_grad():
-                model.fit_errors(q[1].to(dev) - model(q[0].to(dev), q[3].to(dev)) for q in draws([a.val_year], 16))
+                model.fit_errors(target(q).to(dev) - model(q[0].to(dev), q[3].to(dev))
+                                 for q in draws([a.val_year], 16))
         torch.save(model.state_dict(), ck)
         res.update(train_seconds=r["seconds"], loss=[h["loss"] for h in r["hist"]][::10], val_curve=r["val"],
                    best_it=r["best_it"], best_val=r["best_val"], stopped=r["stopped"])
@@ -323,6 +380,9 @@ def main(argv=None):
             else:
                 ens["raw"] = model.sample(hm, h0m, generator=g)
             cost["raw"] += time.time() - tc
+            if core_incr:  # members = x0 + Delta_core + FM residual
+                mu_m = core_incr(hm, d.repeat_interleave(a.members, 0), h0m)
+                ens["raw"] = ens["raw"] + mu_m
             if check_raw and c0 == 0:
                 z_ = np.load(saved("raw", y))
                 sel0 = torch.tensor([k * 4 - 1 for k in range(1, a.K // 4 + 1)])
@@ -349,6 +409,9 @@ def main(argv=None):
                 ens["smoothed"] = model.sample(hm, h0m, a.heun, start=state, lam=a.smooth_lam, s0=a.guide_s0,
                                                chunk=a.members, physics=lambda q, j: laplacian_roughness(q))
                 cost["smoothed"] += time.time() - tc
+            if core_incr:  # the guidance arms saw the residual only; add the core path to them too
+                for arm in [q for q in ens if q != "raw"]:
+                    ens[arm] = ens[arm] + mu_m
             for src, arm in (("raw", "pinn"), ("guided", "guided_pinn")):
                 if arm in here:
                     tc = time.time()

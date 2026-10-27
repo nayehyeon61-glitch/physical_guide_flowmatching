@@ -107,3 +107,21 @@ def test_kinetic_energy_is_area_weighted_mean_of_the_wind_energy():
     from pgcfm.coupling import LEVEL_DYN
     mu, mv = m[LEVEL_DYN["u"]], m[LEVEL_DYN["v"]]
     assert torch.allclose(ke, torch.full((2,), float((0.5 * (mu ** 2 + mv ** 2)).mean())), rtol=1e-4)
+
+
+def test_balance_head_starts_at_zero_and_corrects_only_z_and_t():
+    contract.register_latitudes(LAT)
+    mean, std = _stats()
+    from pgcfm.dyncore import BAL_DYN
+    core = DynCore(DynCoreConfig(hidden=8, blocks=(1, 1), balance=True, positive=False),
+                   torch.zeros(8, 32, 64), torch.full((N,), 0.1), mean[contract.DYNAMIC_CHANNELS],
+                   std[contract.DYNAMIC_CHANNELS], LAT)
+    core.eval()
+    x0 = torch.randn(2, N, 32, 64)
+    y, xb = core.rollout(x0, torch.zeros(2), 2, balanced=True)
+    assert torch.equal(xb[:, 0], x0) and torch.equal(y[:, 0], x0)  # zero heads: persistence, no correction
+    torch.nn.init.normal_(core.bal_head.weight, std=0.1)
+    _, xb = core.rollout(x0, torch.zeros(2), 1, balanced=True)
+    other = [i for i in range(N) if i not in BAL_DYN]
+    assert torch.equal(xb[:, 0, other], x0[:, other])
+    assert not torch.allclose(xb[:, 0, BAL_DYN], x0[:, BAL_DYN])

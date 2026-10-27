@@ -44,7 +44,7 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.cfm import TISR_DYN  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
-from pgcfm.dyncore import (DynCore, DynCoreConfig, StrongPhysics, estimate_strong_scales,  # noqa: E402
+from pgcfm.dyncore import (BAL_DYN, DynCore, DynCoreConfig, StrongPhysics, estimate_strong_scales,  # noqa: E402
                            finite_difference_tendency, kinetic_energy)
 from pgcfm.runs import (EXIT_BUDGET, FitConfig, Prefetch, autocast, device_from, fit, load_years,  # noqa: E402
                         run_record, tendency_std)
@@ -77,6 +77,13 @@ def main(argv=None):
     p.add_argument("--phys-states", type=int, default=2, help="rollout states per sample in the physics loss")
     p.add_argument("--tangent", type=float, default=0.0, help="weight of the tangent-vector loss |f_theta(x_k) - "
                    "xdot_k|^2 on the truth states, xdot_k = centred 12 h difference (the data's own tangent)")
+    p.add_argument("--balance", action="store_true", help="two-output PINN: head 1 corrects z and t before every "
+                   "step (x~ = x + c(x)), head 2 is dx/dt; the solver starts from x~")
+    p.add_argument("--bal-detach", action="store_true", help="--balance: the rollout gradient does not reach c "
+                   "(c learns from the hydrostatic loss only; arm B)")
+    p.add_argument("--lambda-hyd", type=float, default=0.1, help="--balance: weight of the hydrostatic residual of x~")
+    p.add_argument("--hyd-target", type=float, default=0.0, help="--balance: hinge target in ERA5 units (0 = eq. 10)")
+    p.add_argument("--bal-reg", type=float, default=1.0, help="--balance: weight of |c|^2 (minimal modification)")
     p.add_argument("--dt-hours", type=float, default=6.0)
     p.add_argument("--solver", default="heun", choices=["euler", "heun"])
     p.add_argument("--hidden", type=int, default=48)
@@ -110,6 +117,7 @@ def main(argv=None):
     dev = device_from(a.device)
     os.makedirs(a.out, exist_ok=True)
     tag = a.tag or f"dyn_lp{a.lambda_p:g}" + (f"_tan{a.tangent:g}" if a.tangent else "") \
+        + (f"_bal{a.lambda_hyd:g}" + ("d" if a.bal_detach else "") if a.balance else "") \
         + ("_nopos" if a.no_positive else "") + ("_quick" if a.quick else "")
     log = lambda s: print(s, flush=True)  # noqa: E731
 
@@ -159,7 +167,7 @@ def main(argv=None):
     pert.fit(sample(data, a.train_years, a.K, rng, 16)[1] for _ in range(16))
     pert.to(dev)
     cfg = DynCoreConfig(hidden=a.hidden, blocks=tuple(a.blocks), dt_hours=a.dt_hours, solver=a.solver,
-                        positive=not a.no_positive)
+                        positive=not a.no_positive, balance=a.balance, bal_detach=a.bal_detach)
     model = DynCore(cfg, static_features(lat, lon, oro, lsm), t6v.cpu(), mean[DYN], std[DYN], lat).to(dev)
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "strong_scales": vars(phys.scales),
            "bridge_scales": vars(guide.scales), "rest_over_era5": rest, "tendency_over_era5": tend,
@@ -199,10 +207,25 @@ def main(argv=None):
         def loss_of(x0, d, orog, hour0, gen, K=None):
             x0, d, orog, hour0 = (q.to(dev) for q in (x0, d, orog, hour0))
             K = K or cur_K()
-            y = model.rollout(x0, hour0, K, tisr_of(x0, d, K))
+            if a.balance:
+                y, xb = model.rollout(x0, hour0, K, tisr_of(x0, d, K), balanced=True)
+            else:
+                y = model.rollout(x0, hour0, K, tisr_of(x0, d, K))
             data_term = wmse(y - x0[:, None], d[:, :K], w, t6)
             parts = {"data": data_term.item(), "K": float(K)}
             loss = data_term
+            if a.balance:  # head 1: hydrostatic residual of x~ at random steps + the size of the correction
+                pre = torch.cat([x0[:, None], y[:, :-1]], 1)
+                corr = wmse((xb - pre)[:, :, BAL_DYN], 0.0, w, t6[:, :, BAL_DYN])
+                ks = torch.randint(0, K, (a.phys_states,), generator=gen).tolist()
+                m_h = 0.0
+                for k in ks:
+                    xo = x0 if k == 0 else x0 + d[:, k - 1]
+                    R, _ = phys.residuals(xb[:, k], orog, torch.zeros_like(x0))
+                    m_h = m_h + phys.mean_squares({"hyd": R["hyd"]}, guide.mask(xo, xo, orog))["hyd"] / len(ks)
+                hyd = torch.clamp(m_h - a.hyd_target, min=0.0) if a.hyd_target > 0 else m_h
+                loss = loss + a.bal_reg * corr + a.lambda_hyd * hyd.to(loss.dtype)
+                parts.update(corr=corr.item(), m_hyd_bal=float(m_h))
             if a.tangent > 0:  # the truth frames 1..K with both neighbours in the window
                 ks = list(range(1, min(K, a.K - 1) + 1))
                 xt = torch.stack([x0 + d[:, k - 1] for k in ks], 1).flatten(0, 1)
@@ -275,7 +298,22 @@ def main(argv=None):
             j = slice(i, min(a.n_val, i + a.val_chunk))
             x0, d, orog, hour0 = (q[j].to(dev) for q in (X0, D, OR, H0))
             wgt = (j.stop - j.start) / a.n_val
-            y = model.rollout(x0, hour0, Kv, tisr_of(x0, d, Kv))
+            if a.balance:  # identity gate: head 1 on the truth frames (|c| / t6 and the hydrostatic residual)
+                for k in [q for q in (0, 4, 8) if q <= Kv]:
+                    xt_ = x0 if k == 0 else x0 + d[:, k - 1]
+                    _, xtb = model.heads(xt_, hour0 + 6.0 * k)
+                    add(("id_corr", k), wmse(xtb[:, BAL_DYN], xt_[:, BAL_DYN], w[:, 0], t6[0][:, BAL_DYN]), wgt)
+                    for name, st in (("id_pre", xt_), ("id_bal", xtb)):
+                        add((name, k), phys.per_equation(st, orog, torch.zeros_like(st), x_obs=xt_)["hyd"] ** 2, wgt)
+                y, xb = model.rollout(x0, hour0, Kv, tisr_of(x0, d, Kv), balanced=True)
+                pre = torch.cat([x0[:, None], y[:, :-1]], 1)
+                add(("corr",), (((xb - pre)[:, :, BAL_DYN] / t6[:, :, BAL_DYN]) ** 2 * w).mean((0, 2, 3, 4)), wgt)
+                for k in range(0, Kv, 4):  # hydrostatic residual before / after head 1 (ERA5 = 1)
+                    for name, st in (("hyd_pre", pre[:, k]), ("hyd_bal", xb[:, k])):
+                        add((name, k), phys.per_equation(st, orog, torch.zeros_like(st),
+                                                         x_obs=x0 if k == 0 else x0 + d[:, k - 1])["hyd"] ** 2, wgt)
+            else:
+                y = model.rollout(x0, hour0, Kv, tisr_of(x0, d, Kv))
             t = x0[:, None] + d
             inc = y - x0[:, None]
             for v, ii in idx.items():
@@ -349,6 +387,13 @@ def main(argv=None):
                 "error_ratio": math.sqrt(acc[(alpha, name, "err_out")] / acc[(alpha, name, "err_in")])}
     val["bridge_ratio"] = {key[1]: math.sqrt(acc[key] / acc[("bridge_t", key[1])])
                            for key in list(acc) if len(key) == 2 and key[0] == "bridge_y"}
+    if a.balance:
+        val["correction_over_t6"] = np.sqrt(acc[("corr",)]).tolist()
+        val["hyd_before_after"] = {str(6 * k): [math.sqrt(acc[("hyd_pre", k)]), math.sqrt(acc[("hyd_bal", k)])]
+                                   for k in range(0, Kv, 4)}
+        val["identity"] = {str(6 * k): {"corr_over_t6": math.sqrt(acc[("id_corr", k)]),
+                                        "hyd_before_after": [math.sqrt(acc[("id_pre", k)]), math.sqrt(acc[("id_bal", k)])]}
+                           for k in (0, 4, 8) if ("id_corr", k) in acc}
     i24 = min(Kv, 4) - 1
     val["gates"] = {"ke_ratio_24h": val["ke_ratio"][i24], "amp_ratio_24h": val["amp_ratio"][i24],
                     "ke_ratio_last": val["ke_ratio"][-1],
@@ -365,6 +410,13 @@ def main(argv=None):
         + " | increment amplitude " + " ".join(f"{h}:{v:.3f}" for h, v in zip(leads[3::4], val["amp_ratio"][3::4])))
     log("[val] strong residual rollout / truth " + " ".join(
         f"{h}: " + " ".join(f"{q} {v:.2f}" for q, v in r.items()) for h, r in val["strong_ratio"].items()))
+    if a.balance:
+        log("[val identity] head 1 on ERA5 truth: " + " ".join(
+            f"{h}h |c|/t6 {v['corr_over_t6']:.3f} hyd {v['hyd_before_after'][0]:.3f}->{v['hyd_before_after'][1]:.3f}"
+            for h, v in val["identity"].items()))
+        log("[val balance] |c| / t6 by lead " + " ".join(f"{v:.3f}" for v in val["correction_over_t6"][::4])
+            + " | hydrostatic (ERA5 = 1) before -> after head 1 " + " ".join(
+                f"{h}h {v[0]:.3f}->{v[1]:.3f}" for h, v in val["hyd_before_after"].items()))
     log("[val] bridge residual rollout / truth " + " ".join(f"{q} {v:.2f}" for q, v in val["bridge_ratio"].items()))
     for k, v in val["projection"].items():
         log(f"[val projection {k}] spread low {v['spread_ratio']['low']:.3f} high {v['spread_ratio']['high']:.3f}"

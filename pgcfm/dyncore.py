@@ -46,6 +46,11 @@ class DynCoreConfig:
     dt_hours: float = 6.0     # solver substep
     solver: str = "heun"      # euler | heun
     positive: bool = True     # PositiveMass after every 6 h step
+    balance: bool = False     # head 1: a correction c(x) of z and t (hydrostatic structure) before every step
+    bal_detach: bool = False  # the solver starts from x + c.detach(): c learns from the hydrostatic loss only
+
+
+BAL_DYN = LEVEL_DYN["z"] + LEVEL_DYN["t"]  # the channels head 1 may correct (the hydrostatic pair)
 
 
 class DynCore(nn.Module):
@@ -53,6 +58,11 @@ class DynCore(nn.Module):
 
     ``tendency`` is in normalized units per 6 h step (scaled by the training tendency std ``t6`` so the
     zero-initialized head starts as persistence); tisr is never predicted.
+
+    With ``cfg.balance`` (the owner's two-output PINN, 2026-10-27): one trunk pass on the data x gives
+    (1) a correction c(x) of the z and t levels, x~ = x + c(x) (the current state on the hydrostatic
+    manifold), and (2) dx/dt = f(x); the solver starts from x~ with k1 = f(x) and evaluates f again at its
+    intermediate states: x_{t+6h} = x~ + (k1 + f(x~ + k1)) / 2 (Heun).
     """
 
     def __init__(self, cfg: DynCoreConfig, static: torch.Tensor, t6: torch.Tensor, mean, std, lat_deg):
@@ -65,12 +75,27 @@ class DynCore(nn.Module):
         self.register_buffer("keep", keep.view(1, N_DYN, 1, 1))
         self.net = Net(N_DYN + static.shape[0] + 4, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
         self.pm = PositiveMass(mean, std, lat_deg) if cfg.positive else None
+        if cfg.balance:
+            self.bal_head = nn.Conv2d(cfg.hidden, len(BAL_DYN), 1)
+            nn.init.zeros_(self.bal_head.weight)
+            nn.init.zeros_(self.bal_head.bias)
+            self.register_buffer("bal_idx", torch.tensor(BAL_DYN))
+        self.last_balanced = None  # x~ of the last step (for the loss and the gates)
+
+    def _trunk(self, x: torch.Tensor, hours: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        return self.net.trunk(torch.cat([x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1))
 
     def tendency(self, x: torch.Tensor, hours: torch.Tensor) -> torch.Tensor:
         """f_theta(x): normalized increment per 6 h (B, 66, H, W)."""
-        B, _, H, W = x.shape
-        h = torch.cat([x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1)
-        return self.net(h) * self.t6 * self.keep
+        return self.net.head(self._trunk(x, hours)) * self.t6 * self.keep
+
+    def heads(self, x: torch.Tensor, hours: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Both outputs of one pass: (f(x), x~ = x + c(x)), c in units of the 6 h tendency std."""
+        h = self._trunk(x, hours)
+        f = self.net.head(h) * self.t6 * self.keep
+        c = self.bal_head(h) * self.t6[:, self.bal_idx]
+        return f, torch.index_add(x, 1, self.bal_idx, c)
 
     def step(self, x: torch.Tensor, hours: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:
         """One 6 h step of the solver; tisr_next (B, H, W) is the forcing at the end of the step."""
@@ -78,7 +103,12 @@ class DynCore(nn.Module):
         h = 1.0 / n_sub  # in units of the 6 h step
         for i in range(n_sub):
             t = hours + i * HOURS_PER_STEP * h
-            k1 = self.tendency(x, t)
+            if self.cfg.balance and i == 0:
+                k1, xb = self.heads(x, t)
+                self.last_balanced = xb
+                x = x + (xb - x).detach() if self.cfg.bal_detach else xb
+            else:
+                k1 = self.tendency(x, t)
             if self.cfg.solver == "euler":
                 x = x + h * k1
             elif self.cfg.solver == "heun":
@@ -93,14 +123,18 @@ class DynCore(nn.Module):
         return x
 
     def rollout(self, x0: torch.Tensor, hour0: torch.Tensor, steps: int,
-                tisr: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """(B, steps, 66, H, W): the states 6 h, 12 h, ... after x0; tisr (B, steps, H, W) from the data."""
-        x, hours, out = x0, hour0.float(), []
+                tisr: Optional[torch.Tensor] = None, balanced: bool = False):
+        """(B, steps, 66, H, W): the states 6 h, 12 h, ... after x0; tisr (B, steps, H, W) from the data.
+        ``balanced`` (with cfg.balance) also returns the corrected states x~ at 0, 6, ... (steps - 1) x 6 h."""
+        x, hours, out, bal = x0, hour0.float(), [], []
         for k in range(steps):
             x = self.step(x, hours, None if tisr is None else tisr[:, k])
             hours = hours + HOURS_PER_STEP
             out.append(x)
-        return torch.stack(out, 1)
+            if balanced:
+                bal.append(self.last_balanced)
+        y = torch.stack(out, 1)
+        return (y, torch.stack(bal, 1)) if balanced else y
 
 
 class StrongPhysics:
