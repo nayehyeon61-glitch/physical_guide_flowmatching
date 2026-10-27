@@ -44,7 +44,7 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.cfm import TISR_DYN  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
-from pgcfm.dyncore import (BAL_DYN, DynCore, DynCoreConfig, StrongPhysics, estimate_strong_scales,  # noqa: E402
+from pgcfm.dyncore import (BAL_DYN, DynCore, DynCoreConfig, OperatorFeatures, StrongPhysics, estimate_strong_scales,  # noqa: E402
                            finite_difference_tendency, kinetic_energy)
 from pgcfm.runs import (EXIT_BUDGET, FitConfig, Prefetch, autocast, device_from, fit, load_years,  # noqa: E402
                         run_record, tendency_std)
@@ -84,6 +84,8 @@ def main(argv=None):
     p.add_argument("--lambda-hyd", type=float, default=0.1, help="--balance: weight of the hydrostatic residual of x~")
     p.add_argument("--hyd-target", type=float, default=0.0, help="--balance: hinge target in ERA5 units (0 = eq. 10)")
     p.add_argument("--bal-reg", type=float, default=1.0, help="--balance: weight of |c|^2 (minimal modification)")
+    p.add_argument("--gfeat", action="store_true", help="step 18: the operator tendency G(x) = -R0(x) (u, v, T, q x "
+                   "12 levels, scaled, no gradient) as 48 extra input channels of the core")
     p.add_argument("--dt-hours", type=float, default=6.0)
     p.add_argument("--solver", default="heun", choices=["euler", "heun"])
     p.add_argument("--hidden", type=int, default=48)
@@ -167,8 +169,13 @@ def main(argv=None):
     pert.fit(sample(data, a.train_years, a.K, rng, 16)[1] for _ in range(16))
     pert.to(dev)
     cfg = DynCoreConfig(hidden=a.hidden, blocks=tuple(a.blocks), dt_hours=a.dt_hours, solver=a.solver,
-                        positive=not a.no_positive, balance=a.balance, bal_detach=a.bal_detach)
+                        positive=not a.no_positive, balance=a.balance, bal_detach=a.bal_detach, gfeat=a.gfeat)
     model = DynCore(cfg, static_features(lat, lon, oro, lsm), t6v.cpu(), mean[DYN], std[DYN], lat).to(dev)
+    if a.gfeat:
+        feats = OperatorFeatures(phys, triples[0][3])
+        model.gscale.copy_(feats.estimate_scale(torch.cat([t[1] for t in triples])))
+        feats.scale = model.gscale
+        model.features = feats
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "strong_scales": vars(phys.scales),
            "bridge_scales": vars(guide.scales), "rest_over_era5": rest, "tendency_over_era5": tend,
            "n_params": sum(q.numel() for q in model.parameters()), "run": run_record(dev)}

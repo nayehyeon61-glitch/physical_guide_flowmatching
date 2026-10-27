@@ -25,7 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 from pgcfm import contract  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
-from pgcfm.dyncore import DynCore, DynCoreConfig  # noqa: E402
+from pgcfm.coupling import PhysicsConfig, PhysicsGuide  # noqa: E402
+from pgcfm.dyncore import DynCore, DynCoreConfig, OperatorFeatures, StrongPhysics  # noqa: E402
 from pgcfm.runs import load_years  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
@@ -61,6 +62,14 @@ def main(argv=None):
     model = DynCore(cfg, static_features(lat, lon, oro, lsm), torch.ones(contract.N_DYNAMIC), mean[DYN], std[DYN], lat)
     model.load_state_dict(torch.load(os.path.join(a.run, f"{a.tag}.pt"), map_location="cpu"))
     model.eval()
+    if cfg.gfeat:  # the operator features need the guide and the (constant) normalized orography
+        guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
+        with nc.Dataset(os.path.join(a.kai, f"{a.val_year}.nc")) as d:
+            orog = (np.asarray(d["fields"][0, contract.STATIC_CHANNELS], dtype=np.float32)
+                    - mean[contract.STATIC_CHANNELS][:, None, None]) / (std[contract.STATIC_CHANNELS]
+                                                                         + contract.KAI_STD_EPS)[:, None, None]
+        model.features = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC)),
+                                          torch.from_numpy(orog)[None], model.gscale)
     unscale = lambda q: q * std[DYN][:, None, None] + mean[DYN][:, None, None]  # noqa: E731
     w = np.cos(np.deg2rad(lat))
     w = (w / w.mean())[:, None]

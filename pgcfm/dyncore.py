@@ -48,9 +48,12 @@ class DynCoreConfig:
     positive: bool = True     # PositiveMass after every 6 h step
     balance: bool = False     # head 1: a correction c(x) of z and t (hydrostatic structure) before every step
     bal_detach: bool = False  # the solver starts from x + c.detach(): c learns from the hydrostatic loss only
+    gfeat: bool = False       # step 18: the discrete operator's tendency G(x) = -R0(x) as 48 extra input channels
 
 
 BAL_DYN = LEVEL_DYN["z"] + LEVEL_DYN["t"]  # the channels head 1 may correct (the hydrostatic pair)
+G_EQS = ("u", "v", "T", "q")  # prognostic equations whose operator tendency becomes a feature
+N_GFEAT = len(G_EQS) * len(contract.LEVELS_HPA)  # 48
 
 
 class DynCore(nn.Module):
@@ -73,8 +76,12 @@ class DynCore(nn.Module):
         keep = torch.ones(N_DYN)
         keep[TISR_DYN] = 0
         self.register_buffer("keep", keep.view(1, N_DYN, 1, 1))
-        self.net = Net(N_DYN + static.shape[0] + 4, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
+        self.net = Net(N_DYN + static.shape[0] + 4 + (N_GFEAT if cfg.gfeat else 0), N_DYN,
+                       _NetCfg(cfg.hidden, cfg.blocks))
         self.pm = PositiveMass(mean, std, lat_deg) if cfg.positive else None
+        self.features = None  # cfg.gfeat: an OperatorFeatures callable x -> G(x) (attached after construction)
+        if cfg.gfeat:
+            self.register_buffer("gscale", torch.ones(1, N_GFEAT, 1, 1))
         if cfg.balance:
             self.bal_head = nn.Conv2d(cfg.hidden, len(BAL_DYN), 1)
             nn.init.zeros_(self.bal_head.weight)
@@ -82,17 +89,23 @@ class DynCore(nn.Module):
             self.register_buffer("bal_idx", torch.tensor(BAL_DYN))
         self.last_balanced = None  # x~ of the last step (for the loss and the gates)
 
-    def _trunk(self, x: torch.Tensor, hours: torch.Tensor) -> torch.Tensor:
+    def _trunk(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, _, H, W = x.shape
-        return self.net.trunk(torch.cat([x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1))
+        parts = [x, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)]
+        if self.cfg.gfeat:
+            if self.features is None:
+                raise RuntimeError("cfg.gfeat needs model.features = OperatorFeatures(...)")
+            parts.append(self.features(x) if g is None else g)
+        return self.net.trunk(torch.cat(parts, 1))
 
-    def tendency(self, x: torch.Tensor, hours: torch.Tensor) -> torch.Tensor:
-        """f_theta(x): normalized increment per 6 h (B, 66, H, W)."""
-        return self.net.head(self._trunk(x, hours)) * self.t6 * self.keep
+    def tendency(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """f_theta(x): normalized increment per 6 h (B, 66, H, W); ``g`` = precomputed G(x) (cfg.gfeat)."""
+        return self.net.head(self._trunk(x, hours, g)) * self.t6 * self.keep
 
-    def heads(self, x: torch.Tensor, hours: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def heads(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None
+              ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Both outputs of one pass: (f(x), x~ = x + c(x)), c in units of the 6 h tendency std."""
-        h = self._trunk(x, hours)
+        h = self._trunk(x, hours, g)
         f = self.net.head(h) * self.t6 * self.keep
         c = self.bal_head(h) * self.t6[:, self.bal_idx]
         return f, torch.index_add(x, 1, self.bal_idx, c)
@@ -103,16 +116,17 @@ class DynCore(nn.Module):
         h = 1.0 / n_sub  # in units of the 6 h step
         for i in range(n_sub):
             t = hours + i * HOURS_PER_STEP * h
+            g = self.features(x) if self.cfg.gfeat else None  # one operator evaluation per substep (k2 reuses it)
             if self.cfg.balance and i == 0:
-                k1, xb = self.heads(x, t)
+                k1, xb = self.heads(x, t, g)
                 self.last_balanced = xb
                 x = x + (xb - x).detach() if self.cfg.bal_detach else xb
             else:
-                k1 = self.tendency(x, t)
+                k1 = self.tendency(x, t, g)
             if self.cfg.solver == "euler":
                 x = x + h * k1
             elif self.cfg.solver == "heun":
-                k2 = self.tendency(x + h * k1, t + HOURS_PER_STEP * h)
+                k2 = self.tendency(x + h * k1, t + HOURS_PER_STEP * h, g)
                 x = x + 0.5 * h * (k1 + k2)
             else:
                 raise ValueError(self.cfg.solver)
@@ -197,6 +211,42 @@ class StrongPhysics:
                 for k, v in self.mean_squares(R, m).items():
                     acc[k] = acc.get(k, 0.0) + float(v) * (j.stop - j.start) / n
         return {k: math.sqrt(v) for k, v in acc.items()}
+
+
+class OperatorFeatures:
+    """Step 18: G(x) = -R0(x), the discrete primitive-equation operator's own tendency of (u, v, T, q) on the
+    12 levels (48 channels), as an input feature of the core. The operator predicts ERA5's 6 h tendency with
+    correlation 0.5 (u, v) / 0.35 (T) and twice its magnitude (docs/step18), so it is offered to the network
+    as a hint, not integrated: computed without gradient, divided by its ERA5 RMS per channel (``scale``,
+    a buffer of the core), zero below ground, clamped at ``clamp``. The KAI grid has no pole rows, so the
+    residual rows are all H rows."""
+
+    def __init__(self, phys: StrongPhysics, orog: torch.Tensor, scale: Optional[torch.Tensor] = None,
+                 clamp: float = 5.0):
+        self.phys, self.orog, self.scale, self.clamp = phys, orog[:1], scale, clamp
+        if len(phys.guide.grid(orog.device).lat_rows) != orog.shape[-2]:
+            raise ValueError("operator features need a grid without pole rows (residual rows = all rows)")
+
+    def raw(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(-R0 (B, 48, H, W) float64, valid-point mask (B, 48, H, W))."""
+        R0, m = self.phys.residuals(x, self.orog.expand(x.shape[0], -1, -1, -1), torch.zeros_like(x))
+        return -torch.cat([R0[q] for q in G_EQS], 1), m.repeat(1, len(G_EQS), 1, 1)
+
+    def estimate_scale(self, states: torch.Tensor, chunk: int = 8) -> torch.Tensor:
+        """RMS of G over valid points of ERA5 ``states`` (N, 66, H, W) per channel -> (1, 48, 1, 1)."""
+        sq, n = 0.0, 0.0
+        with torch.no_grad():
+            for i in range(0, states.shape[0], chunk):
+                g, m = self.raw(states[i:i + chunk])
+                sq = sq + ((g * m) ** 2).sum((0, 2, 3))
+                n = n + m.sum((0, 2, 3))
+        return torch.sqrt(sq / n.clamp_min(1.0)).clamp_min(1e-30).view(1, -1, 1, 1).float()
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            g, m = self.raw(x.detach())
+            g = (g / self.scale.to(g.dtype)).clamp(-self.clamp, self.clamp) * m
+        return g.to(x.dtype)
 
 
 def mask_device(ms):
