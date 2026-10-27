@@ -13,6 +13,13 @@ ClimODE's protocol, as the owner's four-model comparison (H1-H3, docs/step13_seq
                                          the corrected state on the later steps
                             smoothed     H3's control (--smooth-lam): the same late guidance with a Laplacian
                                          roughness instead of the physics (no physics, only smoothing)
+                            bal          head 1 of a two-output step 16 core (--project-core, cfg.balance):
+                                         x~ = x + c(x) on every member frame (full-mode z/t correction),
+                                         the step 16 E1 projection (owner 2026-10-27 08:50)
+                            hyd          E2 control without a network (--hyd-project): the closed-form
+                                         minimum-displacement projection of (Phi, T_v) of every member frame
+                                         onto the discrete hydrostatic relation d_lnp Phi + R_d T_v = b, with
+                                         b the ERA5 mean of that discrete residual per level and cell
     every arm then gets the hard constraints q >= 0, tcwv >= 0 (the violated fraction is reported);
     raw, guided, inloop and smoothed start from the same noise, so their differences are paired
     (--resume-ens replays the noise of the skipped years, so arms added later stay paired).
@@ -97,6 +104,10 @@ def main(argv=None):
     p.add_argument("--core-mean", default=None, help="step 16 DynCore prefix (runs/step16/dyn_lp0): the FM learns "
                    "the residual d - Delta_core(x0) of the core's 6 h rollout and every member adds Delta_core back "
                    "(owner's residual flow, 2026-10-27); tisr stays with the FM. Tag suffix _core")
+    p.add_argument("--project-core", default=None, help="step 16 two-output core prefix (runs/step16/dyn_balB): "
+                   "arm bal = its head 1 x~ = x + c(x) on every member frame")
+    p.add_argument("--hyd-project", action="store_true", help="arm hyd = closed-form hydrostatic projection "
+                   "of every member frame (no network; control for pinn and bal)")
     p.add_argument("--guide-lam", type=float, default=0.0, help="H3 guidance strength (fraction of |v|); 0 = off")
     p.add_argument("--guide-s0", type=float, default=0.75)
     p.add_argument("--inloop-mu", type=float, default=0.0, help="PINN inside the generation ODE (needs --pinn); 0 = off")
@@ -277,6 +288,41 @@ def main(argv=None):
                    best_it=r["best_it"], best_val=r["best_val"], stopped=r["stopped"])
     model.eval()
 
+    def _load_core(prefix):
+        """A step 16 DynCore with its own normalization (its stats folder) in evaluation mode."""
+        from pgcfm.dyncore import DynCore, DynCoreConfig
+        info = json.load(open(prefix + ".json"))
+        st = os.path.join(os.path.dirname(prefix), "stats")
+        m_, s_ = np.load(os.path.join(st, "global_mean.npy")), np.load(os.path.join(st, "global_std.npy"))
+        c = DynCore(DynCoreConfig(**{**info["cfg"], "blocks": tuple(info["cfg"]["blocks"])}), static,
+                    torch.ones(contract.N_DYNAMIC), m_[DYN], s_[DYN], lat)
+        c.load_state_dict(torch.load(prefix + ".pt", map_location="cpu"))
+        c.to(dev).eval()
+        for q in c.parameters():
+            q.requires_grad_(False)
+        e_ = contract.KAI_STD_EPS
+        f_m, f_s = (torch.from_numpy(q[DYN]).float().to(dev).view(1, -1, 1, 1) for q in (mean, std + e_))
+        c_m, c_s = (torch.from_numpy(q[DYN]).float().to(dev).view(1, -1, 1, 1) for q in (m_, s_ + e_))
+        return c, (f_m, f_s, c_m, c_s)
+
+    bal_frames = None
+    if a.project_core:  # arm bal: head 1 of the two-output core on every member frame
+        pcore, (pf_m, pf_s, pc_m, pc_s) = _load_core(a.project_core)
+        if not pcore.cfg.balance:
+            raise ValueError("--project-core needs a core trained with --balance")
+
+        def _bal_frames(xf, hours, chunk=64):
+            """Frames (N, 66, H, W) in this run's units and their hours (N,) -> x~ = x + c(x)."""
+            out = torch.empty_like(xf)
+            with torch.no_grad():
+                for i in range(0, xf.shape[0], chunk):
+                    j = slice(i, i + chunk)
+                    _, xb = pcore.heads((xf[j] * pf_s + pf_m - pc_m) / pc_s, hours[j])
+                    out[j] = (xb * pc_s + pc_m - pf_m) / pf_s
+            return out
+
+        bal_frames = _bal_frames
+
     P = None
     if a.pinn:
         pc = json.load(open(a.pinn.replace(".pt", ".json")))["cfg"]
@@ -295,6 +341,63 @@ def main(argv=None):
     for q in guide.parameters():
         q.requires_grad_(False)
     guide.to(dev)
+
+    hyd_frames, hyd_res = None, None
+    if a.hyd_project:  # arm hyd: closed-form projection onto the discrete hydrostatic relation (no network)
+        from pgcfm.coupling import LEVEL_DYN
+        from pgcfm.physics.primitive import VIRTUAL_EPS
+        nl = contract.N_LEVELS
+        zi, ti, qi = (torch.tensor(LEVEL_DYN[v], device=dev) for v in ("z", "t", "q"))
+        lv_m = lambda i: torch.from_numpy(mean[DYN][i.cpu().numpy()]).double().to(dev).view(1, -1, 1, 1)  # noqa: E731
+        lv_s = lambda i: torch.from_numpy(std[DYN][i.cpu().numpy()] + contract.KAI_STD_EPS).double().to(dev) \
+            .view(1, -1, 1, 1)  # noqa: E731
+        mz, sz, mt, st_, mq, sq = lv_m(zi), lv_s(zi), lv_m(ti), lv_s(ti), lv_m(qi), lv_s(qi)
+        lnp = torch.log(torch.from_numpy(contract.LEVELS_PA))
+        # the same ln p gradient as pgcfm.physics.grid.SphereGrid.d_p (edge order 2), as a matrix
+        D = torch.gradient(torch.eye(nl, dtype=torch.float64), spacing=(lnp,), dim=0, edge_order=2)[0]
+        A = torch.cat([D / contract.CONST.r_dry, torch.eye(nl, dtype=torch.float64)], 1).to(dev)  # R_hyd in K
+        S = torch.cat([sz.view(-1), st_.view(-1)]) ** 2  # the displacement is minimal in normalized units
+        G = (S[:, None] * A.T) @ torch.linalg.inv(A @ (S[:, None] * A.T))  # (24, 12)
+
+        def hyd_fields(x):
+            """Normalized (N, 66, H, W) -> ((Phi, T_v) in SI (N, 24, H, W), 1 + 0.608 q)."""
+            xd = x.double()
+            fac = 1.0 + VIRTUAL_EPS * (xd[:, qi] * sq + mq)
+            return torch.cat([xd[:, zi] * sz + mz, (xd[:, ti] * st_ + mt) * fac], 1), fac
+
+        def _hyd_res(x):
+            """Discrete hydrostatic residual d_lnp Phi / R_d + T_v (N, 12, H, W) in K."""
+            return torch.einsum("ij,njhw->nihw", A, hyd_fields(x)[0])
+
+        hyd_res = _hyd_res
+        with torch.no_grad():  # ERA5's own discrete residual per level and cell (the affine manifold's offset)
+            hyd_b = torch.cat([hyd_res(e["x0"].to(dev)) for e in est]).mean(0, keepdim=True)
+
+        def _hyd_frames(xf, bias=True, chunk=128):
+            out = xf.clone()
+            with torch.no_grad():
+                for i in range(0, xf.shape[0], chunk):
+                    j = slice(i, i + chunk)
+                    y, fac = hyd_fields(xf[j])
+                    r = torch.einsum("ij,njhw->nihw", A, y) - (hyd_b if bias else 0.0)
+                    y = y - torch.einsum("ij,njhw->nihw", G, r)
+                    out[j, zi] = ((y[:, :nl] - mz) / sz).to(xf.dtype)
+                    out[j, ti] = ((y[:, nl:] / fac - mt) / st_).to(xf.dtype)
+            return out
+
+        hyd_frames = _hyd_frames
+
+    def frame_wise(fn, x0m, inc, h0m):
+        """Apply fn(frames, hours) to the member frames x0 + d_k (k = 1..K) and return the new increments."""
+        K_ = inc.shape[1]
+        xf = (x0m[:, None] + inc).flatten(0, 1)
+        hours = (h0m[:, None].float() + 6.0 * torch.arange(1, K_ + 1, device=inc.device)[None]).reshape(-1)
+        return fn(xf, hours).view_as(inc) - x0m[:, None]
+
+    def zt_rms(d_):
+        """RMS of a normalized displacement over the z and t levels (the channels the projections touch)."""
+        from pgcfm.coupling import LEVEL_DYN
+        return float(d_[:, :, LEVEL_DYN["z"] + LEVEL_DYN["t"]].double().pow(2).mean().sqrt())
 
     # u10/v10 from u1000/v1000 on the validation year (step 11)
     era5 = a.era5
@@ -325,7 +428,10 @@ def main(argv=None):
     smoothed = a.model == "fm" and a.smooth_lam > 0
     arms = ("raw",) + (("pinn",) if P is not None else ()) + (("guided",) if guided else ()) \
         + (("guided_pinn",) if guided and P is not None else ()) + (("inloop",) if inloop else ()) \
-        + (("smoothed",) if smoothed else ())
+        + (("smoothed",) if smoothed else ()) + (("bal",) if bal_frames else ()) + (("hyd",) if hyd_frames else ())
+    kl, kn = (P.cfg.k_lat, P.cfg.k_lon) if P is not None else (PINNConfig().k_lat, PINNConfig().k_lon)
+    proj = {"bal": lambda x0m, inc, h0m: frame_wise(bal_frames, x0m, inc, h0m),
+            "hyd": lambda x0m, inc, h0m: frame_wise(lambda xf, _: hyd_frames(xf), x0m, inc, h0m)}
     pair_ids = torch.tensor([0, a.K // 2, a.K - 1])  # residual diagnostics and the H3 guidance
     mx, mn = climode_minmax(era5)
     wl = np.cos(np.deg2rad(lat))
@@ -333,14 +439,17 @@ def main(argv=None):
     sc = {arm: {k: [] for k in ("rmse", "acc", "crps_gauss", "crps_ens", "spread", "rmse_pers")} for arm in arms}
     phys = {arm: [] for arm in arms + ("truth",)}
     viol = {arm: [] for arm in arms}
-    bands = {arm: [] for arm in arms if arm.endswith("pinn") or arm == "inloop"}
+    bands = {arm: [] for arm in arms if arm.endswith("pinn") or arm in ("inloop", "bal", "hyd")}
+    disp = {arm: {"member": [], "truth": []} for arm in arms if arm in proj}  # projection displacement, z/t RMS
+    if "hyd" in disp:
+        disp["hyd"]["truth_b0"] = []  # the projection onto b = 0 would move ERA5 itself by this much
     cost = {arm: 0.0 for arm in arms}
     g = torch.Generator().manual_seed(a.seed + 7)
     skipped = []
     saved = lambda arm, y: os.path.join(a.out, f"{tag}_{arm}_ens_{y}.npz")  # noqa: E731
     for y in ([a.val_year] if a.save_ens else []) + a.test_years:
         score = y in a.test_years
-        here = list(arms) if score else [q for q in ("raw", "pinn") if q in arms]  # validation: no guidance
+        here = list(arms) if score else [q for q in ("raw", "pinn", "bal", "hyd") if q in arms]  # val: no guidance
         if not score:
             here = here[-1:] if a.resume_ens else here  # only the saved arm matters on a resumed run
         existing = {arm for arm in here if a.resume_ens and os.path.exists(saved(arm, y))}
@@ -354,7 +463,8 @@ def main(argv=None):
             log(f"  {y}: ensembles exist, skipped (noise replayed)")
             continue
         here = [arm for arm in here if arm not in existing]
-        keep = {arm: {"E": [], "O": [], "X0": [], "ics": []} for arm in (here if score else here[-1:])}
+        keep = {arm: {"E": [], "O": [], "X0": [], "ics": []}
+                for arm in (here if score else ([q for q in here if q != "raw"] or here))}
         check_raw = "raw" in existing  # the replayed raw members must equal the saved ones
         x = data[y] if y == a.val_year else load_years(a.kai, [y], mean, std, cache=a.cache)[y]
         truth = climode_truth(era5, y)
@@ -418,16 +528,28 @@ def main(argv=None):
                     with torch.no_grad():
                         ens[arm] = P(x0m, ens[src], h0m)
                     cost[arm] += time.time() - tc
+            for arm in ("bal", "hyd"):  # the step 16 projections of the raw members, frame by frame
+                if arm in here:
+                    tc = time.time()
+                    ens[arm] = proj[arm](x0m, ens["raw"], h0m)
+                    cost[arm] += time.time() - tc
+                    if score:
+                        disp[arm]["member"].append(zt_rms(ens[arm] - ens["raw"]))
+                        disp[arm]["truth"].append(zt_rms(proj[arm](h[:, -1], d, hour0) - d))
+                        if arm == "hyd":
+                            disp[arm]["truth_b0"].append(zt_rms(
+                                frame_wise(lambda xf, _: hyd_frames(xf, bias=False), h[:, -1], d, hour0) - d))
             for arm in here:
                 ens[arm], f = hard_constraints(x0m, ens[arm], mean, std)
                 if score:
                     viol[arm].append(f)
             if score:
-                for arm, src in (("pinn", "raw"), ("guided_pinn", "guided"), ("inloop", "raw")):
+                for arm, src in (("pinn", "raw"), ("guided_pinn", "guided"), ("inloop", "raw"), ("bal", "raw"),
+                                 ("hyd", "raw")):
                     if arm in ens and arm in here:
                         e0 = ens[src].view(B, a.members, *ens[src].shape[1:]).transpose(0, 1)
                         e1 = ens[arm].view(B, a.members, *ens[arm].shape[1:]).transpose(0, 1)
-                        s0_, s1_ = band_spread(e0, P.cfg.k_lat, P.cfg.k_lon), band_spread(e1, P.cfg.k_lat, P.cfg.k_lon)
+                        s0_, s1_ = band_spread(e0, kl, kn), band_spread(e1, kl, kn)
                         bands[arm].append({k: s1_[k] / s0_[k] for k in s0_})
                 phys["truth"].append(residual_rms(guide, h[:, -1], d, d, orog, pair_ids))
             sel = torch.tensor([k * 4 - 1 for k in range(1, a.K // 4 + 1)])  # 24 h multiples
@@ -475,6 +597,8 @@ def main(argv=None):
         t["seconds_per_ic"] = cost[arm] / n_ic
         if arm in bands:
             t["spread_ratio_through_pinn"] = {k: float(np.mean([q[k] for q in bands[arm]])) for k in bands[arm][0]}
+        if arm in disp:
+            t["displacement_zt_rms"] = {k: float(np.sqrt(np.mean(np.square(v)))) for k, v in disp[arm].items() if v}
         t["n_ic"] = n_ic
         res["test"][arm] = t
         log(f"[{arm}] z500 RMSE " + " ".join(f"{h}:{t['rmse'][h]['z']:.0f}" for h in t["rmse"])
