@@ -71,9 +71,9 @@ def main(argv=None):
                 if max(v["rmse"]["Phi"]) > 2.0 * max(first["rmse_pers"]["Phi"]):
                     ax[0].annotate(f"{LABEL.get(arm, arm)}: 축 밖 (최대 {max(v['rmse']['Phi']):.2g})", (0.02, 0.95 - 0.06 * list(arms).index(arm)),
                                    xycoords="axes fraction", fontsize=8, color=COLORS.get(arm, "k"))
-        s = r["setting"]
+        s = r["setting"] + ("42" if r.get("args", {}).get("res") == 42 else "")  # the tag, as the json file
         ax[0].set_title(f"[{s}] Φ RMSE (m²/s²)"), ax[1].set_title(f"[{s}] 바람 RMSE (m/s)")
-        ax[2].set_title(f"[{s}] 에너지 비 예측 / 진실"), ax[3].set_title(f"[{s}] 접벡터 잔차 |f − F_true| / b (진실 상태)")
+        ax[2].set_title(f"[{s}] 에너지 비 예측 / 진실"), ax[3].set_title(f"[{s}] 접벡터 잔차 |f - F_true| / b (진실 상태)")
         ax[2].axhline(1.0, color="k", ls=":", lw=1)
         for q in ax[:3]:
             q.set_xlabel("lead (h)"), q.grid(alpha=0.3)
