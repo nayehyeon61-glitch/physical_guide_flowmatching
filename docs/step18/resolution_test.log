@@ -1,0 +1,24 @@
+triples 92 (hours [0, 6, 12] .. [8646, 8652, 8658])
+interpolation gap (rel RMSE to the fine field / fine power beyond k=32): z 0.032/0.001 q 0.201/0.029 t 0.060/0.003 u 0.194/0.005 v 0.190/0.009
+[coarse] n 92
+  u    rms D 1.059e-04 R0 2.132e-04 R1 1.816e-04 corr(-R0,D) +0.524 skill -1.942
+  v    rms D 1.401e-04 R0 3.256e-04 R1 2.829e-04 corr(-R0,D) +0.500 skill -3.081
+  T    rms D 4.025e-05 R0 1.070e-04 R1 1.001e-04 corr(-R0,D) +0.354 skill -5.187
+  q    rms D 1.248e-08 R0 2.792e-08 R1 2.674e-08 corr(-R0,D) +0.316 skill -3.592
+  mass rms R 2.815e-06
+  hyd  rms R 3.022e+00
+[fine] n 92
+  u    rms D 1.229e-04 R0 2.407e-04 R1 1.999e-04 corr(-R0,D) +0.559 skill -1.644
+  v    rms D 1.543e-04 R0 3.012e-04 R1 2.427e-04 corr(-R0,D) +0.599 skill -1.476
+  T    rms D 4.444e-05 R0 1.227e-04 R1 1.149e-04 corr(-R0,D) +0.350 skill -5.690
+  q    rms D 1.633e-08 R0 3.571e-08 R1 3.296e-08 corr(-R0,D) +0.391 skill -3.071
+  mass rms R 4.769e-06
+  hyd  rms R 3.046e+00
+[interp] n 92
+  u    rms D 1.024e-04 R0 1.928e-04 R1 1.601e-04 corr(-R0,D) +0.558 skill -1.444
+  v    rms D 1.387e-04 R0 2.528e-04 R1 1.966e-04 corr(-R0,D) +0.634 skill -1.010
+  T    rms D 3.964e-05 R0 9.134e-05 R1 8.308e-05 corr(-R0,D) +0.416 skill -3.393
+  q    rms D 1.199e-08 R0 2.407e-08 R1 2.240e-08 corr(-R0,D) +0.384 skill -2.489
+  mass rms R 2.913e-06
+  hyd  rms R 3.021e+00
+cumulative ratio k<=8: coarse u 0.65 v 0.16 T 0.28 | interp u 0.82 v 0.45 T 0.44 | fine u 1.07 v 0.55 T 0.48

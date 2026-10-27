@@ -21,9 +21,11 @@ for f in ("WenQuanYi Zen Hei", "Noto Sans CJK KR", "NanumGothic", "DejaVu Sans")
         plt.rcParams["font.family"] = f
         break
 plt.rcParams["axes.unicode_minus"] = False
-COLORS = {"data": "#4477AA", "node": "#66CCEE", "pi": "#EE6677", "pi_only": "#AA3377"}
+COLORS = {"data": "#4477AA", "node": "#66CCEE", "pi": "#EE6677", "pi_only": "#AA3377", "hybrid": "#004488",
+          "phys": "#999999"}
 MARK = {"fwd": "x", "fit": "o"}
 LABEL = {"data": "자료 (Heun)", "node": "자료 (neural ODE, torchdiffeq)", "pi": "자료 + 물리 잔차", "pi_only": "물리 잔차만",
+         "hybrid": "물리 연산자 + 학습 닫힘항 (하이브리드)", "phys": "물리 연산자만 (학습 없음)",
          "fwd": "Raissi PINN (t=0 자료 + 물리)", "fit": "Raissi PINN (매시간 자료 + 물리)"}
 
 

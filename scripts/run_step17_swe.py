@@ -13,6 +13,9 @@ arms (grid learners, the same ClimODE ResNet tendency net f_theta):
     pi       data + lambda_p x strong-form residual |f_theta(x) - F(x)|^2 at the rollout states, F = the
              solver's right-hand side at the learners' resolution (step 16's physics term with an exact operator)
     pi_only  the residual alone on data states (no trajectories: "learn the physics directly")
+    hybrid   physics as structure (owner 23:23): the learners' own equations integrated by RK4 for one hour,
+             then a learned hourly closure on the advanced state (NeuralGCM form), rollout MSE
+    phys     the learners' equations alone, no learning (what the truncated operator does by itself)
     raissi   maziarraissi/PINNs forward problem per test window: data at t = 0 on the grid + the SWE residual
              by autograd in (lambda, phi, t) on [0, T]; "fit" variant also sees data at every hour (interpolation)
 
@@ -36,10 +39,10 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
-from pgcfm.swe import (CHANNELS, HOUR, Normalizer, SWEPinn, TendencyNet, World, rollout_heun,  # noqa: E402
-                       rollout_node, sample_sphere_time, strong_residual)
+from pgcfm.swe import (CHANNELS, HOUR, HybridNet, Normalizer, SWEPinn, TendencyNet, World,  # noqa: E402
+                       rollout_heun, rollout_node, rollout_steps, sample_sphere_time, strong_residual)
 
-GRID_ARMS = ("data", "node", "pi", "pi_only")
+GRID_ARMS = ("data", "node", "pi", "pi_only", "hybrid", "phys")
 
 
 def main(argv=None):
@@ -72,6 +75,10 @@ def main(argv=None):
     p.add_argument("--pinn-colloc", type=int, default=8192)
     p.add_argument("--pinn-T", type=int, nargs="+", default=[6, 24], help="forward horizons (h)")
     p.add_argument("--pinn-windows", type=int, default=2)
+    p.add_argument("--hybrid-substeps", type=int, default=2, help="RK4 steps per hour of the physics in the "
+                   "hybrid / phys arms (30 min: stable for the gravity waves at T21 and T42)")
+    p.add_argument("--hybrid-closure", type=int, default=1, help="1 = the solver's hyperdiffusion is part of "
+                   "the physics the hybrid is given (a coarse dycore has its own diffusion)")
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true", help="keep the arms already in <out>/<tag>.json (same data "
@@ -163,6 +170,8 @@ def main(argv=None):
         return nz.norm(x), F
 
     def rollout(arm, net, z0, hours):
+        if arm in ("hybrid", "phys"):
+            return rollout_steps(net, z0, hours)
         if arm == "node":
             return rollout_node(net, z0, hours, method=a.node_method, step=a.node_step)
         return rollout_heun(net, z0, hours, substeps=a.substeps)
@@ -183,11 +192,16 @@ def main(argv=None):
     tr = np.random.default_rng(a.seed + 1)
     for arm in [q for q in a.arms if q in GRID_ARMS]:
         torch.manual_seed(a.seed)
-        net = TendencyNet(learn, nz.t1, a.hidden, tuple(a.blocks))
-        opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
+        if arm in ("hybrid", "phys"):
+            net = HybridNet(learn, nz.mean, nz.std, nz.t1, a.hidden, tuple(a.blocks), a.hybrid_substeps,
+                            bool(a.hybrid_closure), learn=arm == "hybrid")
+        else:
+            net = TendencyNet(learn, nz.t1, a.hidden, tuple(a.blocks))
+        iters = a.iters if arm != "phys" else 0  # phys has nothing to learn
+        opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-4) if iters else None
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters) if iters else None
         t1, hist, curve = time.time(), [], []
-        for it in range(a.iters):
+        for it in range(iters):
             z, F = windows(train, a.batch, a.K, tr)
             loss, parts = loss_of(arm, net, z, F)
             opt.zero_grad()
@@ -195,7 +209,7 @@ def main(argv=None):
             torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             opt.step(), sched.step()
             hist.append(float(loss))
-            if (it + 1) % max(1, a.iters // 10) == 0 or it == a.iters - 1:
+            if (it + 1) % max(1, iters // 10) == 0 or it == iters - 1:
                 net.eval()
                 with torch.no_grad():
                     vl = float(np.mean([float(loss_of(arm, net, z_, F_)[0]) for z_, F_ in vw]))

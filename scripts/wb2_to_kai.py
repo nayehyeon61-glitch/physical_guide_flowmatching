@@ -30,7 +30,9 @@ import xarray as xr
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
 
-URL = "https://storage.googleapis.com/weatherbench2/datasets/era5/1959-2023_01_10-6h-64x32_equiangular_conservative.zarr"
+URLS = {"64x32": "https://storage.googleapis.com/weatherbench2/datasets/era5/1959-2023_01_10-6h-64x32_equiangular_conservative.zarr",
+        "128x64": "https://storage.googleapis.com/weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_conservative.zarr"}
+URL = URLS["64x32"]
 UPPER = {"z": "geopotential", "q": "specific_humidity", "t": "temperature",
          "u": "u_component_of_wind", "v": "v_component_of_wind"}
 SURF = {"t2m": "2m_temperature", "sp": "surface_pressure", "tcwv": "total_column_water_vapour",
@@ -42,8 +44,8 @@ CLIMODE = {"z": ("geopotential", 500, "geopotential_500"), "t": ("temperature", 
 SOLAR_CONSTANT = 1361.0
 
 
-def open_wb2():
-    return xr.open_zarr(URL, storage_options={"client_kwargs": {"trust_env": True}})
+def open_wb2(grid: str = "64x32"):
+    return xr.open_zarr(URLS[grid], storage_options={"client_kwargs": {"trust_env": True}})
 
 
 def tisr_1h(times, lat_deg, lon_deg, n_sub=12):
@@ -65,11 +67,14 @@ def tisr_1h(times, lat_deg, lon_deg, n_sub=12):
     return out
 
 
-def kai_year(ds, year, hour, path):
-    """``hour=None``: every 6 h time of the year."""
+def kai_year(ds, year, hour, path, days_step=None, grid="64x32"):
+    """``hour=None``: every 6 h time of the year; ``days_step`` keeps only every n-th day (all its times:
+    the step 18 resolution test needs 6 h triples, not whole years)."""
     sel = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31"))
     if hour is not None:
         sel = sel.sel(time=sel.time.dt.hour == hour)
+    if days_step:
+        sel = sel.sel(time=((sel.time.dt.dayofyear - 1) % days_step) == 0)
     times = sel.time.values
     lat, lon = sel.latitude.values, sel.longitude.values
     T, H, W = len(times), len(lat), len(lon)
@@ -100,7 +105,7 @@ def kai_year(ds, year, hour, path):
         out.createVariable("latitude", "f8", ("latitude",))[:] = lat
         out.createVariable("longitude", "f8", ("longitude",))[:] = lon
         when = "6-hourly" if hour is None else f"{hour:02d} UTC"
-        out.title = f"ERA5 (WeatherBench2 64x32 conservative) {when} snapshots, KAI channel layout"
+        out.title = f"ERA5 (WeatherBench2 {grid} conservative) {when} snapshots, KAI channel layout"
     os.replace(path + ".tmp", path)
     return f
 
@@ -135,8 +140,10 @@ def main(argv=None):
     p.add_argument("--hour", type=int, default=12, help="UTC hour of the daily KAI snapshot")
     p.add_argument("--all-hours", action="store_true", help="every 6 h time, to <out>/kai6h")
     p.add_argument("--no-climode", action="store_true")
+    p.add_argument("--grid", default="64x32", choices=list(URLS), help="128x64 = 2.8125 deg (step 18)")
+    p.add_argument("--days-step", type=int, default=None, help="keep every n-th day only (all its times)")
     a = p.parse_args(argv)
-    ds = open_wb2()
+    ds = open_wb2(a.grid)
     kai = os.path.join(a.out, "kai6h" if a.all_hours else "kai")
     os.makedirs(kai, exist_ok=True)
     if not a.no_climode and not os.path.exists(os.path.join(a.out, "era5_data", "constants", "constants_5.625deg.nc")):
@@ -144,7 +151,7 @@ def main(argv=None):
     for y in a.years:
         path = os.path.join(kai, f"{y}.nc")
         if not os.path.exists(path):
-            kai_year(ds, y, None if a.all_hours else a.hour, path)
+            kai_year(ds, y, None if a.all_hours else a.hour, path, a.days_step, a.grid)
         if not a.no_climode:
             climode_year(ds, y, os.path.join(a.out, "era5_data"))
         print(f"{y} done", flush=True)

@@ -178,6 +178,54 @@ def rollout_node(net: nn.Module, x0: torch.Tensor, hours: int, method: str = "rk
     return y[1:].transpose(0, 1)
 
 
+class HybridNet(nn.Module):
+    """NeuralGCM-style hybrid at the learners' resolution (step 17 arm ``hybrid``, owner 2026-10-27 23:23):
+    one hour = the world's own equations (the inviscid right-hand side plus, with ``closure``, the solver's
+    hyperdiffusion as a tendency) integrated by RK4 in spectral space with ``substeps`` steps, then a learned
+    hourly closure N_theta(y) * t1 (zero-initialized head) on the physics-advanced state y. With ``learn``
+    False it is the truncated physics alone (arm ``phys``). ``forward`` returns the hourly increment, so
+    ``strong_residual`` reads it as the 1 h mean tendency."""
+
+    def __init__(self, world: World, mean: torch.Tensor, std: torch.Tensor, t1: torch.Tensor, hidden: int = 32,
+                 blocks: Tuple[int, ...] = (2, 2), substeps: int = 2, closure: bool = True, learn: bool = True):
+        super().__init__()
+        self.world, self.substeps, self.closure = world, substeps, closure
+        self.register_buffer("mean", mean.view(1, 3, 1, 1).double().clone())
+        self.register_buffer("std", std.view(1, 3, 1, 1).double().clone())
+        self.net = TendencyNet(world, t1, hidden, blocks) if learn else None
+
+    def _rhs(self, us: torch.Tensor) -> torch.Tensor:
+        return torch.stack([self.world.tendency_spec(u, self.closure) for u in us])
+
+    def phys_step(self, z: torch.Tensor) -> torch.Tensor:
+        """One hour of the physics: normalized (B, 3, H, W) -> normalized."""
+        us = self.world.spec(z.double() * self.std + self.mean)
+        h = HOUR / self.substeps
+        for _ in range(self.substeps):
+            k1 = self._rhs(us)
+            k2 = self._rhs(us + 0.5 * h * k1)
+            k3 = self._rhs(us + 0.5 * h * k2)
+            k4 = self._rhs(us + h * k3)
+            us = us + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return ((self.world.grid(us) - self.mean) / self.std).to(z.dtype)
+
+    def step(self, z: torch.Tensor) -> torch.Tensor:
+        y = self.phys_step(z)
+        return y + self.net(y) if self.net is not None else y
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.step(z) - z
+
+
+def rollout_steps(net: nn.Module, x0: torch.Tensor, hours: int) -> torch.Tensor:
+    """(B, hours, 3, H, W): hourly maps x -> net.step(x) (the hybrid and physics-only arms)."""
+    x, out = x0, []
+    for _ in range(hours):
+        x = net.step(x)
+        out.append(x)
+    return torch.stack(out, 1)
+
+
 class Normalizer:
     """z-scores per channel; tendency std per hour; physical <-> normalized."""
 
