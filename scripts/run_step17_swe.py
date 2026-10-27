@@ -74,6 +74,8 @@ def main(argv=None):
     p.add_argument("--pinn-windows", type=int, default=2)
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--resume", action="store_true", help="keep the arms already in <out>/<tag>.json (same data "
+                   "seeds) and run only the missing ones")
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
@@ -132,6 +134,13 @@ def main(argv=None):
            "data": {"std": nz.std.view(-1).tolist(), "mean": nz.mean.view(-1).tolist(), "t1": nz.t1.tolist(),
                     "b": b.tolist(), "wind_rms": float(frames[:, 1:].pow(2).mean().sqrt())},
            "tests": [(k, t) for k, t, _, _ in tests], "arms": {}, "raissi": {}}
+    jpath = os.path.join(a.out, f"{tag}.json")
+    if a.resume and os.path.exists(jpath):
+        old = json.load(open(jpath))
+        res["arms"], res["raissi"] = old.get("arms", {}), old.get("raissi", {})
+        res["resumed_from"] = {"arms": list(res["arms"]), "raissi": list(res["raissi"])}
+        a.arms = [q for q in a.arms if q not in res["arms"] and not (q == "raissi" and res["raissi"])]
+        log(f"  resumed: keeping {res['resumed_from']}, running {a.arms}")
 
     # closure gap: the learners' operator vs the exact tendency of the truncated truth, on truth states
     with torch.no_grad():
