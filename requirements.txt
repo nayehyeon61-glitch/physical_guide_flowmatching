@@ -18,3 +18,7 @@ scoringrules
 properscoring
 zarr
 aiohttp
+pytorch-lightning
+einops
+omegaconf
+tensordict
