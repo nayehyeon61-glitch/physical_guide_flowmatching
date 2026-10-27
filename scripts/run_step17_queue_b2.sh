@@ -1,8 +1,7 @@
 #!/bin/bash
-# step 17 full42, remaining arms (the first run was OOM-killed in the node arm while queue d sampled
-# ensembles): waits for queue d, then resumes node / pi / pi_only on the saved data arm.
+# step 17 full42, remaining arms: the first run was OOM-killed in the node arm at 17:17 UTC together with the
+# queue d sampling (9.3 GB + 4.7 GB > the 14.3 GB cgroup). Runs alone now; queue d2 waits for its done file.
 cd "$(dirname "$0")/.."
-while [ ! -f runs/step16/queue16d.done ]; do sleep 60; done
 export OMP_NUM_THREADS=1
 python scripts/run_step17_swe.py --out runs/step17 --setting full --res 42 --hidden 16 --iters 1000 \
     --arms node pi pi_only --resume --threads 2 > runs/step17/full42_b.log 2>&1
