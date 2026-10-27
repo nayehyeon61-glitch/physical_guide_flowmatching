@@ -1,14 +1,22 @@
-"""Step 13 broad run (train 1979-2015): Korean PDF summary of the scores, logs and figures.
+"""Step 13 broad run: Korean PDF summary read from the run directory's JSON outputs (nothing copied from logs).
 
-Reads runs/step13_broad/score_best.json (arm metrics + bootstrap vs seqregress_pinn) and embeds the two
-figures in docs/step13_broad. The numbers quoted from the logs (raw / PINN base models, flow-dependence,
-operator ablation) are copied from runs/step13_broad/*.log of the 10-27 run. Needs reportlab (not in
-requirements.txt) and a TrueType font with Hangul (DroidSansFallback).
+Inputs under --runs (a missing file drops its section, the PDF says so):
+  score_best.json                score_step13.py: arms (crps/rmse/ssr/..., leads x vars), bootstrap vs the reference
+  seqfm_dct_pinn.json            stage 2 FM: args, "test" (raw / pinn arms, truth residual), run record, best_it
+  seqregress_pinn.json           stage 2 regression ensemble, same layout
+  pinn_project.json              stage 1 PINN: args, run record, train_seconds
+  flowdep.json                   diag_step13_flowdep.py: spread-error diagnostics per arm
+  operator_seqfm_dct_pinn.json   operator ablation on the FM ensemble (deterministic means), optional
+  <tag>.pt_metrics.csv           training curves written by pgcfm.runs.fit -> fig_training.png in --out
+Figures made by plot_step13_broad.py (fig_broad.png, fig_broad_vs_climode.png) are embedded when they exist
+in --out. Needs reportlab (not in requirements.txt) and a TrueType font with Hangul (FONTS, first found).
 
-    python scripts/report_step13_broad.py --scores runs/step13_broad/score_best.json --out docs/step13_broad
+    python scripts/report_step13_broad.py --runs runs/step13_broad --out docs/step13_broad
 """
 
 import argparse
+import csv
+import datetime
 import json
 import os
 
@@ -21,16 +29,42 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-FONT_PATH = "/usr/share/fonts/google-droid/DroidSansFallback.ttf"
+FONTS = (  # TrueType outlines with Hangul; the first that exists is used (a .ttc takes its first face)
+    "/usr/share/fonts/google-droid/DroidSansFallback.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+)
 FONT = "KR"
 INK, MUTED, GRID, ACCENT, HEAD_BG = "#0b0b0b", "#52514e", "#d9d8d4", "#e34948", "#f1f0ec"
-ARMS = (
-    ("seqregress_pinn", "seqregress + PINN"),
+REF = "seqregress_pinn"
+ARMS = (  # score arms in the order of the table; absent ones are skipped
+    (REF, "seqregress + PINN"),
     ("seqfm_dct_pinn_regm_band", "regm_band"),
     ("seqfm_dct_pinn_regm_flow", "regm_flow"),
     ("seqfm_dct_pinn_regm_flowop", "regm_flowop"),
+    ("seqfm_dct_pinn_regm_sband_clim_flow", "regm_sband_clim_flow"),
 )
-LEAD_IDX = (0, 2, 5)  # 24 / 72 / 144 h
+STAGES = (("pinn_project", "PINN projection"), ("seqfm_dct", "seqfm_dct (flow matching)"),
+          ("seqregress", "seqregress (regression ensemble)"))
+SHOW_H = (24, 72, 144)
+VAR_NAMES = {"z": "z500", "t": "t850", "t2m": "t2m", "u10": "u10", "v10": "v10"}
+NEXT_STEPS = (  # the owner's proposals after the 2026-10-27 run (judgement, not numbers)
+    "FM 자체의 과분산 (SSR ≈ 2)과 작은 스케일 과대 파워를 줄이는 것이 우선 — guide가 보정하는 몫을 줄임.",
+    "flowop은 flow 대비 이득이 없으므로 단순한 regm_flow를 기본 arm으로 채택.",
+    "Flow-dependence 강화: spread field 입력에 흐름 정보 (예: 회귀 앙상블 분산, 블로킹 지표)를 추가하는 실험.",
+    "하위 tercile day-6 BSS 음수의 원인 (평균 편향 vs spread) 분해.",
+)
+
+
+def register_font():
+    for path in FONTS:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont(FONT, path, subfontIndex=0))
+            pdfmetrics.registerFontFamily(FONT, normal=FONT, bold=FONT, italic=FONT, boldItalic=FONT)
+            return path
+    raise FileNotFoundError("no Hangul TrueType font found; install one of " + ", ".join(FONTS))
 
 
 def styles():
@@ -73,6 +107,12 @@ def fmt3(vals, nd):
     return " / ".join(f"{v:.{nd}f}" if nd else f"{v:.0f}" for v in vals)
 
 
+def rng_text(vals, nd=2):
+    """'0.27' when the values agree to the last digit, else '0.29–0.31'."""
+    lo, hi = min(vals), max(vals)
+    return f"{lo:.{nd}f}" if f"{lo:.{nd}f}" == f"{hi:.{nd}f}" else f"{lo:.{nd}f}–{hi:.{nd}f}"
+
+
 def figure(path, width):
     from reportlab.lib.utils import ImageReader
 
@@ -80,136 +120,302 @@ def figure(path, width):
     return Image(path, width=width, height=width * h / w)
 
 
-def build(scores, out_dir):
-    pdfmetrics.registerFont(TTFont(FONT, FONT_PATH))
-    # the font has no bold face; <b> maps to the same face
-    pdfmetrics.registerFontFamily(FONT, normal=FONT, bold=FONT, italic=FONT, boldItalic=FONT)
+def load(runs, name):
+    path = os.path.join(runs, name)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def years_text(ys):
+    ys = sorted(int(y) for y in ys)
+    return f"{ys[0]}–{ys[-1]}" if len(ys) > 1 and ys[-1] - ys[0] == len(ys) - 1 else ", ".join(map(str, ys))
+
+
+def run_rows(stages):
+    """One row per stage: iterations, batch, device, commit, hours, best iteration, how it stopped."""
+    rows = [["단계", "it × batch", "device", "commit", "학습 시간", "best it / 종료"]]
+    for tag, name in STAGES:
+        r = stages.get(tag)
+        if r is None:
+            rows.append([name, "-", "-", "-", "-", "(json 없음)"])
+            continue
+        ar, run = r.get("args", {}), r.get("run") or {}
+        secs = r.get("train_seconds")
+        commit = str(run.get("commit", "-"))[:8] + (" (dirty)" if run.get("dirty") else "")
+        best = r.get("best_it")
+        rows.append([name, f"{ar.get('iters', '-')} × {ar.get('batch', '-')}",
+                     str(run.get("device_name", run.get("device", "기록 없음"))), commit,
+                     f"{secs / 3600:.2f} h" if isinstance(secs, (int, float)) else "-",
+                     (f"{best} / " if best is not None else "") + str(r.get("stopped", "-"))])
+    return rows
+
+
+def training_figure(runs, out_dir, stages):
+    """fig_training.png from <tag>.pt_metrics.csv (pgcfm.runs.fit): train loss (and validation loss where
+    it was measured) over the iterations of each stage, the selected iteration marked."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    found = []
+    for tag, name in STAGES:
+        path = os.path.join(runs, f"{tag}.pt_metrics.csv")
+        if os.path.exists(path):
+            with open(path) as f:
+                found.append((tag, name, list(csv.DictReader(f))))
+    if not found:
+        return None
+    fig, axes = plt.subplots(1, len(found), figsize=(5.2 * len(found), 3.8), layout="constrained", squeeze=False)
+    for ax, (tag, name, rows) in zip(axes[0], found):
+        tr = [(int(r["it"]), float(r["train_loss"])) for r in rows if r["train_loss"]]
+        va = [(int(r["it"]), float(r["val_loss"])) for r in rows if r["val_loss"]]
+        if tr:
+            ax.plot(*zip(*tr), color="#2a78d6", lw=2, label="train (mean of the log window)")
+        if va:
+            ax.plot(*zip(*va), color="#e34948", lw=2, marker="o", ms=4, label="validation")
+        best = (stages.get(tag) or {}).get("best_it")
+        if best is not None and best >= 0:
+            ax.axvline(best, color=MUTED, lw=1, ls=":", label=f"selected it {best}")
+        ax.set_title(name, fontsize=11)
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("loss")
+        ax.grid(True, color="#e4e3df", lw=0.8)
+        ax.set_axisbelow(True)
+        for s_ in ("top", "right"):
+            ax.spines[s_].set_visible(False)
+        ax.legend(fontsize=8, frameon=False)
+    path = os.path.join(out_dir, "fig_training.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def build(runs, out_dir, scores_name="score_best.json"):
+    register_font()
+    os.makedirs(out_dir, exist_ok=True)
     st = styles()
-    arms = scores["arms"]
-    boot = scores["bootstrap_vs_seqregress_pinn"]
     full_w = A4[0] - 36 * mm
+    scores = load(runs, scores_name)
+    stages = {tag: load(runs, f"{tag}.json") for tag, _ in STAGES}
+    fm, reg = stages["seqfm_dct"], stages["seqregress"]
+    for tag in ("seqfm_dct", "seqregress"):  # stage 2 writes <tag>_pinn.json when it ran through the PINN
+        if stages[tag] is None:
+            stages[tag] = load(runs, f"{tag}_pinn.json")
+    fm, reg = stages["seqfm_dct"], stages["seqregress"]
+    flowdep, operator = load(runs, "flowdep.json"), load(runs, "operator_seqfm_dct_pinn.json")
+    paper = load(os.path.join(os.path.dirname(__file__), "..", "docs", "step11"), "climode_paper_tables.json")
+    paper_z = {int(h): v["z"] for h, v in paper["rmse"]["ClimODE"].items()} if paper else {}
+    missing = []
     story = []
 
     story += [
         Paragraph("Step 13 broad run 결과 요약", st["title"]),
         Spacer(1, 4),
-        Paragraph("physical_guide_flowmatching · branch claude/project-thread-43gbu8 · 2026-10-27", st["sub"]),
+        Paragraph(f"physical_guide_flowmatching · {os.path.basename(os.path.abspath(runs))} · "
+                  f"{datetime.date.today().isoformat()}", st["sub"]),
         Spacer(1, 10),
     ]
 
-    story.append(Paragraph("1. 실험 설정", st["h1"]))
-    story += bullets([
-        "데이터: 실제 ERA5를 5.625°로 보수적 regrid (fake data 미사용). 학습 1979–2015, 검증 2016, "
-        "테스트 2017–2018 (ClimODE와 같은 360 IC), 앙상블 8 member.",
-        "모델: PINN projection 8000 it (batch 8), seqfm_dct (flow matching) 40000 it (batch 16), "
-        "seqregress (회귀 앙상블) 40000 it (batch 16) — GPU. Guide 적합과 채점은 CPU.",
-        "Guide arm: <b>regm_band</b> = a + b·회귀 평균 + c·x(t) + FM 편차 + band Γ, "
-        "<b>regm_flow</b> = regm_band + flow-dependent spread field, "
-        "<b>regm_flowop</b> = regm_band + operator spread field.",
-        "Run 종료: 2026-10-27 01:04 (본 실험 + operator ablation 모두 exit 0). 결과: runs/step13_broad/.",
-    ], st)
+    # -- 1. setup, from the stage arguments and run records ------------------------------------------
+    story.append(Paragraph("1. 실험 설정 (각 단계 json의 args / run 기록)", st["h1"]))
+    src = fm or reg
+    if src:
+        ar = src["args"]
+        members = ar.get("members", "-")
+        items = [f"데이터: 실제 ERA5 5.625°. 학습 {years_text(ar['train_years'])}, 검증 {ar['val_year']}, "
+                 f"테스트 {years_text(ar['test_years'])}, 앙상블 {members} member, K = {ar.get('K', '-')} (6 h 간격)."]
+        for tag, name in STAGES:
+            r = stages.get(tag)
+            if r:
+                a_, run = r["args"], r.get("run") or {}
+                dev = run.get("device_name") or ("기록 없음 (pgcfm.runs 이전 버전)" if not run else run.get("device"))
+                items.append(f"{name}: {a_.get('iters', '-')} it, batch {a_.get('batch', '-')}, lr {a_.get('lr', '-')}, "
+                             f"device {dev}" + (f", 검증 매 {a_['val_every']} it" if a_.get("val_every") else ""))
+        story += bullets(items, st)
+    else:
+        missing.append("seqfm_dct_pinn.json / seqregress_pinn.json")
+        story += bullets(["단계 json이 없어 설정을 읽지 못함."], st)
 
+    # -- 2. conclusions, filled from the score json ----------------------------------------------------
     story.append(Paragraph("2. 핵심 결론", st["h1"]))
-    story += bullets([
-        "FM + PINN + regm guide가 이번 run의 최선. z500 144h RMSE 741로 회귀 앙상블(789)과 "
-        "ClimODE 논문(784)보다 낮고, z500 144h CRPS는 회귀 대비 약 8% 개선 (0.0310 vs 0.0338).",
-        "Bootstrap 95% CI: 세 guide arm 모두 <b>모든 변수 × 모든 lead</b>에서 CRPS가 seqregress_pinn보다 "
-        "유의하게 낮음 (차이의 CI 상한이 전부 0 미만).",
-        "세 arm 간 차이는 0.6% 이내. 전체 fair CRPS: band 0.1595, flow 0.1585, flowop 0.1585 — "
-        "flowop은 flow 대비 이득 없음.",
-        "Calibration: guide arm의 z500 SSR은 1.10–1.23으로 안정적 (회귀는 144h에서 1.33). "
-        "단, 여전히 약간 과분산이고 day-6 하위 tercile BSS는 -0.17.",
-        "Flow-dependence는 약함: spread–오차 상관 band ≈ 0.01, flow 0.08–0.10, flowop 0.04–0.07.",
-    ], st)
+    if scores:
+        arms, vars_ = scores["arms"], scores["vars"]
+        leads = list(arms[next(iter(arms))].get("leads", (24, 48, 72, 96, 120, 144)))
+        iz, il, hl = vars_.index("z"), len(leads) - 1, leads[-1]  # the longest lead of the run
+        show = [h for h in SHOW_H if h in leads] or [hl]
+        idx = [leads.index(h) for h in show]
+        show_s = " / ".join(f"{h}" for h in show) + "h"
+        present = [(k, n) for k, n in ARMS if k in arms]
+        guide_arms = [(k, n) for k, n in present if k != REF]
+        boot_key = next((k for k in scores if k.startswith("bootstrap_vs_")), None)
+        boot = scores.get(boot_key, {}) if boot_key else {}
+        items = []
+        if REF in arms and guide_arms:
+            k0, n0 = guide_arms[0]
+            rz, bz = arms[REF]["rmse"][il][iz], arms[k0]["rmse"][il][iz]
+            rc, bc = arms[REF]["crps"][il][iz], arms[k0]["crps"][il][iz]
+            items.append(f"{n0}: z500 {hl} h RMSE {bz:.0f} (회귀 앙상블 {rz:.0f}"
+                         + (f", ClimODE 논문 {paper_z[hl]:.0f}" if hl in paper_z else "")
+                         + f"), z500 {hl} h CRPS {bc:.4f} vs {rc:.4f} ({100 * (rc - bc) / rc:+.1f} %).")
+            fair = {n: sum(sum(r) for r in arms[k]["crps"]) / (len(leads) * len(vars_)) for k, n in present}
+            items.append("전 변수·전 lead 평균 CRPS (정규화): " + ", ".join(f"{n} {v:.4f}" for n, v in fair.items()) + ".")
+            if boot:
+                sig = {n: sum(h < 0 for row in boot[k]["crps"]["hi"] for h in row)
+                       for k, n in guide_arms if k in boot}
+                items.append(f"Bootstrap 95 % CI (vs {boot_key.replace('bootstrap_vs_', '')}): CRPS가 유의하게 낮은 "
+                             f"(변수 × lead) 셀 수 / {len(leads) * len(vars_)}: "
+                             + ", ".join(f"{n} {c}" for n, c in sig.items()) + ".")
+            ssr = {n: rng_text([arms[k]["ssr"][i][iz] for i in range(len(leads))]) for k, n in present}
+            items.append("z500 SSR (lead 범위): " + ", ".join(f"{n} {v}" for n, v in ssr.items())
+                         + f". {hl} h z500 하위 tercile BSS: {n0} {arms[k0]['bss_lower'][il][iz]:.2f}.")
+            pk = "power_ratio_k13-32"
+            if pk in arms[k0]:
+                items.append(f"작은 스케일 파워 (k13–32, 1이 완벽) z500 {hl} h: {n0} {arms[k0][pk][il][iz]:.1f}, "
+                             f"회귀 {arms[REF][pk][il][iz]:.1f}.")
+        if flowdep:
+            corr = {k: rng_text([v["case_corr"] for v in flowdep[k].values()]) for k in flowdep}
+            items.append("Flow-dependence (spread–|오차| case 상관, z500/t850 24–144 h): "
+                         + ", ".join(f"{k.replace('seqfm_dct_pinn_', '')} {v}" for k, v in corr.items()) + ".")
+        story += bullets(items or ["score json에 비교할 arm이 없음."], st)
+    else:
+        missing.append(scores_name)
+        story += bullets([f"{scores_name} 없음: 결론을 채우지 못함."], st)
 
-    story.append(Paragraph("3. 기본 모델 (guide 이전, 테스트 2017–18, z500)", st["h1"]))
-    rows = [
-        ["모델", "RMSE 24 / 144h (m²/s²)", "CRPS 24 / 144h", "SSR 24 / 144h", "정역학 잔차"],
-        ["seqfm_dct raw", "371 / 935", "0.0176 / 0.0415", "2.08 / 1.70", "7.97"],
-        ["seqfm_dct + PINN", "372 / 933", "0.0176 / 0.0413", "2.08 / 1.69", "5.42"],
-        ["seqregress raw", "170 / 790", "0.0077 / 0.0339", "1.25 / 1.34", "5.22"],
-        ["seqregress + PINN", "170 / 789", "0.0077 / 0.0338", "1.25 / 1.33", "3.76"],
-    ]
-    story.append(table(rows, [38 * mm, 38 * mm, 32 * mm, 28 * mm, 26 * mm], st))
-    story.append(Spacer(1, 3))
-    story += bullets([
-        "FM 단독은 회귀보다 크게 나쁘고 spread가 오차의 약 2배 (SSR ≈ 2).",
-        "PINN projection은 정확도를 거의 바꾸지 않지만 물리 잔차, 특히 정역학 잔차를 줄임 "
-        "(진짜 대기 잔차 기준 ≈ 1).",
-    ], st)
+    # -- 3. base models, from the stage 2 test dicts -------------------------------------------------
+    story.append(Paragraph("3. 기본 모델 (guide 이전, 테스트 기간, z500)", st["h1"]))
+    first = (fm or reg or {}).get("test", {}).get("raw", {}).get("rmse", {"24": 0})
+    h0, h1 = min(first, key=int), max(first, key=int)  # shortest and longest lead of the stage 2 run
+    rows = [["모델", f"RMSE {h0} / {h1}h (m²/s²)", f"CRPS {h0} / {h1}h", f"SSR {h0} / {h1}h", "정역학 잔차"]]
+    truth_hyd = None
+    for r, name in ((fm, "seqfm_dct"), (reg, "seqregress")):
+        if not r:
+            continue
+        t = r["test"]
+        truth_hyd = t.get("truth_residual", {}).get("hyd", truth_hyd)
+        for arm, suffix in (("raw", " raw"), ("pinn", " + PINN")):
+            if arm in t:
+                q = t[arm]
+                rows.append([name + suffix, fmt3([q["rmse"][h0]["z"], q["rmse"][h1]["z"]], 0),
+                             fmt3([q["crps_ens"][h0]["z"], q["crps_ens"][h1]["z"]], 4),
+                             fmt3([q["ssr"][h0]["z"], q["ssr"][h1]["z"]], 2), f"{q['residual']['hyd']:.2f}"])
+    if len(rows) > 1:
+        story.append(table(rows, [38 * mm, 38 * mm, 32 * mm, 28 * mm, 26 * mm], st))
+        story.append(Spacer(1, 3))
+        items = ["CRPS는 앙상블 CRPS (정규화 z500). 잔차는 PINN guide의 방정식별 정규화 RMS"
+                 + (f"; 실제 대기 (truth) 정역학 잔차 {truth_hyd:.2f}." if truth_hyd is not None else ".")]
+        if fm and reg and "raw" in fm["test"] and "raw" in reg["test"]:
+            items.append(f"FM 단독 z500 {h0} h RMSE {fm['test']['raw']['rmse'][h0]['z']:.0f} vs 회귀 "
+                         f"{reg['test']['raw']['rmse'][h0]['z']:.0f}; FM SSR {h0} h {fm['test']['raw']['ssr'][h0]['z']:.2f}.")
+        story += bullets(items, st)
+    else:
+        story += bullets(["단계 2 json 없음."], st)
 
-    story.append(Paragraph("4. Guide arm vs 회귀 앙상블 (테스트 2017–18)", st["h1"]))
-    rows = [["arm", "z500 RMSE<br/>24 / 72 / 144h", "t850 RMSE (K)<br/>24 / 72 / 144h",
-             "t2m RMSE (K)<br/>24 / 72 / 144h", "z500 CRPS<br/>24 / 72 / 144h", "z500 SSR<br/>24 / 72 / 144h"]]
-    for key, name in ARMS:
-        a = arms[key]
-        pick = lambda m, v, idx=LEAD_IDX: [a[m][i][v] for i in idx]  # noqa: E731
-        rows.append([name, fmt3(pick("rmse", 0), 0), fmt3(pick("rmse", 1), 2), fmt3(pick("rmse", 2), 2),
-                     fmt3(pick("crps", 0), 4), fmt3(pick("ssr", 0), 2)])
-    story.append(table(rows, [24 * mm, 25 * mm, 27 * mm, 27 * mm, 38 * mm, 33 * mm], st, bold_rows=(2, 3)))
-    story.append(Spacer(1, 3))
+    # -- 4. guide arms, from the score json ----------------------------------------------------------
+    story.append(Paragraph("4. Guide arm vs 회귀 앙상블 (테스트 기간)", st["h1"]))
+    if scores:
+        rows = [["arm", f"z500 RMSE<br/>{show_s}", f"t850 RMSE (K)<br/>{show_s}", f"t2m RMSE (K)<br/>{show_s}",
+                 f"z500 CRPS<br/>{show_s}", f"z500 SSR<br/>{show_s}"]]
+        for key, name in present:
+            a = arms[key]
+            pick = lambda m, v: [a[m][i][vars_.index(v)] for i in idx]  # noqa: E731
+            rows.append([name, fmt3(pick("rmse", "z"), 0), fmt3(pick("rmse", "t"), 2), fmt3(pick("rmse", "t2m"), 2),
+                         fmt3(pick("crps", "z"), 4), fmt3(pick("ssr", "z"), 2)])
+        story.append(table(rows, [24 * mm, 25 * mm, 27 * mm, 27 * mm, 38 * mm, 33 * mm], st,
+                           bold_rows=tuple(i + 1 for i, (k, _) in enumerate(present) if k != REF)[:1]))
+        story.append(Spacer(1, 3))
+        items = ["CRPS는 z500을 정규화한 값. 같은 평균장을 공유하는 arm은 RMSE가 동일."]
+        if boot:
+            hi_max = {n: max(max(r) for r in boot[k]["crps"]["hi"]) for k, n in guide_arms if k in boot}
+            items.append("Bootstrap CRPS 차이의 95 % CI 상한 최댓값: "
+                         + ", ".join(f"{n} {v:.1e}" for n, v in hi_max.items())
+                         + " (음수 = 전 변수·전 lead에서 유의한 개선).")
+        a = arms[guide_arms[0][0]] if guide_arms else {}
+        doob, fall = a.get("doob_ratio_member"), a.get("falling_steps_member")
+        if isinstance(doob, list) and len(doob) > iz and not isinstance(doob[0], list):  # one value per variable
+            items.append(f"{guide_arms[0][1]} z500 Doob ratio {doob[iz]:.2f}"
+                         + (f", falling steps {fall[iz]:.0f}" if isinstance(fall, list) and len(fall) > iz else "")
+                         + " (에너지의 lead 단조성).")
+        story += bullets(items, st)
+    else:
+        story += bullets([f"{scores_name} 없음."], st)
 
-    hi_max = {k: max(max(r) for r in v["crps"]["hi"]) for k, v in boot.items()}
-    story += bullets([
-        "CRPS는 z500을 정규화한 값. 세 arm의 평균장은 공유되므로 RMSE가 동일.",
-        "Bootstrap (vs seqregress_pinn) CRPS 차이의 95% CI 상한 최댓값: "
-        + ", ".join(f"{k.replace('seqfm_dct_pinn_', '')} {v:.1e}" for k, v in hi_max.items())
-        + " — 모두 음수, 즉 전 변수·전 lead에서 유의한 개선.",
-        "작은 스케일 파워 (k13–32, 1이 완벽): z500 144h guide ≈ 5.0, 회귀 11.5. 덜 과하지만 여전히 과대.",
-        "Doob ratio 1.00, falling steps 0 — 에너지가 lead에 따라 단조 증가 (물리적으로 일관).",
-    ], st)
-
+    # -- 5. figures ----------------------------------------------------------------------------------
     story.append(Paragraph("5. 그림", st["h1"]))
-    story.append(figure(os.path.join(out_dir, "fig_broad.png"), full_w))
-    story.append(Paragraph(
-        "그림 1. RMSE (위)와 CRPS / spread (아래): 회귀 앙상블 (초록), regm arm 3개 (빨강/주황/청록, 거의 겹침), "
-        "persistence, ClimODE 논문 값.", st["cap"]))
-    story.append(Spacer(1, 8))
-    story.append(figure(os.path.join(out_dir, "fig_broad_vs_climode.png"), full_w))
-    story.append(Paragraph(
-        "그림 2. 같은 360 테스트 IC에서의 결정론적 RMSE: ClimODE 논문, 4년 학습 (2012–2015) step 13, "
-        "이번 broad 학습 (1979–2015). 학습 기간 확장으로 모든 lead에서 개선.", st["cap"]))
+    n_fig = 0
+    for name, cap in (("fig_broad.png", "RMSE (위)와 CRPS / spread (아래): 회귀 앙상블, regm arm, persistence, "
+                                        "ClimODE 논문 값 (plot_step13_broad.py)."),
+                      ("fig_broad_vs_climode.png", "같은 테스트 IC에서의 결정론적 RMSE: ClimODE 논문, 4년 학습 step 13, "
+                                                   "이번 broad 학습.")):
+        path = os.path.join(out_dir, name)
+        if os.path.exists(path):
+            n_fig += 1
+            story += [figure(path, full_w), Paragraph(f"그림 {n_fig}. {cap}", st["cap"]), Spacer(1, 8)]
+    tpath = training_figure(runs, out_dir, stages)
+    if tpath:
+        n_fig += 1
+        story += [figure(tpath, full_w),
+                  Paragraph(f"그림 {n_fig}. 학습 곡선 (<tag>.pt_metrics.csv): 학습 손실과 검증 손실, 선택된 iteration.",
+                            st["cap"])]
+    if not n_fig:
+        story += bullets(["그림 없음 (plot_step13_broad.py를 먼저 실행)."], st)
 
+    # -- 6. flow dependence --------------------------------------------------------------------------
     story.append(PageBreak())
     story.append(Paragraph("6. Flow-dependence (spread가 상황별 오차를 따라가는가)", st["h1"]))
-    rows = [
-        ["arm", "spread CV", "spread–|err| 상관", "spread bin (하→상)", "RMSE bin (하→상)"],
-        ["seqregress_pinn", "0.27", "≈ 0.00", "0.64 → 1.40", "1.00 → 1.00"],
-        ["regm_band", "0.27", "0.01", "0.63 → 1.40", "0.98 → 1.02"],
-        ["regm_flow", "0.31–0.32", "0.08–0.11", "0.59 → 1.50", "0.88 → 1.15"],
-        ["regm_flowop", "0.29–0.31", "0.04–0.07", "0.60 → 1.46", "0.92 → 1.09"],
-    ]
-    story.append(table(rows, [36 * mm, 24 * mm, 34 * mm, 34 * mm, 34 * mm], st))
-    story.append(Spacer(1, 3))
-    story += bullets([
-        "z500 / t850, 24–144h 범위 (runs/step13_broad/flowdep.log). spread가 큰 case에서 실제 오차도 큰 정도는 "
-        "flow > flowop > band 순이지만 절대값은 작음.",
-        "Guide가 예측한 σ와 |error|의 case별 상관 (z500): flow_sigma 0.15–0.18, flow_op 0.12–0.16 (2017, 2018).",
-    ], st)
+    if flowdep:
+        rows = [["arm", "spread CV", "spread–|err| 상관", "spread bin (하→상)", "RMSE bin (하→상)"]]
+        for k, v in flowdep.items():
+            vals = list(v.values())
+            rows.append([k.replace("seqfm_dct_pinn_", ""), rng_text([q["cv_spread"] for q in vals]),
+                         rng_text([q["case_corr"] for q in vals]),
+                         f"{rng_text([q['bin_spread'][0] for q in vals])} → {rng_text([q['bin_spread'][-1] for q in vals])}",
+                         f"{rng_text([q['bin_rmse'][0] for q in vals])} → {rng_text([q['bin_rmse'][-1] for q in vals])}"])
+        story.append(table(rows, [36 * mm, 24 * mm, 34 * mm, 34 * mm, 34 * mm], st))
+        story.append(Spacer(1, 3))
+        keys = sorted({q for v in flowdep.values() for q in v})
+        story += bullets([f"flowdep.json의 {', '.join(keys)} 전체에 대한 범위. spread를 5개 bin으로 나눈 뒤 bin별 "
+                          "평균 spread와 RMSE (전체 평균으로 정규화)의 첫 bin → 마지막 bin."], st)
+    else:
+        missing.append("flowdep.json")
+        story += bullets(["flowdep.json 없음."], st)
 
-    story.append(Paragraph("7. Operator ablation (결정론적 평균, 테스트 2017–18)", st["h1"]))
-    rows = [
-        ["평균장", "z500 RMSE 24 / 72 / 144h", "t850 RMSE 24 / 72 / 144h (K)"],
-        ["mean (seqfm_dct_pinn)", "372 / 666 / 933", "2.03 / 3.15 / 3.99"],
-        ["mbmx", "333 / 631 / 863", "1.92 / 3.00 / 3.72"],
-        ["operator", "367 / 643 / 886", "2.00 / 3.01 / 3.81"],
-        ["operator_mean_only", "334 / 600 / 810", "1.84 / 2.75 / 3.40"],
-        ["persistence", "572 / 903 / 1025", "2.70 / 3.91 / 4.25"],
-    ]
-    story.append(table(rows, [50 * mm, 60 * mm, 60 * mm], st, bold_rows=(4,)))
-    story.append(Spacer(1, 3))
-    story += bullets([
-        "FM 앙상블 위의 operator 중 operator_mean_only가 가장 좋지만, 회귀 평균 (z500 170 / 427 / 789)보다는 "
-        "단기에서 크게 뒤짐. guide arm의 평균장이 회귀 평균을 쓰는 이유.",
-    ], st)
+    # -- 7. operator ablation ------------------------------------------------------------------------
+    story.append(Paragraph("7. Operator ablation (결정론적 평균, 테스트 기간)", st["h1"]))
+    if operator:
+        t = operator["test"]
+        names = [k for k in ("mean", "mbmx", "operator", "operator_mean_only", "persistence") if k in t]
+        hs = [h for h in SHOW_H if str(h) in t[names[0]]["rmse"]] or [max(t[names[0]]["rmse"], key=int)]
+        hs_s = " / ".join(map(str, hs)) + "h"
+        rows = [["평균장", f"z500 RMSE {hs_s}", f"t850 RMSE {hs_s} (K)"]]
+        for k in names:
+            rows.append([k + (" (seqfm_dct_pinn)" if k == "mean" else ""),
+                         fmt3([t[k]["rmse"][str(h)]["z"] for h in hs], 0),
+                         fmt3([t[k]["rmse"][str(h)]["t"] for h in hs], 2)])
+        best = min((k for k in names if k != "persistence"), key=lambda k: t[k]["rmse"][str(hs[-1])]["z"])
+        story.append(table(rows, [50 * mm, 60 * mm, 60 * mm], st, bold_rows=(names.index(best) + 1,)))
+        story.append(Spacer(1, 3))
+        items = [f"FM 앙상블 위의 평균장 중 {best}가 z500 {hs[-1]} h에서 최선"]
+        if reg and "pinn" in reg["test"] and all(str(h) in reg["test"]["pinn"]["rmse"] for h in hs):
+            q = reg["test"]["pinn"]["rmse"]
+            items[0] += (f"; 회귀 평균 (z500 {fmt3([q[str(h)]['z'] for h in hs], 0)})이 단기에서 더 낮아 "
+                         "guide arm의 평균장은 회귀 평균을 씀.")
+        story += bullets(items, st)
+    else:
+        story += bullets(["operator_seqfm_dct_pinn.json 없음 (operator ablation을 돌리지 않음)."], st)
 
-    story.append(Paragraph("8. 다음 단계 제안", st["h1"]))
-    story += bullets([
-        "FM 자체의 과분산 (SSR ≈ 2)과 작은 스케일 과대 파워를 줄이는 것이 우선 — guide가 보정하는 몫을 줄임.",
-        "flowop은 flow 대비 이득이 없으므로 단순한 regm_flow를 기본 arm으로 채택.",
-        "Flow-dependence 강화: spread field 입력에 흐름 정보 (예: 회귀 앙상블 분산, 블로킹 지표)를 추가하는 실험.",
-        "하위 tercile day-6 BSS 음수의 원인 (평균 편향 vs spread) 분해.",
-    ], st)
+    # -- 8. run records ------------------------------------------------------------------------------
+    story.append(Paragraph("8. 학습 기록", st["h1"]))
+    story.append(table(run_rows(stages), [40 * mm, 24 * mm, 36 * mm, 26 * mm, 20 * mm, 28 * mm], st))
+    story.append(Spacer(1, 3))
+    story += bullets(["device / commit / best it은 pgcfm.runs로 학습한 run에만 기록됨 (그 전 run은 '기록 없음')."], st)
+
+    story.append(Paragraph("9. 다음 단계 제안 (2026-10-27 run 기준)", st["h1"]))
+    story += bullets(NEXT_STEPS, st)
+    if missing:
+        story += [Spacer(1, 6), Paragraph("빠진 입력: " + ", ".join(missing), st["cap"])]
 
     out = os.path.join(out_dir, "step13_broad_report.pdf")
     doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm,
@@ -219,14 +425,13 @@ def build(scores, out_dir):
     return out
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--scores", default="runs/step13_broad/score_best.json")
+    p.add_argument("--runs", default="runs/step13_broad", help="run directory with the json outputs")
+    p.add_argument("--scores", default="score_best.json", help="score json inside --runs")
     p.add_argument("--out", default="docs/step13_broad")
-    a = p.parse_args()
-    with open(a.scores) as f:
-        scores = json.load(f)
-    print(build(scores, a.out))
+    a = p.parse_args(argv)
+    print(build(a.runs, a.out, a.scores))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,13 @@ ClimODE's protocol, as the owner's four-model comparison (H1-H3, docs/step13_seq
 
     python scripts/run_step13_seqfm.py --kai /home/claude/era5/kai6h --era5 /home/claude/era5/era5_data \
         --out runs/step13 --basis dct --pinn runs/step13/pinn_project.pt [--quick]
+
+Long runs (docs/step15_training_system.md): ``--device cuda [--amp]``, ``--cache DIR`` (memory-mapped
+years), ``--val-every N`` (the model's loss on fixed validation windows, plus the z500 RMSE of a small
+ensemble with ``--val-members``; the best state is kept and selected), ``--patience``, ``--max-hours``
+(saves and exits 75; the same command resumes), ``<tag>.pt_metrics.csv``. The random streams do not
+depend on these options, so the defaults reproduce the earlier script; noise draws stay on the CPU, so
+the members are the same on every device.
 """
 
 import argparse
@@ -52,8 +59,9 @@ from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa:
 from pgcfm.seqdct import (PINNConfig, PINNProjector, SeqFM, SeqFMConfig, SeqRegressor, band_spread,  # noqa: E402
                           hard_constraints, laplacian_roughness, residual_rms, sequence_residual_loss)
 from scripts.run_step11_climode import VARS, climode_minmax, climode_scores, climode_truth  # noqa: E402
+from pgcfm.runs import (EXIT_BUDGET, FitConfig, Prefetch, autocast, device_from, fit, load_years,  # noqa: E402
+                        run_record)
 from scripts.run_step12_core import load_static  # noqa: E402
-from scripts.run_step13_pinn import load_years  # noqa: E402
 
 DYN, OROG = contract.DYNAMIC_CHANNELS, contract.STATIC_CHANNELS
 SRC = {"z": "z500", "t": "t850", "t2m": "t2m", "u10": "u1000", "v10": "v1000"}
@@ -109,92 +117,127 @@ def main(argv=None):
                         "scores only the years generated in this run)")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cpu", help="cpu, cuda, cuda:N or auto")
+    p.add_argument("--amp", action="store_true", help="bf16 autocast on cuda for training (not validated here)")
+    p.add_argument("--cache", default=None, help="folder of memory-mapped normalized years (built once)")
+    p.add_argument("--prefetch", type=int, default=2, help="batches gathered ahead in a thread (0 = none)")
+    p.add_argument("--val-every", type=int, default=0, help="loss on fixed validation windows every N steps; "
+                   "the best state is kept (<tag>.pt.best) and selected at the end (0 = off)")
+    p.add_argument("--n-val-train", type=int, default=16, help="validation windows of --val-every")
+    p.add_argument("--val-members", type=int, default=0,
+                   help="with --val-every: members sampled per validation window for the z500 RMSE (0 = none)")
+    p.add_argument("--patience", type=int, default=0, help="validations without improvement before stopping")
+    p.add_argument("--select", default="best", choices=["best", "last"])
+    p.add_argument("--max-hours", type=float, default=0.0, help="wall-clock budget; saves and exits 75")
+    p.add_argument("--ckpt-every", type=int, default=100)
+    p.add_argument("--ic-chunk", type=int, default=4,
+                   help="ICs generated together (x members); keep it when resuming saved ensembles (noise replay)")
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
         a.train_years, a.iters, a.K, a.channels, a.max_ics, a.members, a.heun = \
             a.train_years[:1], 3, 4, 32, 2, 2, 2
+        a.n_val_train = 2
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
+    dev = device_from(a.device)
     tag = (f"seqfm_{a.basis}" if a.model == "fm" else "seqregress") + ("_quick" if a.quick else "")
     log = lambda s: print(s, flush=True)  # noqa: E731
     stats = os.path.join(a.out, "stats")  # written by run_step13_pinn.py on the same training years
     mean, std = np.load(os.path.join(stats, "global_mean.npy")), np.load(os.path.join(stats, "global_std.npy"))
-    data = load_years(a.kai, a.train_years + [a.val_year], mean, std)
+    data = load_years(a.kai, a.train_years + [a.val_year], mean, std, cache=a.cache)
     with nc.Dataset(os.path.join(a.kai, f"{a.val_year}.nc")) as d:
         contract.register_latitudes(np.asarray(d["latitude"][:]))
     lat, lon, oro, lsm = load_static(a.era5)
     static = static_features(lat, lon, oro, lsm)
     w = torch.from_numpy(np.cos(np.deg2rad(lat)).astype(np.float32))
-    w = (w / w.mean()).view(1, 1, 1, -1, 1)
+    w = (w / w.mean()).view(1, 1, 1, -1, 1).to(dev)
     cfg = SeqFMConfig(K=a.K, basis=a.basis, model_channels=a.channels)
     model = SeqFM(cfg, static) if a.model == "fm" else SeqRegressor(cfg, static)
-    res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "n_params": sum(q.numel() for q in model.unet.parameters())}
-    log(f"[stage 2 {tag}] {res['n_params']} parameters")
+    res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "n_params": sum(q.numel() for q in model.unet.parameters()),
+           "run": run_record(dev)}
+    log(f"[stage 2 {tag}] {res['n_params']} parameters, {res['run']['device_name']} commit {res['run']['commit']}")
     draws = lambda years, n: (batch(data, random_picks(data, years, a.K, rng, 8), a.K) for _ in range(n))  # noqa: E731
+    to_dev = lambda b: tuple(q.to(dev) for q in b)  # noqa: E731
 
     # -- training: each model's own loss (the FM is never trained through the PINN) -----------------
     ck = os.path.join(a.out, f"{tag}.pt")
     if os.path.exists(ck):
-        model.load_state_dict(torch.load(ck))
+        model.load_state_dict(torch.load(ck, map_location="cpu"))
+        model.to(dev)
     else:
         if a.model == "fm":
             model.fit_basis(q[1] for q in draws(a.train_years, 32))
         else:
             model.fit_scale(q[1] for q in draws(a.train_years, 32))
+        model.to(dev)
         opt = torch.optim.Adam(model.unet.parameters(), lr=a.lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
-        part, hist, start, t0 = ck + ".train", [], 0, time.time()
-        if os.path.exists(part):
-            s = torch.load(part, weights_only=False)
-            model.load_state_dict(s["fm"]), opt.load_state_dict(s["opt"]), sched.load_state_dict(s["sched"])
-            hist, start, t0 = s["hist"], s["it"], time.time() - s["seconds"]
-            rng.bit_generator.state = s["rng"]
-            log(f"  resumed at it {start}")
-        model.train()
-        for it in range(start, a.iters):
-            if it > start and it % 100 == 0:
-                torch.save({"fm": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
-                            "hist": hist, "it": it, "seconds": time.time() - t0, "rng": rng.bit_generator.state},
-                           part + ".tmp")
-                os.replace(part + ".tmp", part)
-            h, d, _, hour0 = batch(data, random_picks(data, a.train_years, a.K, rng, a.batch), a.K)
-            loss = model.loss(h, d, hour0) if a.model == "fm" else model.loss(h, d, hour0, w)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.unet.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            hist.append(loss.item())
-            if (it + 1) % max(1, a.iters // 30) == 0:
-                log(f"  it {it + 1:5d} loss {np.mean(hist[-50:]):.4f} {time.time() - t0:.0f}s")
-        model.eval()
+
+        def loss_of(b):
+            h, d, _, hour0 = to_dev(b)
+            return model.loss(h, d, hour0) if a.model == "fm" else model.loss(h, d, hour0, w)
+
+        # fixed validation windows; the FM loss draws its own tau and noise from a fixed seed each time
+        vr = np.random.default_rng(a.seed + 99)
+        vw = [batch(data, random_picks(data, [a.val_year], a.K, vr, a.batch), a.K)
+              for _ in range(0, a.n_val_train, a.batch)] if a.val_every else []
+        iz = DYN_IDX["z"]
+
+        def val_fn():
+            with torch.random.fork_rng(devices=[dev] if dev.type == "cuda" else []):
+                torch.manual_seed(a.seed + 98)
+                out = {"loss": float(np.mean([loss_of(b).item() for b in vw]))}
+                if a.val_members:  # z500 RMSE of the member mean at 24 h and the last lead (normalized units)
+                    gv = torch.Generator().manual_seed(a.seed + 97)
+                    se = {}
+                    for b in vw:
+                        h, d, _, hour0 = to_dev(b)
+                        hm, h0m = h.repeat_interleave(a.val_members, 0), hour0.repeat_interleave(a.val_members)
+                        e = model.sample(hm, h0m, a.heun, generator=gv) if a.model == "fm" \
+                            else model.sample(hm, h0m, generator=gv)
+                        mu = e.view(len(h), a.val_members, *e.shape[1:]).mean(1)
+                        for k in {min(3, a.K - 1), a.K - 1}:
+                            se.setdefault(k, []).append(((mu[:, k, iz] - d[:, k, iz]) ** 2 * w[0, 0]).mean().item())
+                    out.update({f"z500_rmse_{6 * (k + 1)}h": float(np.sqrt(np.mean(v))) for k, v in se.items()})
+            return out
+
+        r = fit(model, model.unet.parameters(), opt, sched,
+                Prefetch(lambda r_: random_picks(data, a.train_years, a.K, r_, a.batch),
+                         lambda p_: batch(data, p_, a.K), rng, a.prefetch),
+                loss_of, FitConfig(iters=a.iters, ckpt_every=a.ckpt_every, log_every=max(1, a.iters // 30),
+                                   val_every=a.val_every, patience=a.patience, select=a.select,
+                                   max_hours=a.max_hours),
+                ck, val_fn=val_fn if a.val_every else None, amp=autocast(dev, a.amp), log=log)
+        if r["stopped"] == "budget":
+            sys.exit(EXIT_BUDGET)
         if a.model == "regress":  # statistical errors: residuals of the regression on the validation year
             with torch.no_grad():
-                model.fit_errors(q[1] - model(q[0], q[3]) for q in draws([a.val_year], 16))
+                model.fit_errors(q[1].to(dev) - model(q[0].to(dev), q[3].to(dev)) for q in draws([a.val_year], 16))
         torch.save(model.state_dict(), ck)
-        if os.path.exists(part):
-            os.remove(part)
-        res.update(train_seconds=time.time() - t0, loss=hist[::10])
+        res.update(train_seconds=r["seconds"], loss=[h["loss"] for h in r["hist"]][::10], val_curve=r["val"],
+                   best_it=r["best_it"], best_val=r["best_val"], stopped=r["stopped"])
     model.eval()
 
     P = None
     if a.pinn:
         pc = json.load(open(a.pinn.replace(".pt", ".json")))["cfg"]
         P = PINNProjector(PINNConfig(**{**pc, "blocks": tuple(pc["blocks"])}), static)
-        P.load_state_dict(torch.load(a.pinn))
+        P.load_state_dict(torch.load(a.pinn, map_location="cpu"))
+        P.to(dev)
         P.eval()
         if P.cfg.K != a.K:
             raise ValueError("PINN and FM need the same K")
     guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
-    est = []
+    est, r_est = [], np.random.default_rng(a.seed)  # its own stream: the scales no longer depend on training/resume
     for _ in range(10):
-        h, d, orog, _ = batch(data, random_picks(data, a.train_years, 1, rng, 16), 1)
+        h, d, orog, _ = batch(data, random_picks(data, a.train_years, 1, r_est, 16), 1)
         est.append({"x0": h[:, -1], "targets": (h[:, -1] + d[:, 0])[:, None], "static": orog, "doy": torch.zeros(16, 1)})
     guide.scales = estimate_scales(guide, est)
     for q in guide.parameters():
         q.requires_grad_(False)
+    guide.to(dev)
 
     # u10/v10 from u1000/v1000 on the validation year (step 11)
     era5 = a.era5
@@ -248,23 +291,23 @@ def main(argv=None):
             n_ic = (len(f_.dimensions["time"]) - 2 - a.K) // 8 + 1
         n_ic = min(n_ic, a.max_ics or n_ic)
         if existing == set(here):  # saved by an earlier run: replay its noise draws (one per chunk) and skip
-            for c0 in range(0, n_ic, 4):
-                torch.randn((min(4, n_ic - c0) * a.members, a.K, contract.N_DYNAMIC, 32, 64), generator=g)
+            for c0 in range(0, n_ic, a.ic_chunk):
+                torch.randn((min(a.ic_chunk, n_ic - c0) * a.members, a.K, contract.N_DYNAMIC, 32, 64), generator=g)
             skipped.append(y)
             log(f"  {y}: ensembles exist, skipped (noise replayed)")
             continue
         here = [arm for arm in here if arm not in existing]
         keep = {arm: {"E": [], "O": [], "X0": [], "ics": []} for arm in (here if score else here[-1:])}
         check_raw = "raw" in existing  # the replayed raw members must equal the saved ones
-        x = data[y] if y == a.val_year else load_years(a.kai, [y], mean, std)[y]
+        x = data[y] if y == a.val_year else load_years(a.kai, [y], mean, std, cache=a.cache)[y]
         truth = climode_truth(era5, y)
         clim = truth.mean(0)
         t0 = time.time()
-        for c0 in range(0, n_ic, 4):
+        for c0 in range(0, n_ic, a.ic_chunk):
             if c0 and c0 % 40 == 0:
                 log(f"    {y}: {c0}/{n_ic} ICs {time.time() - t0:.0f}s")
-            ics = [2 + 8 * e for e in range(c0, min(n_ic, c0 + 4))]
-            h, d, orog, hour0 = batch({y: x}, [(y, i) for i in ics], a.K)
+            ics = [2 + 8 * e for e in range(c0, min(n_ic, c0 + a.ic_chunk))]
+            h, d, orog, hour0 = to_dev(batch({y: x}, [(y, i) for i in ics], a.K))
             B = len(ics)
             hm, h0m, om = h.repeat_interleave(a.members, 0), hour0.repeat_interleave(a.members), \
                 orog.repeat_interleave(a.members, 0)
@@ -285,7 +328,7 @@ def main(argv=None):
                 sel0 = torch.tensor([k * 4 - 1 for k in range(1, a.K // 4 + 1)])
                 mem0 = (x0m[:, None] + ens["raw"][:, sel0]).view(B, a.members, len(sel0), *ens["raw"].shape[2:])
                 e0 = to_vars(hard_constraints(x0m, ens["raw"], mean, std)[0][:, sel0].add(x0m[:, None])
-                             .view_as(mem0).numpy()) - np.repeat(truth[ics][:, None], len(sel0), 1)[:, None]
+                             .view_as(mem0).cpu().numpy()) - np.repeat(truth[ics][:, None], len(sel0), 1)[:, None]
                 ref = z_["E_minus_x0"][:B].astype(np.float32)
                 log(f"    replayed raw vs saved (first ICs): max |diff| {np.abs(e0 - ref).max():.3g}, "
                     f"member scale {np.abs(ref).mean():.3g}")
@@ -330,7 +373,7 @@ def main(argv=None):
             for arm in here:
                 inc = ens[arm]
                 mem = (x0m[:, None] + inc[:, sel]).view(B, a.members, len(sel), *inc.shape[2:])
-                E = to_vars(mem.numpy())  # (B, M, L, 5, H, W)
+                E = to_vars(mem.cpu().numpy())  # (B, M, L, 5, H, W)
                 if a.save_ens and arm in keep:
                     keep[arm]["E"].append((E - X0[:, None]).astype(np.float16)), keep[arm]["O"].append(O)
                     keep[arm]["X0"].append(X0[:, 0]), keep[arm]["ics"].extend(ics)

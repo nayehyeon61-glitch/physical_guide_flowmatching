@@ -18,6 +18,12 @@ Gates (validation year, docs/step13_sequence.md):
 
     python scripts/run_step13_pinn.py --kai /home/claude/era5/kai6h --era5 /home/claude/era5/era5_data \
         --out runs/step13 --objective project [--quick]
+
+Long runs (docs/step15_training_system.md): ``--device cuda [--amp]``, ``--cache DIR`` (memory-mapped
+years instead of RAM), ``--val-every N`` (loss on fixed validation windows, the best state is kept and
+selected, ``--patience`` stops early), ``--max-hours`` (saves and exits 75; the same command resumes),
+``<tag>.pt_metrics.csv`` with the curves. The random streams do not depend on these options, so a run
+with the defaults reproduces the earlier scripts step for step.
 """
 
 import argparse
@@ -26,7 +32,6 @@ import json
 import math
 import os
 import sys
-import time
 
 import netCDF4 as nc
 import numpy as np
@@ -38,6 +43,8 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.balance import BalanceProjector, PositiveMass, ageostrophic  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide, estimate_scales  # noqa: E402
+from pgcfm.runs import (EXIT_BUDGET, FitConfig, Prefetch, autocast, device_from, fit, load_years,  # noqa: E402,F401
+                        run_record, tendency_std)
 from pgcfm.seqdct import (PINNConfig, PINNProjector, SeqDCT, band_spread, residual_rms,  # noqa: E402
                           sequence_residual_loss)
 from scripts.run_step11_climode import channel_stats  # noqa: E402
@@ -46,25 +53,22 @@ from scripts.run_step12_core import load_static  # noqa: E402
 DYN, OROG = contract.DYNAMIC_CHANNELS, contract.STATIC_CHANNELS
 
 
-def load_years(kai, years, mean, std):
-    """{year: (T, 67, H, W) float32 normalized (KAI: std + eps)}."""
-    out = {}
-    for y in years:
-        with nc.Dataset(os.path.join(kai, f"{y}.nc")) as d:
-            f = np.asarray(d["fields"][:], dtype=np.float32)
-        f -= mean[:, None, None]
-        f /= (std + contract.KAI_STD_EPS)[:, None, None]
-        out[y] = torch.from_numpy(f)
-    return out
-
-
-def sample(data, years, K, rng, n):
-    """n random sequences -> x0 (n, 66, H, W), d (n, K, 66, H, W), orog (n, 1, H, W), hour0 (n,)."""
+def pick(data, years, K, rng, n):
+    """n random window starts: (years, indices)."""
     ys = rng.choice(years, n)
-    idx = [int(rng.integers(0, len(data[y]) - K)) for y in ys]
+    return ys, [int(rng.integers(0, len(data[y]) - K)) for y in ys]
+
+
+def gather(data, ys, idx, K):
+    """Windows -> x0 (n, 66, H, W), d (n, K, 66, H, W), orog (n, 1, H, W), hour0 (n,)."""
     seq = torch.stack([data[y][i:i + K + 1] for y, i in zip(ys, idx)])
     x0 = seq[:, 0, DYN]
     return x0, seq[:, 1:, DYN] - x0[:, None], seq[:, 0, OROG], torch.tensor([6.0 * i for i in idx])
+
+
+def sample(data, years, K, rng, n):
+    """n random sequences (pick + gather)."""
+    return gather(data, *pick(data, years, K, rng, n), K)
 
 
 def wmse(a, b, w, t6):
@@ -104,14 +108,26 @@ def main(argv=None):
     p.add_argument("--lambda-geo", type=float, default=0.0,
                    help="weight of the ageostrophic wind (in units of ERA5's own) inside the physics loss")
     p.add_argument("--json-suffix", default="", help="appended to the json name (gates rerun on a checkpoint)")
+    p.add_argument("--device", default="cpu", help="cpu, cuda, cuda:N or auto")
+    p.add_argument("--amp", action="store_true", help="bf16 autocast on cuda (not validated against fp32 here)")
+    p.add_argument("--cache", default=None, help="folder of memory-mapped normalized years (built once)")
+    p.add_argument("--prefetch", type=int, default=2, help="batches gathered ahead in a thread (0 = none)")
+    p.add_argument("--val-every", type=int, default=0, help="training loss on fixed validation windows every N "
+                   "steps; the best state is kept (<tag>.pt.best) and selected at the end (0 = off)")
+    p.add_argument("--n-val-train", type=int, default=8, help="validation windows of --val-every")
+    p.add_argument("--patience", type=int, default=0, help="validations without improvement before stopping")
+    p.add_argument("--select", default="best", choices=["best", "last"])
+    p.add_argument("--max-hours", type=float, default=0.0, help="wall-clock budget; saves and exits 75")
+    p.add_argument("--ckpt-every", type=int, default=50)
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
         a.train_years, a.iters, a.K, a.hidden, a.n_val = a.train_years[:1], 3, 4, 8, 4
-        a.val_chunk, a.fno_width, a.fno_layers = 2, 8, 2
+        a.val_chunk, a.fno_width, a.fno_layers, a.n_val_train = 2, 8, 2, 2
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
+    dev = device_from(a.device)
     os.makedirs(a.out, exist_ok=True)
     tag = f"pinn_{a.objective}" if a.projector == "pinn" else \
         f"pibal_{a.objective}_b{a.bound:g}_g{a.lambda_geo:g}" + ("_nopos" if a.no_positive else "")
@@ -122,15 +138,14 @@ def main(argv=None):
     stats = os.path.join(a.out, "stats")
     channel_stats(a.kai, a.train_years, stats)
     mean, std = np.load(os.path.join(stats, "global_mean.npy")), np.load(os.path.join(stats, "global_std.npy"))
-    data = load_years(a.kai, a.train_years + [a.val_year], mean, std)
+    data = load_years(a.kai, a.train_years + [a.val_year], mean, std, cache=a.cache)
     with nc.Dataset(os.path.join(a.kai, f"{a.val_year}.nc")) as d:
         lat_kai = np.asarray(d["latitude"][:])
     contract.register_latitudes(lat_kai)  # 32 rows without poles
     lat, lon, oro, lsm = load_static(a.era5)
     w = torch.from_numpy(np.cos(np.deg2rad(lat)).astype(np.float32))
-    w = (w / w.mean()).view(1, 1, 1, -1, 1)
-    t6 = torch.sqrt(torch.stack([((data[y][1:, DYN] - data[y][:-1, DYN]) ** 2).mean((0, 2, 3))
-                                 for y in a.train_years]).mean(0)).clamp_min(1e-6).view(1, 1, -1, 1, 1)
+    w = (w / w.mean()).view(1, 1, 1, -1, 1).to(dev)
+    t6 = tendency_std(data, a.train_years, DYN).clamp_min(1e-6).view(1, 1, -1, 1, 1).to(dev)
     guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
     est = []
     for _ in range(10):
@@ -139,8 +154,10 @@ def main(argv=None):
     guide.scales = estimate_scales(guide, est)
     for q in guide.parameters():
         q.requires_grad_(False)
+    guide.to(dev)
     pert = SeqDCT(a.K, contract.N_DYNAMIC, 32, 64, spatial=True)
     pert.fit(sample(data, a.train_years, a.K, rng, 16)[1] for _ in range(16))
+    pert.to(dev)
     cfg = PINNConfig(K=a.K, k_lat=a.k_lat, k_lon=a.k_lon, hidden=a.hidden)
     if a.projector == "pinn":
         P = PINNProjector(cfg, static_features(lat, lon, oro, lsm))
@@ -148,64 +165,71 @@ def main(argv=None):
         P = BalanceProjector(static_features(lat, lon, oro, lsm), mean[DYN], std[DYN], lat, width=a.fno_width,
                              modes=a.fno_modes, n_layers=a.fno_layers, bound=a.bound or None,
                              positive=not a.no_positive)
-    pm = PositiveMass(mean[DYN], std[DYN], lat)
+    P.to(dev)
+    pm = PositiveMass(mean[DYN], std[DYN], lat).to(dev)
     with torch.no_grad():  # ERA5's own ageostrophic wind, the unit of the R_geo loss
-        x0, d, orog, _ = sample(data, a.train_years, 1, rng, 16)
+        x0, d, orog, _ = (q.to(dev) for q in sample(data, a.train_years, 1, rng, 16))
         b_geo = float(ageostrophic(guide, x0 + d[:, 0], orog)[0].pow(2).mean().sqrt())
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "scales": vars(guide.scales), "b_geo": b_geo,
-           "n_params": sum(q.numel() for q in P.parameters())}
+           "n_params": sum(q.numel() for q in P.parameters()), "run": run_record(dev)}
     log(f"[stage 1 {a.objective} {a.projector}] {res['n_params']} parameters, b_j {res['scales']}, "
-        f"ERA5 ageostrophic wind {b_geo:.2f} m/s")
+        f"ERA5 ageostrophic wind {b_geo:.2f} m/s, {res['run']['device_name']} commit {res['run']['commit']}")
 
     # -- training ---------------------------------------------------------------------------------
     ck = os.path.join(a.out, f"{tag}.pt")
+    project = a.objective == "project"
     if os.path.exists(ck):
-        P.load_state_dict(torch.load(ck))
+        P.load_state_dict(torch.load(ck, map_location=dev))
         res["resumed"] = True
     else:
         opt = torch.optim.Adam(P.parameters(), lr=a.lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
-        part, hist, start, t0 = ck + ".train", [], 0, time.time()
-        if os.path.exists(part):
-            s = torch.load(part, weights_only=False)
-            P.load_state_dict(s["P"]), opt.load_state_dict(s["opt"]), sched.load_state_dict(s["sched"])
-            hist, start, t0 = s["hist"], s["it"], time.time() - s["seconds"]
-            rng.bit_generator.state = s["rng"]
-            log(f"  resumed at it {start}")
-        g = torch.Generator().manual_seed(a.seed + 1)
-        for it in range(start, a.iters):
-            if it > start and it % 50 == 0:
-                torch.save({"P": P.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "hist": hist,
-                            "it": it, "seconds": time.time() - t0, "rng": rng.bit_generator.state}, part + ".tmp")
-                os.replace(part + ".tmp", part)
-            x0, d, orog, hour0 = sample(data, a.train_years, a.K, rng, a.batch)
-            alpha = torch.rand(a.batch, generator=g).view(-1, 1, 1, 1, 1) * a.alpha_max
-            dt_ = d + alpha * pert.noise(d.shape, g) * P.keep
+        g = torch.Generator().manual_seed(a.seed + 1)  # alpha and the perturbations (CPU: device-independent)
+
+        def picks(r):  # every numpy draw of a step, in the order of the original loop
+            ys, idx = pick(data, a.train_years, a.K, r, a.batch)
+            return ys, idx, r.choice(a.K, a.pairs, replace=False)
+
+        def gather_(p):
+            ys, idx, pairs = p
+            return (*gather(data, ys, idx, a.K), torch.from_numpy(pairs))
+
+        def loss_of(x0, d, orog, hour0, pairs, gen):
+            x0, d, orog, hour0 = (q.to(dev) for q in (x0, d, orog, hour0))
+            alpha = (torch.rand(len(x0), generator=gen).view(-1, 1, 1, 1, 1) * a.alpha_max).to(dev)
+            dt_ = d + alpha * pert.noise(d.shape, gen) * P.keep
             out = P(x0, dt_, hour0)
-            data_term = wmse(out, dt_ if a.objective == "project" else d, w, t6)
-            pairs = torch.from_numpy(rng.choice(a.K, a.pairs, replace=False))
+            data_term = wmse(out, dt_ if project else d, w, t6)
             phys, _ = sequence_residual_loss(guide, x0, out, d, orog, pairs)
             if a.lambda_geo > 0:  # the frames after each pair's step
                 f = (x0[:, None] + out[:, pairs]).flatten(0, 1)
                 ageo, _ = ageostrophic(guide, f, orog.repeat_interleave(len(pairs), 0))
                 phys = phys + a.lambda_geo * ((ageo / b_geo) ** 2).mean().to(phys.dtype)
-            loss = data_term + a.lambda_p * phys
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(P.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            if a.projector == "balance" and a.bound:
-                P.project_()
-            hist.append({"data": data_term.item(), "phys": phys.item()})
-            if (it + 1) % max(1, a.iters // 20) == 0:
-                h = hist[-50:]
-                log(f"  it {it + 1:5d} data {np.mean([q['data'] for q in h]):.4f} "
-                    f"phys {np.mean([q['phys'] for q in h]):.3f} {time.time() - t0:.0f}s")
+            return data_term + a.lambda_p * phys, {"data": data_term.item(), "phys": phys.item()}
+
+        # fixed validation windows, perturbations and pairs: comparable across validations
+        vr = np.random.default_rng(a.seed + 99)
+        vw = [gather_(picks(vr)) for _ in range(0, a.n_val_train, a.batch)] if a.val_every else []
+
+        def val_fn():
+            gv = torch.Generator().manual_seed(a.seed + 98)
+            parts = [loss_of(*b, gv) for b in vw]
+            return {"loss": float(np.mean([q[0].item() for q in parts])),
+                    "data": float(np.mean([q[1]["data"] for q in parts])),
+                    "phys": float(np.mean([q[1]["phys"] for q in parts]))}
+
+        r = fit(P, P.parameters(), opt, sched, Prefetch(picks, gather_, rng, a.prefetch),
+                lambda b: loss_of(*b, g),
+                FitConfig(iters=a.iters, ckpt_every=a.ckpt_every, log_every=max(1, a.iters // 20),
+                          val_every=a.val_every, patience=a.patience, select=a.select, max_hours=a.max_hours),
+                ck, val_fn=val_fn if a.val_every else None, generators={"g": g},
+                after_step=P.project_ if a.projector == "balance" and a.bound else None,
+                amp=autocast(dev, a.amp), log=log)
+        if r["stopped"] == "budget":
+            sys.exit(EXIT_BUDGET)
         torch.save(P.state_dict(), ck)
-        if os.path.exists(part):
-            os.remove(part)
-        res.update(train_seconds=time.time() - t0, hist=hist[::10])
+        res.update(train_seconds=r["seconds"], hist=r["hist"][::10], val_curve=r["val"], best_it=r["best_it"],
+                   best_val=r["best_val"], stopped=r["stopped"])
     P.eval()
 
     # -- gates on the validation year, ``--val-chunk`` sequences at a time (66 channels x K frames) ------
@@ -238,7 +262,8 @@ def main(argv=None):
         X0, D, OR, H0 = sample(data, [a.val_year], a.K, vr, a.n_val)
         for i in range(0, a.n_val, a.val_chunk):
             j = slice(i, min(a.n_val, i + a.val_chunk))
-            x0, d, orog, hour0, wgt = X0[j], D[j], OR[j], H0[j], (j.stop - j.start) / a.n_val
+            x0, d, orog, hour0 = (q[j].to(dev) for q in (X0, D, OR, H0))
+            wgt = (j.stop - j.start) / a.n_val
             pd = P(x0, d, hour0)
             add(("identity_change",), wmse(pd, d, w, t6), wgt)
             for name, f in (("base", d), ("identity", pd)):

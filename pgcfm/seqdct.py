@@ -126,9 +126,10 @@ class SeqDCT(nn.Module):
         self.std.copy_(((s2 - n * mean ** 2) / max(n - 1, 1)).clamp_min(0).sqrt().float().clamp_min(1e-6))
 
     def noise(self, shape, generator=None) -> torch.Tensor:
-        """Zero-mean Gaussian increments with the fitted per-coefficient std (B, K, C, H, W)."""
-        eps = torch.randn(shape, generator=generator, device=self.std.device)
-        return self.inverse_coeffs(eps * self.std)
+        """Zero-mean Gaussian increments with the fitted per-coefficient std (B, K, C, H, W). The draw
+        happens on the generator's device (a CPU generator gives the same members on every device)."""
+        eps = torch.randn(shape, generator=generator, device=None if generator is None else generator.device)
+        return self.inverse_coeffs(eps.to(self.std.device) * self.std)
 
 
 @dataclass
@@ -186,7 +187,7 @@ def sequence_residual_loss(guide, x0, d, d_obs, orog, pairs: torch.Tensor):
     a, b = f[:, pairs].flatten(0, 1), f[:, pairs + 1].flatten(0, 1)
     ao, bo = fo[:, pairs].flatten(0, 1), fo[:, pairs + 1].flatten(0, 1)
     s = orog.repeat_interleave(len(pairs), 0)
-    R, _ = guide.residuals(a, b, s, torch.zeros(B * len(pairs)), use_bridge=False, use_closure=False)
+    R, _ = guide.residuals(a, b, s, torch.zeros(B * len(pairs), device=a.device), use_bridge=False, use_closure=False)
     return guide.loss(R, guide.mask(ao, bo, s)), R
 
 
@@ -201,7 +202,8 @@ def residual_rms(guide, x0, d, d_obs, orog, pairs, chunk: int = 32) -> Dict[str,
     acc, n = {}, a.shape[0]
     for i in range(0, n, chunk):
         j = slice(i, min(n, i + chunk))
-        R, _ = guide.residuals(a[j], b[j], s[j], torch.zeros(a[j].shape[0]), use_bridge=False, use_closure=False)
+        R, _ = guide.residuals(a[j], b[j], s[j], torch.zeros(j.stop - j.start, device=a.device), use_bridge=False,
+                               use_closure=False)
         for k, v in guide.per_equation(R, guide.mask(ao[j], bo[j], s[j])).items():
             acc[k] = acc.get(k, 0.0) + v ** 2 * (j.stop - j.start) / n
     return {k: math.sqrt(v) for k, v in acc.items()}
@@ -210,7 +212,7 @@ def residual_rms(guide, x0, d, d_obs, orog, pairs, chunk: int = 32) -> Dict[str,
 def band_spread(e: torch.Tensor, k_lat: int, k_lon: int) -> Dict[str, float]:
     """Member spread of e (M, B, K, C, H, W) in the low (k_lat x k_lon) and the other DCT modes."""
     c = dct_2d(e - e.mean(0, keepdim=True))
-    m = torch.zeros(c.shape[-2:], dtype=torch.bool)
+    m = torch.zeros(c.shape[-2:], dtype=torch.bool, device=c.device)
     m[:k_lat, :k_lon] = True
     low, high = (c ** 2)[..., m], (c ** 2)[..., ~m]
     return {"low": math.sqrt(float(low.mean())), "high": math.sqrt(float(high.mean()))}
@@ -308,7 +310,10 @@ class SeqFM(nn.Module):
         return ((self.velocity(tau, z, hist, hour0) - u) ** 2).mean()
 
     def noise(self, B: int, generator=None, device=None) -> torch.Tensor:
-        return torch.randn((B,) + tuple(self.basis.std.shape), generator=generator, device=device)
+        """Source draws on the generator's device (CPU generator: the same members on every device)."""
+        dev = device if generator is None else generator.device
+        return torch.randn((B,) + tuple(self.basis.std.shape), generator=generator, device=dev).to(
+            self.basis.std.device if device is None else device)
 
     def sample(self, hist, hour0, steps: int = 8, generator=None, eps=None, physics=None, lam: float = 0.0,
                s0: float = 0.75, project=None, mu: float = 0.0, chunk: int = None, start=None, keep_at=None):
@@ -415,8 +420,8 @@ class SeqRegressor(nn.Module):
     @torch.no_grad()
     def sample(self, hist, hour0, generator=None, **_):
         mu = self(hist, hour0)
-        return mu + self.err_lead * self.errors.inverse_coeffs(
-            self.errors.mean + self.errors.std * torch.randn(mu.shape, generator=generator, device=mu.device))
+        eps = torch.randn(mu.shape, generator=generator, device=None if generator is None else generator.device)
+        return mu + self.err_lead * self.errors.inverse_coeffs(self.errors.mean + self.errors.std * eps.to(mu.device))
 
 
 def laplacian_roughness(d: torch.Tensor) -> torch.Tensor:
@@ -435,7 +440,8 @@ def hard_constraints(x0: torch.Tensor, d: torch.Tensor, mean, std):
     idx = [contract.DYNAMIC_CHANNELS.index(contract.CHANNEL_INDEX[c])
            for c in [f"q{p}" for p in contract.LEVELS_HPA] + ["tcwv"]]
     full = [contract.DYNAMIC_CHANNELS[i] for i in idx]
-    lo = torch.as_tensor(-mean[full] / (std[full] + contract.KAI_STD_EPS), dtype=d.dtype).view(1, 1, -1, 1, 1)
+    lo = torch.as_tensor(-mean[full] / (std[full] + contract.KAI_STD_EPS), dtype=d.dtype,
+                         device=d.device).view(1, 1, -1, 1, 1)
     x = x0[:, None, idx] + d[:, :, idx]
     frac = float((x < lo).float().mean())
     d = d.clone()
