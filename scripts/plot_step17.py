@@ -69,7 +69,7 @@ def main(argv=None):
             ax[2].set_ylim(0.5, 1.5)
             for arm, v in arms.items():
                 if max(v["rmse"]["Phi"]) > 2.0 * max(first["rmse_pers"]["Phi"]):
-                    ax[0].annotate(f"{LABEL.get(arm, arm)}: 발산 ({max(v['rmse']['Phi']):.2g})", (0.02, 0.95 - 0.06 * list(arms).index(arm)),
+                    ax[0].annotate(f"{LABEL.get(arm, arm)}: 축 밖 (최대 {max(v['rmse']['Phi']):.2g})", (0.02, 0.95 - 0.06 * list(arms).index(arm)),
                                    xycoords="axes fraction", fontsize=8, color=COLORS.get(arm, "k"))
         s = r["setting"]
         ax[0].set_title(f"[{s}] Φ RMSE (m²/s²)"), ax[1].set_title(f"[{s}] 바람 RMSE (m/s)")

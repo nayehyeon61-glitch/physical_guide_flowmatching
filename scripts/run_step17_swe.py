@@ -46,6 +46,8 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="runs/step17")
     p.add_argument("--setting", default="coarse", choices=["full", "coarse"])
+    p.add_argument("--res", type=int, default=21, choices=[21, 42], help="learners' resolution: T21 (64 x 128) "
+                   "or T42 (128 x 256; full only: the truth at T42 keeps the broken-jet regime of coarse)")
     p.add_argument("--arms", nargs="+", default=list(GRID_ARMS) + ["raissi"])
     p.add_argument("--n-train", type=int, default=12, help="perturbed Galewsky trajectories (2 of them held out)")
     p.add_argument("--n-random", type=int, default=4, help="random-IC trajectories in training")
@@ -83,10 +85,15 @@ def main(argv=None):
     rng = np.random.default_rng(a.seed)
     os.makedirs(a.out, exist_ok=True)
     log = lambda s: print(s, flush=True)  # noqa: E731
-    tag = a.setting + ("_quick" if a.quick else "")
+    tag = a.setting + (f"{a.res}" if a.res != 21 else "") + ("_quick" if a.quick else "")
 
     # -- worlds and data --------------------------------------------------------------------------------
-    learn = World(64, 128, 22, 300.0) if not a.quick else World(32, 64, 11, 600.0)
+    if a.res == 42:
+        if a.setting != "full":
+            raise ValueError("--res 42 is for the full setting")
+        learn = World(128, 256, 43, 150.0) if not a.quick else World(64, 128, 22, 300.0)
+    else:
+        learn = World(64, 128, 22, 300.0) if not a.quick else World(32, 64, 11, 600.0)
     truth = learn if a.setting == "full" else (World(128, 256, 43, 150.0) if not a.quick else World(64, 128, 22, 300.0))
     to_learn = lambda us: learn.grid(truth.truncate(us, learn.lmax)).float()  # noqa: E731
     # the exact tendency of the truncated truth, hyperdiffusion included (what the data do)
