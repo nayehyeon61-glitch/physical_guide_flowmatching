@@ -63,6 +63,14 @@ def main(argv=None):
         ax[3].plot(xs, [r["operator_bias"][k] for k in ch], "k_", ms=25, mew=2, label="물리 연산자의 닫힘 결손")
         ax[3].set_xticks(xs), ax[3].set_xticklabels(ch)
         ax[3].axhline(1.0, color="grey", ls=":", lw=1)
+        if first is not None:  # a diverged arm (pi_only without closure) would hide the others
+            ax[0].set_ylim(0, 2.0 * max(first["rmse_pers"]["Phi"]))
+            ax[1].set_ylim(0, 2.0 * max(first["rmse_pers"]["wind"]))
+            ax[2].set_ylim(0.5, 1.5)
+            for arm, v in arms.items():
+                if max(v["rmse"]["Phi"]) > 2.0 * max(first["rmse_pers"]["Phi"]):
+                    ax[0].annotate(f"{LABEL.get(arm, arm)}: 발산 ({max(v['rmse']['Phi']):.2g})", (0.02, 0.95 - 0.06 * list(arms).index(arm)),
+                                   xycoords="axes fraction", fontsize=8, color=COLORS.get(arm, "k"))
         s = r["setting"]
         ax[0].set_title(f"[{s}] Φ RMSE (m²/s²)"), ax[1].set_title(f"[{s}] 바람 RMSE (m/s)")
         ax[2].set_title(f"[{s}] 에너지 비 예측 / 진실"), ax[3].set_title(f"[{s}] 접벡터 잔차 |f − F_true| / b (진실 상태)")

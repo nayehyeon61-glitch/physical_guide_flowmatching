@@ -220,10 +220,13 @@ def evaluate(arm, net, tests, learn, nz, b, rollout, hours):
             en.append(learn.energy(y.double()) / learn.energy(x[1:].double()))
             tan.append(strong_residual(learn, nz, net, nz.norm(x), b, F_true=F).sqrt())
             opr.append(strong_residual(learn, nz, net, nz.norm(x), b).sqrt())
-    rm, rp, en = torch.stack(rm).mean(0), torch.stack(rp).mean(0), torch.stack(en).mean(0)
     wind = lambda r: (r[:, 1] ** 2 + r[:, 2] ** 2).sqrt()  # noqa: E731
+    per_window = [{"kind": kind, "t0": t0, "rmse_Phi": r[:, 0].tolist(), "rmse_wind": wind(r).tolist(),
+                   "pers_Phi": q[:, 0].tolist(), "pers_wind": wind(q).tolist(), "energy_ratio": e.tolist()}
+                  for (kind, t0, _, _), r, q, e in zip(tests, rm, rp, en)]
+    rm, rp, en = torch.stack(rm).mean(0), torch.stack(rp).mean(0), torch.stack(en).mean(0)
     out = {"rmse": {k: rm[:, i].tolist() for i, k in enumerate(CHANNELS)}, "rmse_pers": {},
-           "energy_ratio": en.tolist(),
+           "energy_ratio": en.tolist(), "windows": per_window,
            "tangent_residual": {k: float(torch.stack(tan)[:, i].mean()) for i, k in enumerate(CHANNELS)},
            "operator_residual": {k: float(torch.stack(opr)[:, i].mean()) for i, k in enumerate(CHANNELS)}}
     out["rmse"]["wind"], out["rmse_pers"]["wind"] = wind(rm).tolist(), wind(rp).tolist()
@@ -268,8 +271,12 @@ def raissi(a, tests, learn, b, log):
                 rm.append(learn.wrmse(y, x[1:].double()))
                 rp.append(learn.wrmse(x[:1].double().expand_as(x[1:]), x[1:].double()))
                 en.append(learn.energy(y) / learn.energy(x[1:].double()))
-                hist.append({"data": h[-1]["data"], "phys": h[-1]["phys"], "first": h[0]["loss"], "last": h[-1]["loss"],
-                             "seconds": time.time() - t1})
+                hist.append({"kind": kind, "t0": t0, "data": h[-1]["data"], "phys": h[-1]["phys"],
+                             "first": h[0]["loss"], "last": h[-1]["loss"], "seconds": time.time() - t1,
+                             "rmse_Phi": rm[-1][:, 0].tolist(), "pers_Phi": rp[-1][:, 0].tolist(),
+                             "rmse_wind": (rm[-1][:, 1] ** 2 + rm[-1][:, 2] ** 2).sqrt().tolist(),
+                             "pers_wind": (rp[-1][:, 1] ** 2 + rp[-1][:, 2] ** 2).sqrt().tolist(),
+                             "energy_ratio": en[-1].tolist()})
                 log(f"  [raissi {variant} T{T}] {kind} t0 {t0}: data {h[-1]['data']:.3g} phys {h[-1]['phys']:.3g} "
                     f"Phi RMSE {float(rm[-1][-1, 0]):.0f} (pers {float(rp[-1][-1, 0]):.0f}) wind "
                     f"{float((rm[-1][-1, 1] ** 2 + rm[-1][-1, 2] ** 2).sqrt()):.2f} energy {float(en[-1][-1]):.3f} "
