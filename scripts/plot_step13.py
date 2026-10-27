@@ -52,6 +52,23 @@ FIGURES = {  # (score key, label, line style, categorical slot); calibration: sl
         ("seqfm_dct_pinn_regm_band", "a + b·regression mean + c·x(t) + band spread", "-", 7),
         ("seqfm_dct_pinn_regm_guide", "a + b·regression mean + c·x(t) + learned guide", "--", 7),
     ]),
+    # step 16 E1/E2 (docs/step16_dynpinn.md 8.3): residual flow around the data-only core, four post-projections
+    "fig_resfm_proj": ("Core mean + residual FM members, four projections (before calibration)", [
+        ("seqfm_dct_core_raw", "Core mean + residual FM (raw)", "-", 0),
+        ("seqfm_dct_core_pinn", "+ stage-1 PINN projection", "--", 1),
+        ("seqfm_dct_core_bal", "+ two-head core balance (B)", "-.", 2),
+        ("seqfm_dct_core_hyd", "+ closed-form hydrostatic projection", "-", 3),
+        ("seqfm_dct_pinn", "Step 13 FM + PINN (no core)", "-", 6),
+        ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
+    ]),
+    "fig_resfm_cal": ("The same members after the band Gamma on the regression mean (regm_band)", [
+        ("seqfm_dct_core_pinn_regm_band", "PINN projection + regm_band", "--", 1),
+        ("seqfm_dct_core_pinn_mbm_band", "PINN projection + MBM mean + band", ":", 1),
+        ("seqfm_dct_core_bal_regm_band", "Two-head balance + regm_band", "-.", 2),
+        ("seqfm_dct_core_hyd_regm_band", "Hydrostatic projection + regm_band", "-", 3),
+        ("seqfm_dct_pinn_regm_band", "Step 13 reported model (FM + PINN + regm_band)", "-", 7),
+        ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
+    ]),
 }
 
 
@@ -136,6 +153,8 @@ def main(argv=None):
     p.add_argument("--paired", nargs="*", default=None, help="climode_paired*.json (scripts/compare_step13_climode.py)")
     p.add_argument("--subtitle", default="Real ERA5 5.625°, test 2017-2018 (ClimODE's 360 ICs), 8 members; "
                                          "CPU budget: FM 3000 it, PINN 1000 it")
+    p.add_argument("--figures", nargs="*", default=None, help="FIGURES keys to draw (default: every one with arms)")
+    p.add_argument("--step", default="Step 13", help="suptitle prefix")
     a = p.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     arms = {}
@@ -153,6 +172,8 @@ def main(argv=None):
     days, pdays = np.array(LEADS_H) / 24, np.array(ph) / 24
     written = []
     for name, (title, lines) in FIGURES.items():
+        if a.figures is not None and name not in a.figures:
+            continue
         present = [q for q in lines if q[0] in arms]
         if not present:
             print(f"[plot] {name}: no arms in the score files, skipped")
@@ -190,7 +211,7 @@ def main(argv=None):
                 a_.spines[s_].set_visible(False)
         fig.legend(*ax[0, 0].get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize=9,
                    frameon=False)
-        fig.suptitle(f"Step 13: {title}\n{a.subtitle}", fontsize=13)
+        fig.suptitle(f"{a.step}: {title}\n{a.subtitle}", fontsize=13)
         path = os.path.join(a.out, name + ".png")
         fig.savefig(path, dpi=150)
         plt.close(fig)
