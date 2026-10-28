@@ -238,3 +238,27 @@ python scripts/run_climode_eval.py --data data/era5_5p625/era5_data --out runs/c
 
 - 원저자 스크립트는 학습 구간을 `slice('2006','2016')`로 잡아 검증 해 2016이 학습에 들어갑니다(원문 그대로 둠).
 - 평가는 11단계와 같은 함수와 초기장입니다. `--max-ics`를 빼면 시험 해당 180개씩 360개 전부를 돕니다.
+
+## 12. 19단계: 출력단 super-resolution (5.625° → 2.8125°, `docs/step19_sr_output.md`)
+
+13단계 멤버 뒤에 붙는 SR 망(`pgcfm/sr.py`, Chiang et al. 2024 축소판)을 GPU에서 학습하고, 저장된 arm을 멤버별로 SR해 2.8125° 진실(WB2 128×64, 5변수)로 채점합니다. CPU 실행(4년, 31분)과 같은 코드이고 `--device`만 다릅니다.
+
+```bash
+# (1) 2.8125° 진실: ClimODE 5변수만, 5.625° 파일과 같은 era5_data 루트에 *_2.8125deg.nc 로 들어갑니다 (한 해 240 MB; 37년 8.9 GB)
+python scripts/wb2_to_kai.py --out data/era5_5p625 --grid 128x64 --climode-only --years $(seq 1979 2018)
+# (2) SR 학습 + 저장된 arm 채점 (한 번에). --ens 는 여러 arm 가능, --save-sr 은 SR한 멤버를 npz로 (arm·해마다 0.7 GB)
+python scripts/run_step19_sr.py --coarse data/era5_5p625/era5_data --fine data/era5_5p625/era5_data --device auto \
+    --train-range 1979 2015 --val-year 2016 --test-years 2017 2018 --iters 20000 --batch 32 --chunk 30 \
+    --ens runs/step13_best/seqregress_pinn runs/step13_best/seqfm_dct_pinn_regm_band \
+          runs/step13_best/seqfm_dct_pinn_regm_sband_clim_flow \
+    --out runs/step13_best/sr --fig runs/step13_best/fig --save-sr
+# 또는 best 스크립트의 한 단계로: 위 두 명령을 $OUT/sr 에, 채점된 arm 전부에 대해 실행합니다
+SR=1 PROFILE=broad bash scripts/run_step13_best.sh          # SR_TRAIN_YEARS="2006 ... 2015" 로 학습 연수를 줄일 수 있음
+```
+
+- 학습 데이터는 호스트 메모리에 올립니다: 한 해에 coarse 60 MB + fine 120 MB(float16), 37년이면 약 6.6 GB. 141k 파라미터라 GPU 메모리는 배치 32에서 1 GB 미만입니다. `--amp`(bf16)는 선택.
+- 채점은 `--chunk` 초기장씩 GPU에서 합니다(한 chunk = chunk × 8 멤버 × 6 lead × 5변수 × 64 × 128 float32 ≈ chunk × 63 MB, 보간·SR·평균 세 벌). 24 GB GPU면 30, CPU면 6.
+- CRPS는 properscoring과 같은 추정량(E|X−y| − ½ E|X−X'|, 쌍 평균 M²)을 torch로 계산합니다(차이 1e-6 확인). 눈금은 ClimODE 최소·최대 정규화(5.625° 2006~2018)입니다.
+- 결과: `sr.json`의 `evaluation.analysis[해]`(분석장 보간/SR RMSE), `evaluation.ensemble[arm][해]`(lead × 변수: `rmse_i`/`rmse_s`/`rmse_sm`(평균의 SR)/`rmse_pers`/`rmse_c`(5.625°), `spread2_*`, `crps_*`), `train.val_curve`. 그림 `fig_sr_sr_<arm>.png`(arm이 하나면 `fig_sr_sr.png`): z500·t2m RMSE, t2m·u10 CRPS, 보간 파랑 / SR 빨강 / 5.625° 회색 점선 / 지속 점선.
+- 이미 학습한 망으로 다른 arm만 채점: `--eval-only --out <sr.pt 가 있는 폴더> --ens <새 arm ...>` (json의 `evaluation` 만 다시 씀).
+- 읽는 법(CPU 결과, `docs/step19_sr_output.md`): 2.8°에서 t2m RMSE·CRPS만 내려가고(24 h −10 %, 144 h −3 %), z500·t850은 ±0.1 %, 바람은 퍼짐만 커집니다. GPU 37년 학습에서 바뀔 수 있는 것은 SR 망의 용량(검증 비 0.76이 평평해진 지점)과 멤버의 2.8° 오차이며, SR이 5.625° 점수를 바꾸지는 않습니다.

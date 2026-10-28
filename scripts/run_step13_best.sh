@@ -15,6 +15,8 @@
 #   SIGMA=0 bash scripts/run_step13_best.sh            # regm_band only, without the spread-field arms
 #   SBAND=0 bash scripts/run_step13_best.sh            # without regm_sband_clim_flow (saves ~15 min)
 #   SMOKE=1 bash scripts/run_step13_best.sh            # 2 iterations, 6 ICs a year: checks the chain (~15 min)
+#   SR=1 bash scripts/run_step13_best.sh               # + step 19 output-stage super-resolution of every scored arm
+#                                                      #   (2.8125 deg truth download, SR net, 2.8 deg scores; docs/RUN_ON_GPU.md 12)
 #
 # Profiles (docs/step15_training_system.md) set the training years, iterations, batches and validation:
 #   PROFILE=small (default)   train 2012-2015, the CPU settings of docs/step13_reproduce.md
@@ -28,7 +30,9 @@
 #   Comparing profiles: scripts/run_step15_compare.sh (climode + broad_long, then the reports side by side)
 # Every profile value can be overridden: TRAIN_YEARS="1990 ... 2015" PINN_ITERS GEN_ITERS GEN_BATCH VAL_EVERY
 # VAL_MEMBERS PATIENCE MAX_HOURS (per trainer invocation: saves and exits 75, rerun to resume) DEVICE CACHE
-# (1 = memory-mapped years under $OUT/cache) AMP (1 = bf16 autocast on cuda). Each step appends a line to
+# (1 = memory-mapped years under $OUT/cache) AMP (1 = bf16 autocast on cuda). With SR=1: SR_TRAIN_YEARS (default
+# TRAIN_YEARS; 2.8125 deg files are 240 MB a year), SR_ITERS, SR_BATCH, SR_CHUNK (ICs per scoring chunk), SR_SAVE
+# (1 = write the super-resolved members, 0.7 GB per arm and year). Each step appends a line to
 # $OUT/manifest.jsonl (command, commit, start, end, exit).
 #
 # Trained weights: put pinn_project.pt, pinn_project.json, seqfm_dct.pt, seqregress.pt and stats/ in $OUT
@@ -46,6 +50,8 @@ CONTROL=${CONTROL:-0}
 CLIMODE=${CLIMODE:-0}
 SIGMA=${SIGMA:-1}
 SBAND=${SBAND:-1}
+SR=${SR:-0}
+SR_SAVE=${SR_SAVE:-0}
 VAL_YEAR=${VAL_YEAR:-2016}
 TEST_YEARS=${TEST_YEARS:-"2017 2018"}
 case "$PROFILE" in
@@ -54,6 +60,7 @@ case "$PROFILE" in
         PINN_ITERS=${PINN_ITERS:-1000}; PINN_BATCH=${PINN_BATCH:-4}
         GEN_ITERS=${GEN_ITERS:-3000}; GEN_BATCH=${GEN_BATCH:-4}
         VAL_EVERY=${VAL_EVERY:-0}; VAL_MEMBERS=${VAL_MEMBERS:-0}
+        SR_ITERS=${SR_ITERS:-3000}; SR_BATCH=${SR_BATCH:-16}; SR_CHUNK=${SR_CHUNK:-6}
         DEVICE=${DEVICE:-cpu}; CACHE=${CACHE:-0} ;;
     broad|broad_long|climode)
         # broad: the owner's 2026-10-27 GPU run (37 years). broad_long: the same data, 3x the FM / regression
@@ -68,12 +75,14 @@ case "$PROFILE" in
         GEN_ITERS=${GEN_ITERS:-$([ "$PROFILE" = broad_long ] && echo 120000 || echo 40000)}; GEN_BATCH=${GEN_BATCH:-16}
         VAL_EVERY=${VAL_EVERY:-1000}; VAL_MEMBERS=${VAL_MEMBERS:-4}
         PATIENCE=${PATIENCE:-$([ "$PROFILE" = broad_long ] && echo 10 || echo 0)}
+        SR_ITERS=${SR_ITERS:-20000}; SR_BATCH=${SR_BATCH:-32}; SR_CHUNK=${SR_CHUNK:-30}
         DEVICE=${DEVICE:-auto}; CACHE=${CACHE:-1} ;;
     *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, smoke)"; exit 2 ;;
 esac
 PATIENCE=${PATIENCE:-0}
 MAX_HOURS=${MAX_HOURS:-0}
 AMP=${AMP:-0}
+SR_TRAIN_YEARS=${SR_TRAIN_YEARS:-$TRAIN_YEARS}
 K=$DATA/kai6h
 E=$DATA/era5_data
 FM=$OUT/seqfm_dct_pinn
@@ -86,11 +95,13 @@ TRAIN_ARGS="--device $DEVICE --val-every $VAL_EVERY --patience $PATIENCE --max-h
 if [ "$SMOKE" = 1 ]; then
     PINN_ARGS="--iters 2 --n-val 4"; GEN_ARGS="--iters 2 --max-ics 6"
     GUIDE_ARGS="--n-valid 1 --epochs 1 --guide-epochs 1 --sigma-epochs 1"; SCORE_ARGS="--n-boot 20"; SIGMA_FULL=1
-    ABAND_ARGS="--epochs 1 --width 8"
+    ABAND_ARGS="--epochs 1 --width 8"; SR_ARGS="--iters 2 --val-every 1 --n-val 4 --max-ics 6"
 else
     PINN_ARGS="--iters $PINN_ITERS --batch $PINN_BATCH"; GEN_ARGS="--iters $GEN_ITERS --batch $GEN_BATCH --val-members $VAL_MEMBERS"
-    GUIDE_ARGS=""; SCORE_ARGS=""; SIGMA_FULL=30; ABAND_ARGS=""
+    GUIDE_ARGS=""; SCORE_ARGS=""; SIGMA_FULL=30; ABAND_ARGS=""; SR_ARGS="--iters $SR_ITERS --batch $SR_BATCH"
 fi
+[ "$AMP" = 1 ] && SR_ARGS="$SR_ARGS --amp"
+[ "$SR_SAVE" = 1 ] && SR_ARGS="$SR_ARGS --save-sr"
 mkdir -p "$OUT"
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "")
 echo "[best] profile $PROFILE, train $TRAIN_YEARS, device $DEVICE, out $OUT, commit $COMMIT"
@@ -192,5 +203,17 @@ if [ "$CLIMODE" = 1 ] && [ "$SMOKE" != 1 ]; then
         --max-ics 8 --lead-steps 24
     run paired "$OUT/climode_paired_best.json" python scripts/compare_step13_climode.py --era5 "$E" \
         --climode "$OUT/climode/climode_pred.npz" --arms $ARMS --out "$OUT/climode_paired_best.json"
+fi
+# 6. optional: step 19 output-stage super-resolution (docs/step19_sr_output.md). The 2.8125 deg truth of the 5
+#    ClimODE variables (WB2 128x64) lands next to the 5.625 deg files in $E; the SR net (pgcfm/sr.py) learns
+#    analysis -> analysis pairs on the SR years; then every scored arm is super-resolved member by member and
+#    scored at 2.8 deg against the interpolation of the same members (RMSE, spread, CRPS; $OUT/sr/sr.json,
+#    $OUT/fig/fig_sr_sr_<arm>.png). SR_SAVE=1 also writes the super-resolved members.
+if [ "$SR" = 1 ]; then
+    run data_fine "$E/geopotential_500/geopotential_500_${LAST_TEST}_2.8125deg.nc" python scripts/wb2_to_kai.py \
+        --out "$DATA" --grid 128x64 --climode-only --years $SR_TRAIN_YEARS $VAL_YEAR $TEST_YEARS
+    run sr "$OUT/sr/sr.json" python scripts/run_step19_sr.py --coarse "$E" --fine "$E" --device "$DEVICE" \
+        --train-years $SR_TRAIN_YEARS --val-year "$VAL_YEAR" --test-years $TEST_YEARS --chunk "$SR_CHUNK" \
+        --ens $ARMS --out "$OUT/sr" --fig "$OUT/fig" --threads "$THREADS" $SR_ARGS
 fi
 echo "[best] finished: $OUT/score_best.json (summary at the end of $OUT/score.log), $OUT/flowdep.json"
