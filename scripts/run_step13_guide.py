@@ -55,7 +55,7 @@ from pgcfm.core import static_features, time_features  # noqa: E402
 from pgcfm.ens_to_det import EnsembleToDeterministic, fit  # noqa: E402
 from pgcfm.flow_sigma import (FlowSigma, HeadOnly, OperatorSigma, fit_flow_sigma, flow_features,  # noqa: E402
                               predict_sigma)
-from scripts.run_step10_deterministic import PersistenceMBM  # noqa: E402
+from scripts.run_step10_deterministic import BlendMBM, PersistenceMBM  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 from scripts.run_step13_operator import load, samples  # noqa: E402
@@ -143,6 +143,8 @@ def main(argv=None):
     p.add_argument("--reg", default=None,
                    help="saved ensemble prefix whose member mean is mu* (runs/step13/seqregress_pinn): adds reg_*")
     p.add_argument("--reg-mbm", action="store_true", help="with --reg: also mu* = a + b mu_reg + c x0 (regm_*)")
+    p.add_argument("--blend", action="store_true", help="with --core and --reg: mu* = a + b core + c mu_reg + d x0 "
+                   "per lead and channel (step 20 lead-dependent blend), arm blend_band")
     p.add_argument("--flow-sigma", action="store_true", help="with --reg --reg-mbm: adds regm_flow")
     p.add_argument("--flow-op", action="store_true",
                    help="with --reg --reg-mbm: adds regm_flowop (operator pretrained on the regm_band members)")
@@ -279,6 +281,21 @@ def main(argv=None):
             log("[regm] val z500 RMSE of a + b mu_reg + c x0 by lead (normalized) "
                 + " ".join(f"{float(((mu_regm[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
                            for j in range(L)))
+    if a.blend:
+        if not (a.core and a.reg):
+            raise SystemExit("--blend needs --core and --reg")
+        ics_v = load(a.ens, a.val_year)[3][:n]
+        mus_v = [torch.from_numpy(core_predictions(a.core, a.era5, a.val_year, ics_v)),
+                 torch.from_numpy(ens_mean(a.reg, a.val_year, ics_v))]
+        blend = BlendMBM(5, L, len(mus_v)).fit(mus_v, torch.from_numpy(O[:n]), torch.from_numpy(X0[:n]))
+        mu_blend = nz(blend(mus_v, torch.from_numpy(X0[:n]))).reshape(-1, 5, H, W)
+        gam["blend_band"] = per_lead_gamma(band_error2(mu_blend, tgt, bidx, nb), sp_b, L, M)
+        res["blend_coef"] = {"order": ["1", "core", "reg", "x0"], "z500": blend.coef[:, VARS.index("z")].tolist(),
+                             "t2m": blend.coef[:, VARS.index("t2m")].tolist()}
+        log("[blend] val z500 RMSE of a + b core + c mu_reg + d x0 by lead (normalized) "
+            + " ".join(f"{float(((mu_blend[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
+                       for j in range(L))
+            + " | z500 coef (core, reg) by lead " + " ".join(f"({c[1]:.2f},{c[2]:.2f})" for c in res["blend_coef"]["z500"]))
     if a.flow_sigma or a.flow_op:  # flow-dependent spread factors on top of regm_band (pgcfm/flow_sigma.py)
         lat_, lon_, oro_, lsm_ = load_static(a.era5)
         static = static_features(lat_, lon_, oro_, lsm_)
@@ -376,6 +393,9 @@ def main(argv=None):
             mus["reg"] = nz(torch.from_numpy(ens_mean(a.reg, y, ics))).reshape(-1, 5, H, W)
         if a.reg and a.reg_mbm:
             mus["regm"] = nz(torch.from_numpy(reg_mbm_mean(a.reg, y, ics, reg_mbm)[1])).reshape(-1, 5, H, W)
+        if a.blend:
+            mus_t = [torch.from_numpy(core_predictions(a.core, a.era5, y, ics)), torch.from_numpy(ens_mean(a.reg, y, ics))]
+            mus["blend"] = nz(blend(mus_t, torch.from_numpy(X0))).reshape(-1, 5, H, W)
         sp = band_spread2(mem, bidx, nb)
         with torch.no_grad():
             arms = {"raw": mem,
@@ -383,7 +403,7 @@ def main(argv=None):
                     "mbm_band": apply_gamma(mu_mbm, mem, gam["mbm_band"][lead_idx], bidx),
                     "op_band": apply_gamma(mu_op, mem, gam["op_band"][lead_idx], bidx),
                     "op_mono": apply_gamma(mu_op, mem, gam["op_mono"][lead_idx], bidx)}
-            for k in ("core_band", "core_mono", "reg_band", "regm_band"):
+            for k in ("core_band", "core_mono", "reg_band", "regm_band", "blend_band"):
                 if k in gam:
                     arms[k] = apply_gamma(mus[k.split("_")[0]], mem, gam[k][lead_idx], bidx)
             for k, (gd, src) in guides.items():
