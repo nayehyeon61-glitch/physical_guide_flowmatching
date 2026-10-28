@@ -138,7 +138,7 @@ def plot_paired(paths, out, mx, mn):
         pers = get("persistence", met, v) * scale if met != "spread" else np.zeros(len(leads))
         a_.plot(days, pers, ":", color=MUTED, lw=2, label="Persistence")
         a_.plot(days, get("climode", met, v) * scale, "-", color=INK, lw=1.2, marker="s", ms=5,
-                label="ClimODE (public checkpoint, reproduced)")
+                label=d.get("reference", "ClimODE (public checkpoint, reproduced)"))
         a_.set_title(sub, fontsize=13)
         a_.set_xlabel("Forecast lead (days)")
         a_.set_ylabel(ylab)
@@ -155,8 +155,9 @@ def plot_paired(paths, out, mx, mn):
         which = f"{len(ics)} ICs of 2017 and of 2018 (days " + ", ".join(str(i // 4 + 1) for i in ics) + ")"
     else:
         which = "ClimODE's first 8 of 2017 and of 2018, January"
-    fig.suptitle(f"PG-CFM arms vs ClimODE's public checkpoint on the same {n} ICs ({which})\n"
-                 "ClimODE: authors' checkpoint and code, Gaussian σ; ours: CPU budget, 8 members", fontsize=13)
+    ref = d.get("reference", "ClimODE (public checkpoint, reproduced)").split(" (")[0]
+    fig.suptitle(f"PG-CFM arms vs {ref}'s public checkpoint on the same {n} ICs ({which})\n"
+                 f"{ref}: authors' checkpoint and code; ours: CPU budget, 8 members", fontsize=13)
     p = os.path.join(out, "fig_climode_paired.png")
     fig.savefig(p, dpi=150)
     plt.close(fig)

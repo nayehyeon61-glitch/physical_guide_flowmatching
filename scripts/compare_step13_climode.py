@@ -35,9 +35,12 @@ def main(argv=None):
     p.add_argument("--arms", nargs="*", default=[], help="prefixes of saved ensembles (<prefix>_ens_<year>.npz)")
     p.add_argument("--core", nargs="*", default=[], help="step 12 core prefixes (<prefix>_pred.npz)")
     p.add_argument("--out", default="runs/step13/climode_paired.json")
+    p.add_argument("--ref-name", default="ClimODE (public checkpoint, reproduced)",
+                  help="legend name of the reference model in the paired figure")
     a = p.parse_args(argv)
     cp = dict(np.load(a.climode))
     ics, leads = [int(i) for i in cp["ics"]], [int(h) for h in cp["lead_hours"]]
+    years = [int(y) for y in cp["years"]] if "years" in cp else list(YEARS)  # run_neuralgcm_eval.py saves its year
     mx, mn = climode_minmax(a.era5)
     lat = load_static(a.era5)[0]
     sc_ = (mx - mn)[:, None, None]
@@ -49,7 +52,7 @@ def main(argv=None):
     def add(name, h, met, v):
         scores.setdefault(name, {}).setdefault(str(h), {}).setdefault(met, []).append(np.asarray(v, np.float64))
 
-    for yi, y in enumerate(YEARS):
+    for yi, y in enumerate(years):
         truth = climode_truth(a.era5, y)
         clim = truth.mean(0)  # ClimODE: time mean of the test year
         assert np.allclose(cp["truth"][yi, :, 1:], truth[[[i + h // 6 for h in leads] for i in ics]], rtol=1e-4,
@@ -95,14 +98,16 @@ def main(argv=None):
                         add(name, h, met, v)
                         if met in s_c:
                             add(f"{name}-climode", h, met, v - s_c[met])
-    out = {"n_ic": {}, "leads": leads, "vars": VARS, "ics": ics, "climode": a.climode, "scores": {}}
+    out = {"n_ic": {}, "leads": leads, "vars": VARS, "ics": ics, "years": years, "climode": a.climode,
+           "reference": a.ref_name, "scores": {}}
     for name, by_h in scores.items():
         for h, d in by_h.items():
             for met, v in d.items():
                 v = np.stack(v)
                 out["n_ic"][name] = len(v)
-                out["scores"].setdefault(name, {}).setdefault(h, {})[met] = {
-                    var: {"mean": float(v[:, i].mean()), "ci95": boot_ci(v[:, i]) if name.endswith("-climode") else None}
+                out["scores"].setdefault(name, {}).setdefault(h, {})[met] = {  # NaN (a variable the reference lacks) -> null
+                    var: {"mean": None if np.isnan(v[:, i]).any() else float(v[:, i].mean()),
+                          "ci95": boot_ci(v[:, i]) if name.endswith("-climode") and not np.isnan(v[:, i]).any() else None}
                     for i, var in enumerate(VARS)}
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w") as f:

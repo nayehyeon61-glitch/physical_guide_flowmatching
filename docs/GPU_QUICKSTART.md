@@ -85,7 +85,8 @@ tail -f runs/climode_blend.log
 - job 시간 제한이 있으면 `MAX_HOURS=11`을 붙입니다. 11시간마다 저장하고 종료 코드 75로 끝나며, 같은 명령을 다시 실행하면 이어집니다.
 - 가볍게: `SIGMA=0` (퍼짐장 팔 없이 regm_band와 blend_band만, guide 30분 → 10분). `AMP=1`은 bf16 autocast인데 GPU에서 검증한 적이 없으니 먼저 끄고 돌리세요.
 - 한 단계만 다시: 그 단계의 산출물을 지우고 같은 명령 (예: 코어 반복 수를 바꾸려면 `rm runs/climode_blend/dyn_gfeat*` 뒤 `CORE_ITERS=40000 ...`).
-- 덤: `CONTROL=1` 회귀 편차 대조군, `CLIMODE=1` ClimODE 공개 체크포인트 짝 비교(초기장 쌍당 약 18분), `SR=1` 2.8125° 출력단 SR (`docs/RUN_ON_GPU.md` 12절).
+- 덤: `CONTROL=1` 회귀 편차 대조군, `SR=1` 2.8125° 출력단 SR (`docs/RUN_ON_GPU.md` 12절).
+- **ClimODE 체크포인트와 짝 비교** (`docs/step22_climode_paired.md`): `CLIMODE=1`을 붙이면 저자들의 GPU 학습 체크포인트를 저자 코드로 같은 IC에서 돌려 모든 팔(BLEND=1이면 blend_band와 코어도)을 짝지어 채점하고 `fig/fig_climode_paired.png`를 그립니다. 기본은 각 해 첫 8개 IC(CPU에서 쌍당 약 18분)이고, GPU에서는 `CLIMODE_ICS=180`으로 시험 IC 전체(360개)를 돌리세요. 부분집합은 `CLIMODE_STRIDE=20 CLIMODE_OFFSET=10`(계절을 가로지른 9쌍)처럼 고릅니다.
 
 ## 6. 결과 읽기
 
@@ -135,3 +136,38 @@ python scripts/score_step13.py --era5 $E --out $O/ctrl_lp0/score_vs.json --ref $
 
 - `runs/climode_blend/score_blend.json`, `energy_blend.json`, `guide_seqfm_dct_pinn_blend_band.json`, `manifest.jsonl`, `fig/*.png`, `*.json`(학습 기록)만 있으면 모든 표와 그림을 다시 만들 수 있습니다. 앙상블 npz(해마다 arm당 228 MB)는 공유하지 않아도 됩니다.
 - 체크포인트(`pinn_project.pt`, `seqfm_dct.pt`, `seqregress.pt`, `dyn_gfeat.pt`, `stats/`)를 다른 `OUT`에 넣으면 학습을 건너뛰고 생성·보정·채점만 다시 돕니다.
+
+## 9. NeuralGCM 공개 체크포인트와 비교 (선택, 23단계)
+
+NeuralGCM(Kochkov et al. 2024)의 체크포인트는 `gs://neuralgcm/models/v1/`(CC BY-SA 4.0)에 있고 학습 기간이 1979~2017(2.8°·1.4° 결정론) / 1979~2019(0.7°, 1.4° 확률론)라
+우리 시험 해 2017~18이 그쪽 학습 자료입니다. 그래서 이 비교만 **시험 해 2020**으로 옮깁니다. 아무것도 다시 학습하지 않습니다:
+NeuralGCM은 체크포인트 그대로 추론, 우리는 5절의 가중치와 2016년 보정 상수를 고정한 채 2020년 멤버만 새로 만듭니다.
+비교 변수는 두 모델이 공유하는 z500·t850뿐이고(NeuralGCM에는 t2m·u10·v10이 없음), NeuralGCM 출력은 우리 5.625° 격자로 보존 재격자합니다.
+
+```bash
+pip install neuralgcm dinosaur-dycore gcsfs            # JAX는 GPU판으로: pip install -U "jax[cuda12]"
+python scripts/wb2_to_kai.py --out data/era5_5p625 --all-hours --years 2020
+O=runs/climode_blend; N=runs/climode_blend/ngcm; mkdir -p $N
+for f in pinn_project.pt pinn_project.json seqfm_dct.pt seqregress.pt dyn_gfeat.pt dyn_gfeat.json stats \
+         seqfm_dct_pinn_ens_2016.npz seqregress_pinn_ens_2016.npz; do ln -s ../$f $N/$f; done
+# 2020년 멤버 (고정 가중치): FM, 회귀, G(x) 코어, 보정(regm_band, blend_band)
+K=data/era5_5p625; E=data/era5_5p625/era5_data
+C="--kai $K --era5 $E --out $N --pinn $N/pinn_project.pt --save-ens --resume-ens --train-years 2006 2007 2008 2009 2010 2011 2012 2013 2014 2015 --val-year 2016 --test-years 2020 --device cuda --val-every 0 --patience 0 --max-hours 0 --val-members 0"
+python scripts/run_step13_seqfm.py $C --basis dct
+python scripts/run_step13_seqfm.py $C --model regress
+python scripts/run_step16_predict.py --kai $K --era5 $E --run $N --tag dyn_gfeat --val-year 2016 --test-years 2020
+python scripts/run_step13_guide.py --ens $N/seqfm_dct_pinn --era5 $E --out $N --core $N/dyn_gfeat --reg $N/seqregress_pinn \
+    --reg-mbm --blend --val-year 2016 --test-years 2020 --save-arms regm_band blend_band
+# NeuralGCM: 2020년 ClimODE 규약 IC 전부(180개), ARCO ERA5 0.25°·37층을 내려받아 모델 격자로 재격자
+python scripts/run_neuralgcm_eval.py --era5 $E --out $N/neuralgcm_2_8 --model v1/deterministic_2_8_deg --year 2020
+python scripts/run_neuralgcm_eval.py --era5 $E --out $N/neuralgcm_ens --model v1/stochastic_1_4_deg --year 2020 --members 8
+# 같은 IC에서 짝 비교 (각 체크포인트마다)
+for R in neuralgcm_2_8 neuralgcm_ens; do
+python scripts/compare_step13_climode.py --era5 $E --climode $N/$R/neuralgcm_pred.npz --ref-name "NeuralGCM ($R)" \
+    --arms $N/seqregress_pinn $N/seqfm_dct_pinn_regm_band $N/seqfm_dct_pinn_blend_band --core $N/dyn_gfeat --out $N/${R}_paired.json
+python scripts/plot_step13.py --era5 $E --scores $O/score_best.json --years 2020 --figures none --paired $N/${R}_paired.json --out $N/fig_$R
+done
+```
+
+`--train-years`는 5절에서 쓴 것과 같아야 합니다(정규화 통계가 거기서 옵니다). CPU에서는 `--cpu --threads 4`로 같은 명령이 돌고 2.8° 결정론만 현실적입니다.
+학습 자료·해상도·연산 자원이 다르니(NeuralGCM: 0.25°·37층 ERA5 39년, TPU; 우리: 5.625°·12층) 결과는 "이긴다"가 아니라 상한 참조로 적습니다(`docs/step23_neuralgcm.md`).
