@@ -110,18 +110,23 @@ def kai_year(ds, year, hour, path, days_step=None, grid="64x32"):
     return f
 
 
-def climode_year(ds, year, root):
+DEG = {"64x32": "5.625", "128x64": "2.8125"}  # file-name suffix of the ClimODE-format files per grid
+
+
+def climode_year(ds, year, root, grid="64x32"):
     sel = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31"))
     for short, (name, level, folder) in CLIMODE.items():
         os.makedirs(os.path.join(root, folder), exist_ok=True)
+        p = os.path.join(root, folder, f"{folder}_{year}_{DEG[grid]}deg.nc")
+        if os.path.exists(p):
+            continue
         x = sel[name] if level is None else sel[name].sel(level=level, drop=True)
         x = x.transpose("time", "latitude", "longitude").rename(latitude="lat", longitude="lon").rename(short)
-        p = os.path.join(root, folder, f"{folder}_{year}_5.625deg.nc")
         x.load().to_dataset().to_netcdf(p + ".tmp", format="NETCDF4")
         os.replace(p + ".tmp", p)
 
 
-def constants(ds, root):
+def constants(ds, root, grid="64x32"):
     os.makedirs(os.path.join(root, "constants"), exist_ok=True)
     lat, lon = ds.latitude.values, ds.longitude.values
     lon2d, lat2d = np.meshgrid(lon, lat)
@@ -130,7 +135,7 @@ def constants(ds, root):
                     "lsm": (("lat", "lon"), ds.land_sea_mask.transpose("latitude", "longitude").values),
                     "lat2d": (("lat", "lon"), lat2d), "lon2d": (("lat", "lon"), lon2d)},
                    coords={"lat": lat, "lon": lon})
-    c.to_netcdf(os.path.join(root, "constants", "constants_5.625deg.nc"))
+    c.to_netcdf(os.path.join(root, "constants", f"constants_{DEG[grid]}deg.nc"))
 
 
 def main(argv=None):
@@ -142,18 +147,20 @@ def main(argv=None):
     p.add_argument("--no-climode", action="store_true")
     p.add_argument("--grid", default="64x32", choices=list(URLS), help="128x64 = 2.8125 deg (step 18)")
     p.add_argument("--days-step", type=int, default=None, help="keep every n-th day only (all its times)")
+    p.add_argument("--climode-only", action="store_true", help="only the 5 ClimODE variables (step 19 SR targets)")
     a = p.parse_args(argv)
     ds = open_wb2(a.grid)
     kai = os.path.join(a.out, "kai6h" if a.all_hours else "kai")
     os.makedirs(kai, exist_ok=True)
-    if not a.no_climode and not os.path.exists(os.path.join(a.out, "era5_data", "constants", "constants_5.625deg.nc")):
-        constants(ds, os.path.join(a.out, "era5_data"))
+    if not a.no_climode and not os.path.exists(os.path.join(a.out, "era5_data", "constants",
+                                                            f"constants_{DEG[a.grid]}deg.nc")):
+        constants(ds, os.path.join(a.out, "era5_data"), a.grid)
     for y in a.years:
         path = os.path.join(kai, f"{y}.nc")
-        if not os.path.exists(path):
+        if not os.path.exists(path) and not a.climode_only:
             kai_year(ds, y, None if a.all_hours else a.hour, path, a.days_step, a.grid)
         if not a.no_climode:
-            climode_year(ds, y, os.path.join(a.out, "era5_data"))
+            climode_year(ds, y, os.path.join(a.out, "era5_data"), a.grid)
         print(f"{y} done", flush=True)
 
 

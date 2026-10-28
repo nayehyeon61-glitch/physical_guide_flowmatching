@@ -40,12 +40,14 @@ import matplotlib.pyplot as plt  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 from pgcfm import contract  # noqa: E402
-from pgcfm.coupling import PhysicsConfig, PhysicsGuide  # noqa: E402
+from pgcfm.coupling import LEVEL_DYN, PhysicsConfig, PhysicsGuide  # noqa: E402
 from pgcfm.dyncore import StrongPhysics, finite_difference_tendency  # noqa: E402
 
 DYN, OROG = contract.DYNAMIC_CHANNELS, contract.STATIC_CHANNELS
 PROG = ("u", "v", "T", "q")
 DIAG = ("mass", "hyd")
+ALPHAS = (0.0, 0.25, 0.5, 1.0)  # one-step forecast x + alpha G(x) dt: alpha 0 = persistence
+KEY_LEVEL = {"u": 500, "v": 500, "T": 850}
 COLORS = {"coarse": "#4477AA", "fine": "#EE6677", "interp": "#228833"}
 LABEL = {"coarse": "5.625° 원자료", "fine": "2.8° 실제 자료", "interp": "5.625° → 2.8° 보간"}
 GROUPS = {"z": "z", "q": "q", "t": "t", "u": "u", "v": "v"}
@@ -98,6 +100,11 @@ def evaluate(name, states, guide, phys, chunk=8):
     lw = g.latitude_weight("area", pole_cap_deg=guide.cfg.pole_cap_deg).double()
     sums = {q: np.zeros(5) for q in PROG}  # <D^2>, <R0^2>, <R1^2>, <R0 D>, <1>
     diag = {q: np.zeros(2) for q in DIAG}
+    step = {q: np.zeros((len(ALPHAS), 2)) for q in PROG[:3]}  # 6 h forecast error^2 (all levels, key level)
+    step_pers = {q: np.zeros(2) for q in PROG[:3]}
+    dt = phys.dt
+    std_si = {q: phys.std[LEVEL_DYN[v]] for q, v in zip(PROG[:3], ("u", "v", "t"))}  # (L, 1, 1) double
+    lv = {q: contract.LEVELS_HPA.index(KEY_LEVEL[q]) for q in KEY_LEVEL}
     spec = {q: [0.0, 0.0] for q in PROG[:3]}  # |D_k|^2, |R1_k|^2
     with torch.no_grad():
         for i in range(0, states.shape[0], chunk):
@@ -108,6 +115,14 @@ def evaluate(name, states, guide, phys, chunk=8):
             R0, _ = phys.residuals(x, orog, torch.zeros_like(x))
             wt = (lw * m).double()
             W = wt.sum().item()
+            dlt = (s[:, 2, DYN] - s[:, 1, DYN]).double()  # the forward 6 h increment (normalized)
+            for q, v in zip(PROG[:3], ("u", "v", "t")):
+                dq = dlt[:, LEVEL_DYN[v]].index_select(-2, g.lat_rows) * std_si[q]  # SI
+                G = -R0[q]
+                for j, al in enumerate(ALPHAS):
+                    err = (dq - al * G * dt) ** 2 * wt
+                    step[q][j] += np.array([err.sum().item(), err[:, lv[q]].sum().item()])
+                step_pers[q] += np.array([(dq ** 2 * wt).sum().item(), (dq[:, lv[q]] ** 2 * wt[:, lv[q]]).sum().item()])
             for q in PROG:
                 D, E, A = R1[q] - R0[q], R1[q], R0[q]
                 sums[q] += np.array([(wt * D * D).sum().item(), (wt * A * A).sum().item(),
@@ -129,6 +144,9 @@ def evaluate(name, states, guide, phys, chunk=8):
             "rest_over_residual": float(np.sqrt(a2 / e2)), "tendency_over_residual": float(np.sqrt(d2 / e2))}
     for q, (e2, w) in diag.items():
         out["diagnostic"][q] = {"rms_residual": float(np.sqrt(e2 / w))}
+    out["one_step"] = {q: {str(al): {"all_levels": float(np.sqrt(step[q][j][0] / step_pers[q][0])),
+                                     f"{KEY_LEVEL[q]}hPa": float(np.sqrt(step[q][j][1] / step_pers[q][1]))}
+                           for j, al in enumerate(ALPHAS)} for q in step}
     for q, (sd, se) in spec.items():
         out["spectrum"][q] = {"ratio": (sd / se).tolist(), "cumulative": (np.cumsum(sd) / np.cumsum(se)).tolist(),
                               "tendency_power": sd.tolist(), "residual_power": se.tolist()}
@@ -138,6 +156,9 @@ def evaluate(name, states, guide, phys, chunk=8):
               f"corr(-R0,D) {r['corr_operator_tendency']:+.3f} skill {r['skill']:+.3f}")
     for q, r in out["diagnostic"].items():
         print(f"  {q:4s} rms R {r['rms_residual']:.3e}")
+    for q, r in out["one_step"].items():
+        print(f"  6 h forecast x + alpha G dt, RMSE / persistence ({q}, all levels | {KEY_LEVEL[q]} hPa): "
+              + " ".join(f"a={al} {r[str(al)]['all_levels']:.3f}|{r[str(al)][f'{KEY_LEVEL[q]}hPa']:.3f}" for al in ALPHAS))
     return out
 
 
