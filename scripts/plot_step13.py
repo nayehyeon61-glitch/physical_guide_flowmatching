@@ -62,7 +62,7 @@ FIGURES = {  # (score key, label, line style, categorical slot); calibration: sl
         ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
     ]),
     # step 20 (docs/step20_pinn_score.md): the blended mean a + b core + c regression + d x(t) per lead and variable
-    "fig_step20": ("Step 20: blended mean (a + b·G(x) core + c·regression mean + d·x(t)) + FM deviations + band Γ", [
+    "fig_step20": ("blended mean (a + b·G(x) core + c·regression mean + d·x(t)) + FM deviations + band Γ", [
         ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
         ("seqfm_dct_pinn_regm_band", "regm_band: a + b·regression mean + c·x(t) (reported model)", "-", 7),
         ("seqfm_dct_pinn_regm_sband_clim_flow", "regm_sband_clim_flow (best probabilistic arm)", "--", 7),

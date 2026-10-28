@@ -1,6 +1,6 @@
 # 20단계: PINN이 점수에 닿는 길 — lead별 혼합 평균(blend_band)과 다변량 energy score
 
-**실행**: 2026-10-28 02:41~03:33 UTC (CPU 2스레드), 대조군·energy score 03:35~. **코드**: `scripts/run_step10_deterministic.py`의 `BlendMBM`, `scripts/run_step13_guide.py --blend`, `scripts/step20_energy_score.py`, 큐 `scripts/run_step20_queue.sh`, `scripts/run_step20_queue_b.sh`. **결과 파일**: `runs/step20/score.json`(부트스트랩 포함), `runs/step20/guide_seqfm_dct_pinn_blend_band_regm_band.json`(혼합 계수, Γ), `runs/step20/ctrl_lp0/score.json`(대조군), `docs/step20/energy_score.json`. **그림**: `docs/step20/fig_step20.png`.
+**실행**: 2026-10-28 02:41~03:33 UTC (CPU 2스레드), 대조군·energy score 03:35~04:39. **코드**: `scripts/run_step10_deterministic.py`의 `BlendMBM`, `scripts/run_step13_guide.py --blend`, `scripts/step20_energy_score.py`, 큐 `scripts/run_step20_queue.sh`, `scripts/run_step20_queue_b.sh`. **결과 파일**: `runs/step20/score.json`(부트스트랩 포함), `runs/step20/guide_seqfm_dct_pinn_blend_band_regm_band.json`(혼합 계수, Γ), `runs/step20/ctrl_lp0/score.json`(대조군), `docs/step20/energy_score.json`. **그림**: `docs/step20/fig_step20.png` (`plot_step13.py --figures fig_step20`, `runs/step20/score_merged.json`; ClimODE 논문 점, 지속 점선).
 
 ## 요청을 이렇게 읽었습니다
 
@@ -62,7 +62,18 @@ z500은 코어가 24 h에 0.74를 차지하고 144 h에 0.38로 내려가며, t2
 
 ### 2.2 귀속 대조군: 같은 혼합을 데이터만의 코어(dyn_lp0)로
 
-(실행 중, `runs/step20/ctrl_lp0/`)
+G(x) 특징 없이 같은 설정으로 학습한 16단계 데이터 코어(dyn_lp0, z500 215/501/822)를 같은 절차로 섞은 `blend_lp0_band`(`runs/step20/ctrl_lp0/`, `runs/step20/score_ctrl.json`, 두 혼합의 짝 부트스트랩 `score_ctrl_vs.json`):
+
+| arm | z500 RMSE 24/72/144 h | z500 CRPS 24/72/144 h | t2m RMSE 24/144 h | u10 RMSE 24/144 h | 5변수 CRPS | fair CRPS(보정 json) |
+|---|---|---|---|---|---|---|
+| regm_band | 244 / 522 / 778 | 0.0108 / 0.0226 / 0.0327 | 1.42 / 2.61 | 2.15 / 3.68 | 0.02580 | 0.18005 |
+| blend_band (G(x) 코어) | **188** / **451** / 723 | **0.0089** / **0.0202** / 0.0315 | 1.34 / 2.56 | 1.84 / 3.55 | 0.02449 | **0.16604** |
+| blend_lp0_band (데이터 코어, 대조군) | 202 / 458 / **714** | 0.0094 / 0.0204 / **0.0303** | 1.35 / **2.53** | 1.88 / **3.53** | **0.02427** | 0.16728 |
+
+- 이득의 본체는 혼합입니다. regm_band → 대조군이 5변수 CRPS −5.9 %, fair CRPS −7.1 %로, G(x) 혼합의 이득(−5.1 %, −7.8 %)과 같은 크기입니다.
+- G(x) 특징의 몫은 **lead에 따라 부호가 바뀝니다**(짝 부트스트랩, G(x) 혼합 − 대조군): z500 RMSE 24/48/72/96 h −14 / −10 / −6 / −3(모두 유의), 120 h +2(유의하지 않음), 144 h +10(유의); z500 CRPS 24~72 h −0.0005 / −0.0004 / −0.0002(유의), 96 h부터 +0.0001 → +0.0012(유의). 다른 변수도 같은 꼴(바람 24 h −0.0004~−0.0005, 144 h +0.0010). 30칸 중 CRPS가 유의하게 좋은 칸 10, 나쁜 칸 17.
+- 두 요약 점수가 엇갈리는 것은 가중의 차이입니다: ClimODE 정규화 5변수 평균(lead·변수 동일 가중)은 긴 lead의 손해가 커서 대조군이 0.9 % 좋고, 보정 json의 fair CRPS(정규화 단위, 전 lead·변수)는 G(x) 혼합이 0.7 % 좋습니다. 어느 쪽이든 1 % 안이고, 물리 특징의 효과는 "72 h까지 작은 이득, 96 h부터 같은 크기의 손해"입니다. 18단계의 코어 단독 결과(24 h 217 → 197, 144 h 817 → 888)가 혼합 뒤에도 그대로 남은 것입니다.
+- 혼합 계수도 그 말을 합니다: z500의 코어 가중은 G(x) 코어 0.74 → 0.38, 데이터 코어 0.65 → 0.46(24 → 144 h). 최소제곱이 단기에는 G(x) 코어를 더 믿고 장기에는 덜 믿지만, 144 h의 코어 오차(888)가 커서 가중 0.38로도 손해가 남습니다.
 
 ### 2.3 다변량 energy score (2017~2018, 360 IC, 8멤버, 변수를 기후 표준편차로 표준화)
 
@@ -84,7 +95,10 @@ ES = 5변수 벡터의 fair energy score(격자점별 노름, 면적 가중), z�
 
 ## 3. 판독
 
-(대조군·energy score 뒤에 확정)
+1. **점수를 올린 것은 "ODE 경향 코어 + 시퀀스 회귀의 lead별 혼합 평균"입니다.** 두 모델은 구조(6 h Heun 적분 경향망 대 24 h 간격 시퀀스 U-Net)와 오차가 다르고, lead·변수별 최소제곱이 각 lead에서 더 맞는 쪽에 무게를 둡니다. 그 위에 13단계 FM + PINN 편차와 대역 Γ를 그대로 얹으면 z500 RMSE 188 / 451 / 723(ClimODE 논문 193 / 479 / 784), 5변수 CRPS −5~−6 %(regm_band 대비), 회귀 대비 30칸 모두 유의하게 좋아집니다. 이것이 CPU 4년 예산에서 새 최선 arm이고, 논문의 주장도 여기에 두어야 합니다: "단일 모델 ClimODE 대 다중 모델 후처리 평균"임을 밝히고, 단일 모델 비교는 G(x) 코어 197 ≈ ClimODE 193으로 적습니다.
+2. **물리 특징 G(x)의 점수 몫은 0 ± 1 %입니다.** 72 h까지 유의한 이득(z500 24 h −14 m²/s², CRPS −5 %)과 96 h부터 같은 크기의 손해가 상쇄됩니다. 18단계에서 본 원인(연산자 힌트가 긴 롤아웃에서 자기 오차에 되먹임, 상관 0.5·크기 2배의 경향)이 혼합으로도 지워지지 않습니다. 논문에서 물리는 "단기 힌트"로만 쓸 수 있고, 장기까지 이득을 보려면 (a) G(x)를 lead나 적분 시간에 따라 꺼 주는 게이트, (b) 더 정확한 연산자(해상도·ω·지면기압 예측 방정식, 17단계의 SWE 결과)가 필요합니다.
+3. **PINN 사영은 다변량 점수에서도 0입니다.** 5변수 energy score와 z–t 쌍 ES 모두 raw와 같고(±0.5 % 안), 결합 구조를 실제로 바꾸는 것은 닫힌 형 정역학 사영뿐입니다(z–t ES −5~−9 %, 보정 전). 16단계의 결론(사영은 보정 뒤 점수에 닿지 않는다)이 다변량 점수로도 확인됩니다.
+4. 소유자의 원래 질문 "PINN 구조로 점수를 올리려면"에 대한 이 단계의 답: 사영(PINN)으로는 안 되고, 물리를 **평균을 만드는 모델의 입력 구조**로 넣으면 단기에만 닿으며, 점수를 실제로 올린 것은 서로 다른 두 평균 모델의 혼합입니다. 다음 단계가 있다면 lead 게이트가 있는 G(x) 코어(단기 이득만 취하기)와 GPU ClimODE 연도 재현(`BLEND=1 PROFILE=climode`, `docs/RUN_ON_GPU.md` 13절)입니다.
 
 ## 4. 약점
 
