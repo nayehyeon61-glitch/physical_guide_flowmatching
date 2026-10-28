@@ -254,7 +254,10 @@ def main(argv=None):
     uc, inv_c = np.unique(ci, return_inverse=True)
     xc = load_states(coarse_path, uc, mean, std)[torch.from_numpy(inv_c.reshape(ci.shape))]
     n = xf.shape[0]
-    xi = interpolate(xc.reshape(n * 3, *xc.shape[2:]), lat_c, lat_f, len(lon_f)).reshape(n, 3, *xf.shape[2:])
+    xi = torch.empty_like(xf)
+    for i in range(0, n, 8):  # chunked: the spline works in float64 (memory)
+        xi[i:i + 8] = interpolate(xc[i:i + 8].reshape(-1, *xc.shape[2:]), lat_c, lat_f, len(lon_f)
+                                  ).reshape(-1, 3, *xf.shape[2:])
     xi[:, :, OROG] = xf[:, :, OROG]  # the downscaler knows the true fine topography
     gap = interpolation_gap(xi[:, 1], xf[:, 1])
     print("interpolation gap (rel RMSE to the fine field / fine power beyond k=32): "
