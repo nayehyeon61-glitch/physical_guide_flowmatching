@@ -11,7 +11,9 @@
 #   bash scripts/run_step13_best.sh                    # everything: 6-7 h on 4 CPU cores after the data
 #   DATA=/path/era5_5p625 OUT=runs/best bash scripts/run_step13_best.sh
 #   CONTROL=1 bash scripts/run_step13_best.sh          # + the same mean and Gamma on the regression's deviations
-#   CLIMODE=1 bash scripts/run_step13_best.sh          # + ClimODE's checkpoint on its first 16 test ICs, paired
+#   CLIMODE=1 bash scripts/run_step13_best.sh          # + ClimODE's checkpoint on CLIMODE_ICS IC pairs (default 8: its
+#                                                      #   first 16 test ICs; CLIMODE_STRIDE / CLIMODE_OFFSET pick a subset,
+#                                                      #   CLIMODE_ICS=180 all), paired scores and figure (docs/step22_climode_paired.md)
 #   SIGMA=0 bash scripts/run_step13_best.sh            # regm_band only, without the spread-field arms
 #   SBAND=0 bash scripts/run_step13_best.sh            # without regm_sband_clim_flow (saves ~15 min)
 #   SMOKE=1 bash scripts/run_step13_best.sh            # 2 iterations, 6 ICs a year: checks the chain (~15 min)
@@ -52,6 +54,7 @@ OUT=${OUT:-$([ "$SMOKE" = 1 ] && echo runs/step13_smoke || echo runs/step13_best
 THREADS=${THREADS:-4}
 CONTROL=${CONTROL:-0}
 CLIMODE=${CLIMODE:-0}
+CLIMODE_ICS=${CLIMODE_ICS:-8}; CLIMODE_STRIDE=${CLIMODE_STRIDE:-1}; CLIMODE_OFFSET=${CLIMODE_OFFSET:-0}
 SIGMA=${SIGMA:-1}
 SBAND=${SBAND:-1}
 SR=${SR:-0}
@@ -242,10 +245,19 @@ fi
 
 # 5. optional: ClimODE's published checkpoint on its first 8 ICs of each test year, then the paired comparison
 if [ "$CLIMODE" = 1 ] && [ "$SMOKE" != 1 ]; then
+    # ClimODE's published checkpoint with the authors' code on CLIMODE_ICS IC pairs (one IC of 2017 and one of
+    # 2018 each): every CLIMODE_STRIDE-th pair from pair CLIMODE_OFFSET (ics = 2 + 8 e), so CLIMODE_STRIDE=20
+    # CLIMODE_OFFSET=10 spreads 9 pairs over the seasons; CLIMODE_ICS=180 is the whole test set (about 18 min a
+    # pair on 4 CPU cores, a few minutes on a GPU). Then every scored arm (and the blend arm and the G(x) core
+    # with BLEND=1) is scored on exactly those ICs, paired with bootstrap intervals, and drawn as a 2x2 figure.
     run climode "$OUT/climode/climode_pred.npz" python scripts/run_climode_eval.py --data "$E" --out "$OUT/climode" \
-        --max-ics 8 --lead-steps 24
+        --max-ics "$CLIMODE_ICS" --ic-stride "$CLIMODE_STRIDE" --ic-offset "$CLIMODE_OFFSET" --lead-steps 24
+    PAIRED_ARMS="$ARMS"; PAIRED_CORE=""
+    [ "$BLEND" = 1 ] && PAIRED_ARMS="$PAIRED_ARMS ${FM}_blend_band" && PAIRED_CORE="--core $OUT/dyn_gfeat"
     run paired "$OUT/climode_paired_best.json" python scripts/compare_step13_climode.py --era5 "$E" \
-        --climode "$OUT/climode/climode_pred.npz" --arms $ARMS --out "$OUT/climode_paired_best.json"
+        --climode "$OUT/climode/climode_pred.npz" --arms $PAIRED_ARMS $PAIRED_CORE --out "$OUT/climode_paired_best.json"
+    run fig_paired "$OUT/fig/fig_climode_paired.png" python scripts/plot_step13.py --era5 "$E" \
+        --scores "$OUT/score_best.json" --years $TEST_YEARS --figures none --paired "$OUT/climode_paired_best.json" --out "$OUT/fig"
 fi
 # 6. optional: step 19 output-stage super-resolution (docs/step19_sr_output.md). The 2.8125 deg truth of the 5
 #    ClimODE variables (WB2 128x64) lands next to the 5.625 deg files in $E; the SR net (pgcfm/sr.py) learns

@@ -67,9 +67,9 @@ def main(argv=None):
                 print(f"  {y}: {f} missing, skipped")
         for prefix in a.core:
             with np.load(prefix + "_pred.npz") as z:
-                if str(y) in z.files:
-                    sources[os.path.basename(prefix)] = ("det", z[str(y)][[(i - 2) // 8 for i in ics]],
-                                                         [int(h) for h in z["leads"]])
+                if str(y) in z.files:  # step 12 cores carry "leads"; step 16 / 18 cores (run_step16_predict.py) are 24..144 h
+                    lz = [int(h) for h in z["leads"]] if "leads" in z.files else [24 * (k + 1) for k in range(z[str(y)].shape[1])]
+                    sources[os.path.basename(prefix)] = ("det", z[str(y)][[(i - 2) // 8 for i in ics]], lz)
         for e, i0 in enumerate(ics):
             for j, h in enumerate(leads):
                 obs = truth[i0 + h // 6]
@@ -95,7 +95,7 @@ def main(argv=None):
                         add(name, h, met, v)
                         if met in s_c:
                             add(f"{name}-climode", h, met, v - s_c[met])
-    out = {"n_ic": {}, "leads": leads, "vars": VARS, "scores": {}}
+    out = {"n_ic": {}, "leads": leads, "vars": VARS, "ics": ics, "climode": a.climode, "scores": {}}
     for name, by_h in scores.items():
         for h, d in by_h.items():
             for met, v in d.items():
@@ -107,7 +107,7 @@ def main(argv=None):
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w") as f:
         json.dump(out, f, indent=1)
-    print(f"[paired] ClimODE's first {len(ics)} ICs of each test year; ICs per model {out['n_ic']}")
+    print(f"[paired] ClimODE's ICs {ics} of each test year; ICs per model {out['n_ic']}")
     for name, by_h in out["scores"].items():
         for met in ("rmse", "crps_gauss", "crps_ens"):
             if met not in by_h[str(leads[0])]:

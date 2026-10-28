@@ -105,7 +105,11 @@ PAIRED = [  # (score key, label, line style, categorical slot)
     ("seqfm_dct_pinn_core_guide", "Core mean + FM deviations + band guide", "-", 3),
     ("seqfm_dct_pinn_reg_band", "Regression mean + FM deviations + band Γ", "-", 5),
     ("seqregress_pinn_reg_band", "Regression mean + its own deviations + band Γ", "--", 5),
-    ("seqfm_dct_pinn_regm_band", "a + b·regression mean + c·x(t) + FM deviations + band Γ", "-", 7),
+    ("seqfm_dct_pinn_regm_band", "regm_band: a + b·μ_reg + c·x(t) + FM deviations + band Γ", "-", 7),
+    ("seqregress_pinn", "Regression + statistical errors + P", "-", 6),
+    ("dyn_gfeat", "G(x)-feature ODE core alone (deterministic)", "-.", 1),
+    ("seqfm_dct_pinn_blend_band", "blend_band: a + b·G(x) core + c·μ_reg + d·x(t) + FM deviations + band Γ", "-", 2),
+    ("seqfm_dct_pinn_blend_lp0_band", "the same blend with the data-only core (control)", "--", 4),
 ]
 
 
@@ -129,7 +133,7 @@ def plot_paired(paths, out, mx, mn):
               (ax[1, 1], "Geopotential at 500 hPa", "Ensemble spread (m²/s²)", "spread", "z", 1.0)]
     for a_, sub, ylab, met, v, scale in panels:
         for k, lab, ls, slot in PAIRED:
-            if k in S:
+            if k in S and met in S[k][str(leads[0])]:  # a deterministic core has no spread
                 a_.plot(days, get(k, met, v) * scale, ls, color=SLOTS[slot], lw=1.8, label=lab)
         pers = get("persistence", met, v) * scale if met != "spread" else np.zeros(len(leads))
         a_.plot(days, pers, ":", color=MUTED, lw=2, label="Persistence")
@@ -142,10 +146,17 @@ def plot_paired(paths, out, mx, mn):
         a_.grid(True, color=GRID, lw=0.8)
         for s_ in ("top", "right"):
             a_.spines[s_].set_visible(False)
-    fig.legend(*ax[0, 0].get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize=9, frameon=False)
+    fig.legend(*ax[0, 0].get_legend_handles_labels(), loc="outside lower center", ncol=2, fontsize=9, frameon=False)
     n = d["n_ic"].get("climode") if isinstance(d["n_ic"], dict) else d["n_ic"]
-    fig.suptitle(f"Step 13 vs ClimODE on the same {n} ICs (ClimODE's first 8 of 2017 and of 2018, January)\n"
-                 "ClimODE: authors' checkpoint and code; ours: CPU budget, 8 members", fontsize=13)
+    ics = d.get("ics")
+    if ics and max(ics) < 100:
+        which = f"ClimODE's first {len(ics)} ICs of 2017 and of 2018, January"
+    elif ics:
+        which = f"{len(ics)} ICs of 2017 and of 2018 (days " + ", ".join(str(i // 4 + 1) for i in ics) + ")"
+    else:
+        which = "ClimODE's first 8 of 2017 and of 2018, January"
+    fig.suptitle(f"PG-CFM arms vs ClimODE's public checkpoint on the same {n} ICs ({which})\n"
+                 "ClimODE: authors' checkpoint and code, Gaussian σ; ours: CPU budget, 8 members", fontsize=13)
     p = os.path.join(out, "fig_climode_paired.png")
     fig.savefig(p, dpi=150)
     plt.close(fig)

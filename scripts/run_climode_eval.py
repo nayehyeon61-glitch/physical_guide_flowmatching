@@ -38,6 +38,8 @@ def main(argv=None):
     p.add_argument("--out", default="runs/step11")
     p.add_argument("--ckpt", default=None)
     p.add_argument("--max-ics", type=int, default=None, help="per test year (upstream: all 182)")
+    p.add_argument("--ic-stride", type=int, default=1, help="every n-th IC pair (ics = 2 + 8e): a season-spread subset")
+    p.add_argument("--ic-offset", type=int, default=0, help="first IC pair index e")
     p.add_argument("--lead-steps", type=int, default=24, help="6 h steps (upstream eval: 7)")
     p.add_argument("--solver", default="euler")
     p.add_argument("--eval-mode", action="store_true",
@@ -73,10 +75,13 @@ def main(argv=None):
     H, W = test.shape[3], test.shape[4]
     clim = torch.mean(test, dim=0)  # upstream ACC climatology: time mean of each test year
 
-    n_ic = (len(test) - 2 - a.lead_steps) // 8 + 1
+    n_all = (len(test) - 2 - a.lead_steps) // 8 + 1
+    es = list(range(a.ic_offset, n_all, a.ic_stride))
     if a.max_ics:
-        n_ic = min(n_ic, a.max_ics)
-    ics = [2 + 8 * e for e in range(n_ic)]
+        es = es[:a.max_ics]
+    n_ic = len(es)
+    ics = [2 + 8 * e for e in es]
+    contiguous = a.ic_stride == 1 and a.ic_offset == 0
 
     # -- test velocities with upstream fit_velocity (kernel cached in the out folder) -------------
     cwd = os.getcwd()
@@ -87,13 +92,16 @@ def main(argv=None):
             cu.get_gauss_kernel((H, W), lat, lon)
             print(f"kernel {time.time() - t0:.0f}s", flush=True)
         kernel = torch.from_numpy(np.load("kernel.npy"))
-        vel_name = f"test_{n_ic}ic"
+        vel_name = f"test_{n_ic}ic" if contiguous else f"test_{n_ic}ic_s{a.ic_stride}_o{a.ic_offset}"
         if not os.path.exists(vel_name + "_vel.npy"):
             t0 = time.time()
             idx = torch.arange(1460).view(-1, 1)
-            data_loader = torch.utils.data.DataLoader(test[2:2 + 8 * n_ic], batch_size=8, shuffle=False)
-            time_loader = torch.utils.data.DataLoader(time_steps[2:2 + 8 * n_ic], batch_size=8, shuffle=False)
-            idx_loader = torch.utils.data.DataLoader(idx[2:2 + 8 * n_ic], batch_size=8, shuffle=False)
+            # upstream fits one velocity per batch from the batch's first element, so a batch of 8 consecutive
+            # steps starting at each IC equals a batch of 1 holding the IC alone; the latter takes any IC subset
+            sel = torch.tensor(ics)
+            data_loader = torch.utils.data.DataLoader(test[sel], batch_size=1, shuffle=False)
+            time_loader = torch.utils.data.DataLoader(time_steps[sel], batch_size=1, shuffle=False)
+            idx_loader = torch.utils.data.DataLoader(idx[sel], batch_size=1, shuffle=False)
             cu.fit_velocity(idx_loader, time_loader, test, data_loader, torch.device("cpu"), 2, LEVELS, 0, H, W,
                             types=vel_name, vel_model=Optim_velocity, kernel=kernel, lat=lat, lon=lon)
             print(f"velocity fit {time.time() - t0:.0f}s", flush=True)
