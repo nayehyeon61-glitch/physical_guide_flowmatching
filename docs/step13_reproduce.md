@@ -46,6 +46,7 @@
 | 4. 채점 | `score_step13.py --ref seqregress_pinn --arms seqregress_pinn seqfm_dct_pinn_regm_band …regm_flow …regm_flowop …regm_sband_clim_flow` | `score_best.json` | 약 5분 |
 | 5. 흐름 의존성 | `diag_step13_flowdep.py --leads 24 48 72 96 120 144` | `flowdep.json` (퍼짐 변동계수, 퍼짐 오분위별 오차) | 1분 |
 | 6. 퍼짐장 비교 | `score_step13.py --ref …regm_band`, `plot_step13_flowdep.py` (`SIGMA=1`일 때) | `score_sigma.json`, `fig/fig_flowdep.png` | 약 4분 |
+| 7b. 혼합 평균 (`BLEND=1`일 때) | `run_step16_dynpinn.py --gfeat`, `run_step16_predict.py`, `run_step13_guide.py --blend --save-arms blend_band`, `score_step13.py`, `step20_energy_score.py`, `plot_step13.py --figures fig_step20` | `dyn_gfeat.pt/.json`, `dyn_gfeat_pred*.npz`, `seqfm_dct_pinn_blend_band_ens_*.npz`, `score_blend.json`, `energy_blend.json`, `fig/fig_step20.png` | 코어 76분(CPU 4년) / GPU 1~2시간 + 보정 30분 + 채점 10분 |
 | 7. 출력단 SR (`SR=1`일 때) | `wb2_to_kai.py --grid 128x64 --climode-only`, `run_step19_sr.py --ens <채점한 arm 전부>` | `era5_data/*/*_2.8125deg.nc`, `sr/sr.json`, `sr/sr.pt`, `fig/fig_sr_sr_<arm>.png` | 2.8° 자료 받기 + 학습 31분(4년, CPU) / GPU 수 분 + arm·해마다 채점 CPU 15분 |
 
 학습은 2012–2015년, 보정(a, b, c, Γ, σ 장)은 2016년, 시험은 2017–2018년 ClimODE 초기장 360개입니다. 데이터 내려받기를 빼고 약 6–7시간입니다.
@@ -148,5 +149,6 @@
 - 저장된 앙상블에는 ClimODE의 5변수(z500, t850, t2m, u10, v10)만 24 h 간격으로 들어 있습니다. 66채널 전체 멤버가 필요하면 `run_step13_seqfm.py`에서 저장할 변수를 늘려야 합니다.
 - 보정 단계는 매번 2016년에서 a, b, c와 Γ를 닫힌 형으로, σ 장 망은 NLL로 다시 맞춥니다(학습된 가중치가 따로 없음). 다른 해에 적용하려면 그 해의 FM·회귀 앙상블을 같은 방법으로 만든 뒤 `--test-years`를 바꾸면 됩니다.
 - σ 장 망은 seed가 고정되어 있지만, 스레드 수에 따라 학습 결과가 조금 달라질 수 있습니다. 이 문서의 regm_flow, regm_flowop 수치는 4스레드 실행입니다.
+- 20단계 혼합 평균(blend_band)은 `BLEND=1`로 붙습니다: G(x) 특징 코어를 프로파일의 연도로 학습하고 ClimODE IC를 예측한 뒤, 회귀 평균과 lead·변수별로 섞은 평균에 FM 편차와 Γ를 얹어 `score_blend.json`으로 채점합니다(ClimODE 연도 비교: `BLEND=1 PROFILE=climode`, `docs/RUN_ON_GPU.md` 13절).
 - 출력단 SR(19단계)은 `SR=1`로 같은 스크립트에 붙습니다. 채점된 arm 전부를 멤버별로 2.8125°로 올려 2.8° 진실로 채점하고(`$OUT/sr/sr.json`), `SR_SAVE=1`이면 SR한 멤버도 저장합니다. GPU 설정과 결과 읽는 법은 `docs/RUN_ON_GPU.md` 12절.
 - GPU에서 더 오래 학습하려면 `--device cuda`(또는 `PROFILE=broad`)를 쓰세요. 15단계에서 장치 옵션, memmap 캐시, 검증과 best 선택, 시간 예산 재개가 들어갔습니다(`docs/step15_training_system.md`).

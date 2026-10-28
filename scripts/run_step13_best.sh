@@ -17,6 +17,9 @@
 #   SMOKE=1 bash scripts/run_step13_best.sh            # 2 iterations, 6 ICs a year: checks the chain (~15 min)
 #   SR=1 bash scripts/run_step13_best.sh               # + step 19 output-stage super-resolution of every scored arm
 #                                                      #   (2.8125 deg truth download, SR net, 2.8 deg scores; docs/RUN_ON_GPU.md 12)
+#   BLEND=1 PROFILE=climode bash scripts/run_step13_best.sh   # + step 20 blend_band: G(x)-feature core trained on the
+#                                                      #   profile's years, mu* = a + b core + c regression + d x(t), scored
+#                                                      #   with the energy scores and the step 20 figure (docs/RUN_ON_GPU.md 13)
 #
 # Profiles (docs/step15_training_system.md) set the training years, iterations, batches and validation:
 #   PROFILE=small (default)   train 2012-2015, the CPU settings of docs/step13_reproduce.md
@@ -32,7 +35,8 @@
 # VAL_MEMBERS PATIENCE MAX_HOURS (per trainer invocation: saves and exits 75, rerun to resume) DEVICE CACHE
 # (1 = memory-mapped years under $OUT/cache) AMP (1 = bf16 autocast on cuda). With SR=1: SR_TRAIN_YEARS (default
 # TRAIN_YEARS; 2.8125 deg files are 240 MB a year), SR_ITERS, SR_BATCH, SR_CHUNK (ICs per scoring chunk), SR_SAVE
-# (1 = write the super-resolved members, 0.7 GB per arm and year). Each step appends a line to
+# (1 = write the super-resolved members, 0.7 GB per arm and year). With BLEND=1: CORE_ITERS, CORE_BATCH (the G(x)
+# core; small 4000 x 4, broad / climode 20000 x 16). Each step appends a line to
 # $OUT/manifest.jsonl (command, commit, start, end, exit).
 #
 # Trained weights: put pinn_project.pt, pinn_project.json, seqfm_dct.pt, seqregress.pt and stats/ in $OUT
@@ -52,6 +56,7 @@ SIGMA=${SIGMA:-1}
 SBAND=${SBAND:-1}
 SR=${SR:-0}
 SR_SAVE=${SR_SAVE:-0}
+BLEND=${BLEND:-0}
 VAL_YEAR=${VAL_YEAR:-2016}
 TEST_YEARS=${TEST_YEARS:-"2017 2018"}
 case "$PROFILE" in
@@ -61,6 +66,7 @@ case "$PROFILE" in
         GEN_ITERS=${GEN_ITERS:-3000}; GEN_BATCH=${GEN_BATCH:-4}
         VAL_EVERY=${VAL_EVERY:-0}; VAL_MEMBERS=${VAL_MEMBERS:-0}
         SR_ITERS=${SR_ITERS:-3000}; SR_BATCH=${SR_BATCH:-16}; SR_CHUNK=${SR_CHUNK:-6}
+        CORE_ITERS=${CORE_ITERS:-4000}; CORE_BATCH=${CORE_BATCH:-4}; CORE_VAL_EVERY=${CORE_VAL_EVERY:-500}
         DEVICE=${DEVICE:-cpu}; CACHE=${CACHE:-0} ;;
     broad|broad_long|climode)
         # broad: the owner's 2026-10-27 GPU run (37 years). broad_long: the same data, 3x the FM / regression
@@ -76,6 +82,7 @@ case "$PROFILE" in
         VAL_EVERY=${VAL_EVERY:-1000}; VAL_MEMBERS=${VAL_MEMBERS:-4}
         PATIENCE=${PATIENCE:-$([ "$PROFILE" = broad_long ] && echo 10 || echo 0)}
         SR_ITERS=${SR_ITERS:-20000}; SR_BATCH=${SR_BATCH:-32}; SR_CHUNK=${SR_CHUNK:-30}
+        CORE_ITERS=${CORE_ITERS:-20000}; CORE_BATCH=${CORE_BATCH:-16}; CORE_VAL_EVERY=${CORE_VAL_EVERY:-1000}
         DEVICE=${DEVICE:-auto}; CACHE=${CACHE:-1} ;;
     *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, smoke)"; exit 2 ;;
 esac
@@ -96,9 +103,12 @@ if [ "$SMOKE" = 1 ]; then
     PINN_ARGS="--iters 2 --n-val 4"; GEN_ARGS="--iters 2 --max-ics 6"
     GUIDE_ARGS="--n-valid 1 --epochs 1 --guide-epochs 1 --sigma-epochs 1"; SCORE_ARGS="--n-boot 20"; SIGMA_FULL=1
     ABAND_ARGS="--epochs 1 --width 8"; SR_ARGS="--iters 2 --val-every 1 --n-val 4 --max-ics 6"
+    CORE_ARGS="--iters 2 --batch 2 --n-val 4 --n-val-train 4 --val-K 8 --val-every 1"; PREDICT_ARGS="--max-ics 6"
 else
     PINN_ARGS="--iters $PINN_ITERS --batch $PINN_BATCH"; GEN_ARGS="--iters $GEN_ITERS --batch $GEN_BATCH --val-members $VAL_MEMBERS"
     GUIDE_ARGS=""; SCORE_ARGS=""; SIGMA_FULL=30; ABAND_ARGS=""; SR_ARGS="--iters $SR_ITERS --batch $SR_BATCH"
+    CORE_ARGS="--iters $CORE_ITERS --batch $CORE_BATCH --n-val 16 --n-val-train 8 --val-K 24 --val-every $CORE_VAL_EVERY"
+    PREDICT_ARGS=""
 fi
 [ "$AMP" = 1 ] && SR_ARGS="$SR_ARGS --amp"
 [ "$SR_SAVE" = 1 ] && SR_ARGS="$SR_ARGS --save-sr"
@@ -182,6 +192,32 @@ if [ "$CONTROL" = 1 ]; then  # the paper's control: same mu* and Gamma formula o
         --out "$OUT" --reg "$REG" --reg-mbm --val-year "$VAL_YEAR" --test-years $TEST_YEARS \
         --save-arms regm_band --threads "$THREADS" $GUIDE_ARGS
     ARMS="$ARMS ${REG}_regm_band"
+fi
+
+# 3c. optional (BLEND=1): the step 20 blended mean (docs/step20_pinn_score.md). The G(x)-feature tendency core
+#     (step 18, pgcfm/dyncore.py: the strong-form operator tendency -R0(x) of u, v, T, q as 48 input channels of
+#     the ODE core, docs/step18_downscaling.md 5) is trained on the profile's years with the trainer options of
+#     step 15, predicts ClimODE's ICs, and the guide fits mu* = a + b core + c regression mean + d x(t) per lead and
+#     variable on the validation year under the FM + PINN deviations and the band Gamma (arm blend_band). Scored
+#     against the regression next to regm_band (and regm_sband_clim_flow when present), with the energy scores and
+#     the step 20 figure: $OUT/score_blend.json, $OUT/energy_blend.json, $OUT/fig/fig_step20.png.
+if [ "$BLEND" = 1 ]; then
+    CORE=$OUT/dyn_gfeat
+    run core_gfeat "$CORE.json" python scripts/run_step16_dynpinn.py --kai "$K" --era5 "$E" --out "$OUT" --tag dyn_gfeat \
+        --gfeat --lambda-p 0 $PINN_YEARS_ARGS --K 8 --curriculum 1 2 4 8 --val-chunk 4 $TRAIN_ARGS $CORE_ARGS
+    run core_predict "${CORE}_pred.npz" python scripts/run_step16_predict.py --kai "$K" --era5 "$E" --run "$OUT" \
+        --tag dyn_gfeat --val-year "$VAL_YEAR" --test-years $TEST_YEARS --threads "$THREADS" $PREDICT_ARGS
+    run guide_blend "${FM}_blend_band_ens_$LAST_TEST.npz" python scripts/run_step13_guide.py --ens "$FM" --era5 "$E" \
+        --out "$OUT" --core "$CORE" --reg "$REG" --reg-mbm --blend --val-year "$VAL_YEAR" --test-years $TEST_YEARS \
+        --save-arms blend_band --threads "$THREADS" $GUIDE_ARGS
+    BLEND_ARMS="$REG ${FM}_regm_band ${FM}_blend_band"
+    [ -e "${FM}_regm_sband_clim_flow_ens_$LAST_TEST.npz" ] && BLEND_ARMS="$BLEND_ARMS ${FM}_regm_sband_clim_flow"
+    run score_blend "$OUT/score_blend.json" python scripts/score_step13.py --era5 "$E" --out "$OUT/score_blend.json" \
+        --ref "$REG" --arms $BLEND_ARMS --test-years $TEST_YEARS $SCORE_ARGS
+    run energy_blend "$OUT/energy_blend.json" python scripts/step20_energy_score.py --era5 "$E" \
+        --out "$OUT/energy_blend.json" --arms $BLEND_ARMS --test-years $TEST_YEARS --threads "$THREADS"
+    run fig_blend "$OUT/fig/fig_step20.png" python scripts/plot_step13.py --era5 "$E" --scores "$OUT/score_blend.json" \
+        --years $TEST_YEARS --figures fig_step20 --out "$OUT/fig" --step "Step 20"
 fi
 
 # 4. scores on ClimODE's test ICs (2017-2018), bootstrap differences against regression + statistical errors
