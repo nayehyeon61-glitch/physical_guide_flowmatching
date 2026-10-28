@@ -65,7 +65,7 @@ def main(argv=None):
     torch.set_num_threads(a.threads)
     lat, lon, _, _ = load_static(a.era5)
     w = torch.from_numpy((np.cos(np.deg2rad(lat)) / np.cos(np.deg2rad(lat)).mean()).astype(np.float32))[:, None]
-    std = np.stack([climode_truth(a.era5, y) for y in (2015, 2016)]).reshape(-1, 5, len(lat), len(lon)).std((0, 2, 3))
+    std = np.concatenate([climode_truth(a.era5, y) for y in (2015, 2016)], 0).std((0, 2, 3))
     std = torch.from_numpy(std.astype(np.float32))[:, None, None]
     iz, it = VARS.index("z"), VARS.index("t")
     res = {"std": std.view(-1).tolist(), "arms": {}}

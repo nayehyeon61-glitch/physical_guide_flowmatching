@@ -61,6 +61,15 @@ FIGURES = {  # (score key, label, line style, categorical slot); calibration: sl
         ("seqfm_dct_pinn", "Step 13 FM + PINN (no core)", "-", 6),
         ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
     ]),
+    # step 20 (docs/step20_pinn_score.md): the blended mean a + b core + c regression + d x(t) per lead and variable
+    "fig_step20": ("Step 20: blended mean (a + b·G(x) core + c·regression mean + d·x(t)) + FM deviations + band Γ", [
+        ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
+        ("seqfm_dct_pinn_regm_band", "regm_band: a + b·regression mean + c·x(t) (reported model)", "-", 7),
+        ("seqfm_dct_pinn_regm_sband_clim_flow", "regm_sband_clim_flow (best probabilistic arm)", "--", 7),
+        ("seqfm_dct_pinn_core_band", "G(x)-feature core mean alone + band Γ", "-.", 3),
+        ("seqfm_dct_pinn_blend_band", "blend_band: + G(x)-feature core (dyn_gfeat)", "-", 0),
+        ("seqfm_dct_pinn_blend_lp0_band", "blend with the data-only core (dyn_lp0, control)", "--", 0),
+    ]),
     "fig_resfm_cal": ("The same members after the band Gamma on the regression mean (regm_band)", [
         ("seqfm_dct_core_pinn_regm_band", "PINN projection + regm_band", "--", 1),
         ("seqfm_dct_core_pinn_mbm_band", "PINN projection + MBM mean + band", ":", 1),
