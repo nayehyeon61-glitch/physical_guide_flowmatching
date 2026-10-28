@@ -95,9 +95,12 @@ def main(argv=None):
                 add("ref", "spread2", ((sd ** 2) * w).mean((-1, -2)))
                 lo = norm.cdf((th[:, 0] - mu) / sd)
                 hi = 1 - norm.cdf((th[:, 1] - mu) / sd)
-                b_lo, b_hi, c_lo, c_hi = brier(lo, hi, obs, th)
-                add("ref", "brier_lower", b_lo), add("ref", "brier_upper", b_hi)
-                add("ref", "brier_clim_lower", c_lo), add("ref", "brier_clim_upper", c_hi)
+            else:  # deterministic reference: its tercile "probability" is 0 or 1
+                lo, hi = (mu < th[:, 0]).astype(np.float64), (mu > th[:, 1]).astype(np.float64)
+            b_lo, b_hi, c_lo, c_hi = brier(lo, hi, obs, th)
+            add("ref", "brier_lower", b_lo), add("ref", "brier_upper", b_hi)
+            add("ref", "brier_clim_lower", c_lo), add("ref", "brier_clim_upper", c_hi)
+            if not ref_det:
                 pit = norm.cdf((obs - mu) / sd)  # (L, 5, H, W)
                 per.setdefault("ref", {}).setdefault("pit", []).append(pit)
             for h in a.spec_leads:
@@ -117,9 +120,8 @@ def main(argv=None):
                 b_lo, b_hi, c_lo, c_hi = brier(lo, hi, obs, th)
                 add(name, "brier_lower", b_lo), add(name, "brier_upper", b_hi)
                 add(name, "brier_clim_lower", c_lo), add(name, "brier_clim_upper", c_hi)
-                if not ref_det:
-                    add(f"{name}-ref", "brier_lower", b_lo - per["ref"]["brier_lower"][-1])
-                    add(f"{name}-ref", "brier_upper", b_hi - per["ref"]["brier_upper"][-1])
+                add(f"{name}-ref", "brier_lower", b_lo - per["ref"]["brier_lower"][-1])
+                add(f"{name}-ref", "brier_upper", b_hi - per["ref"]["brier_upper"][-1])
                 below = (Em < obs[None]).sum(0) + rng.integers(0, 1 + (Em == obs[None]).sum(0))  # (L, 5, H, W)
                 per.setdefault(name, {}).setdefault("rank", []).append((below, M))
                 for h in a.spec_leads:
@@ -219,7 +221,8 @@ def plot(out, path):
     for k, n in enumerate(arms):
         a_.plot(days, np.array(out["scores"][n]["bss_upper"])[:, iz], color=SLOTS[k], lw=1.8, label=LABELS.get(n, n))
     if "bss_upper" in out["scores"]["ref"]:
-        a_.plot(days, np.array(out["scores"]["ref"]["bss_upper"])[:, iz], "-", color=INK, lw=1.2, marker="s", ms=5, label=ref)
+        a_.plot(days, np.array(out["scores"]["ref"]["bss_upper"])[:, iz], "-", color=INK, lw=1.2, marker="s", ms=5,
+                label=ref + (" (0/1 forecast)" if out.get("reference_deterministic") else ""))
     a_.axhline(0, color=MUTED, ls=":", lw=1.5, label="climatology (0)")
     a_.set_title("z500 Brier skill, event: above the monthly upper tercile"), a_.set_xlabel("Forecast lead (days)")
     a_.set_ylabel("BSS (1 = perfect)")
