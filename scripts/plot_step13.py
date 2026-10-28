@@ -149,10 +149,17 @@ def plot_paired(paths, out, mx, mn):
     fig.legend(*ax[0, 0].get_legend_handles_labels(), loc="outside lower center", ncol=2, fontsize=9, frameon=False)
     n = d["n_ic"].get("climode") if isinstance(d["n_ic"], dict) else d["n_ic"]
     ics = d.get("ics")
+    years = d.get("years", [2017, 2018])
+    ys = ("each of " if len(years) > 1 else "") + " and ".join(str(y) for y in years)
+    dd = [i // 4 + 1 for i in ics] if ics else []
     if ics and max(ics) < 100:
-        which = f"ClimODE's first {len(ics)} ICs of 2017 and of 2018, January"
+        which = f"ClimODE's first {len(ics)} ICs of {ys}, January"
+    elif ics and len(ics) <= 8:
+        which = f"{len(ics)} ICs of {ys} (days " + ", ".join(str(x) for x in dd) + ")"
     elif ics:
-        which = f"{len(ics)} ICs of 2017 and of 2018 (days " + ", ".join(str(i // 4 + 1) for i in ics) + ")"
+        jan = sum(x <= 31 for x in dd)
+        rest = [x for x in dd if x > 31]
+        which = (f"{len(ics)} ICs of {ys}: {jan} in January" + (f" + {len(rest)} spread over days {min(rest)}-{max(rest)}" if rest else ""))
     else:
         which = "ClimODE's first 8 of 2017 and of 2018, January"
     ref = d.get("reference", "ClimODE (public checkpoint, reproduced)").split(" (")[0]
