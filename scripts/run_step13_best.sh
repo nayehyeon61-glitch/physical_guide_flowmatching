@@ -135,14 +135,21 @@ run() {  # run <name> <done-file> <command...>: skip when <done-file> exists, lo
 # 0. ERA5 5.625 deg from the public WeatherBench2 zarr: 6-hourly KAI files for the model years and
 #    WeatherBench1-style files (ClimODE's 5 variables) for scoring; 2006-2015 for the tercile climatology
 #    (daily files only, when they are not training years already).
+#    Every year is checked on its own (wb2_to_kai.py skips years already there), so a profile with more
+#    training years than an earlier run in the same DATA folder downloads only the years it lacks.
 LAST_TEST=${TEST_YEARS##* }
-run data_6h "$K/$LAST_TEST.nc" python scripts/wb2_to_kai.py --out "$DATA" --all-hours \
-    --years $TRAIN_YEARS $VAL_YEAR $TEST_YEARS
+MISSING=""
+for y in $TRAIN_YEARS $VAL_YEAR $TEST_YEARS; do [ -e "$K/$y.nc" ] || MISSING="$MISSING $y"; done
+if [ -n "$MISSING" ]; then
+    run data_6h "$K/.never" python scripts/wb2_to_kai.py --out "$DATA" --all-hours --years $MISSING
+fi
 CLIM_YEARS=""
-for y in $(seq 2006 2015); do case " $TRAIN_YEARS " in *" $y "*) ;; *) CLIM_YEARS="$CLIM_YEARS $y" ;; esac; done
+for y in $(seq 2006 2015); do
+    case " $TRAIN_YEARS " in *" $y "*) continue ;; esac
+    [ -e "$E/geopotential_500/geopotential_500_${y}_5.625deg.nc" ] || CLIM_YEARS="$CLIM_YEARS $y"
+done
 if [ -n "$CLIM_YEARS" ]; then
-    run data_clim "$E/geopotential_500/geopotential_500_${CLIM_YEARS##* }_5.625deg.nc" python scripts/wb2_to_kai.py \
-        --out "$DATA" --years $CLIM_YEARS
+    run data_clim "$E/.never" python scripts/wb2_to_kai.py --out "$DATA" --years $CLIM_YEARS
 fi
 
 # 1. stage 1: PINN projector on the low 8x16 DCT modes (project objective), then frozen. Also writes the

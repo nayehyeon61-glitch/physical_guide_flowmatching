@@ -4,8 +4,11 @@ run_step13_pinn.py, run_step13_seqfm.py, run_step13_guide.py and run_step13_oper
 a + b * regression mean + c * x(t), FM + PINN deviations, closed-form band Gamma) does not use faded.
 ``--sigma`` draws fig_system_sigma.png: how the flow-dependent spread field of regm_flowop is trained
 (docs/step13_sequence.md 4.3, pgcfm/flow_sigma.py: OperatorSigma).
+``--blend`` draws fig_system_blend.png: the step 20 best ensemble blend_band (PINN -> sequence FM and
+regression -> G(x)-feature ODE core -> BlendMBM mean + closed-form band Gamma, docs/step20_pinn_score.md).
 
     python scripts/plot_step13_system.py --out docs/step13 [--best | --sigma]
+    python scripts/plot_step13_system.py --out docs/step20 --blend
 """
 
 import argparse
@@ -25,7 +28,7 @@ KIND = {  # fill, edge
     "loss": ("#fcf2e8", "#c0692a"),
     "energy": ("#f2ecf8", "#7d5ba8"),
 }
-STAGE = {1: "#1f8a70", 2: "#2e62a6", 3: "#7d5ba8"}
+STAGE = {1: "#1f8a70", 2: "#2e62a6", 3: "#7d5ba8", 4: "#b0603a"}
 TITLE, BODY, RULE = "#1e2b45", "#5a6681", "#d9dce3"
 W, H = 15.5, 8.5
 COLS = [4 + i * (W + 3.75) for i in range(5)]
@@ -179,14 +182,159 @@ def sigma_system(out):
     return path
 
 
+def blend_system(out):
+    """blend_band (step 20): PINN -> sequence FM and regression -> G(x) core -> blended mean + band Gamma."""
+    fig = plt.figure(figsize=(20, 27.0))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(-0.5, 100.5)
+    ax.set_ylim(-0.5, 135)
+    ax.axis("off")
+    ax.text(4, 131.6, "Blended-mean PG-CFM", fontsize=30, weight="bold", color=TITLE, va="center")
+    ax.text(4, 128.3, "Best ensemble (blend_band): μ* = a + b·G(x) core + c·μ_reg + d·x(t) per lead and variable, "
+            "FM + PINN deviations, closed-form band Γ", fontsize=15, color=BODY, va="center")
+    ax.text(99, 131.6, "ERA5 5.625°, 66 KAI channels every 6 h", fontsize=12.5, color=BODY, ha="right", va="center")
+    ax.text(99, 129.2, "Train 2012–2015 on CPU  ·  GPU: PROFILE=climode, 2006–2015", fontsize=11.5, color=BODY,
+            ha="right", va="center")
+    ax.text(99, 127.0, "Fit stage 4 on 2016  ·  test 2017–2018 (ClimODE's 360 ICs)", fontsize=11.5, color=BODY,
+            ha="right", va="center")
+    ax.plot([4, 99], [125.2, 125.2], color=RULE, lw=1.2)
+
+    # -- stage 1: PINN -------------------------------------------------------------------------------
+    g = STAGE[1]
+    stage_band(ax, 111.5, 123.2, 1, "PINN", g)
+    sublabel(ax, 4, 122.6, "Stage 1 · pretrain the PINN projector, then freeze it  (run_step13_pinn.py)", g)
+    y = 116
+    box(ax, 0, y, "Truth sequence", ["x(t),  d_k = x(t + 6k h) − x(t)", "k = 1 … 24, 66 channels"], "data")
+    box(ax, 1, y, "Perturbed input d′", ["d + α·ε,  ε ~ per-lead DCT std", "stand-in for FM members"], "op")
+    box(ax, 2, y, "PINN projector P", ["d′ + lowpass N(x(t), d′)", "corrects low 8×16 modes only", "identity skip"],
+        "net")
+    box(ax, 3, y, "Projection loss", ["|P(d′) − d′|² + λ_P · Φ(P(d′))", "Φ: 6 h primitive-equation", "residual"],
+        "loss")
+    box(ax, 4, y, "Gates on 2016", ["identity on the truth", "spread ratio through P ≈ 1", "Φ falls (hydrostatic)"],
+        "data")
+    for c in range(4):
+        row(ax, c, c + 1, y, g)
+
+    # -- stage 2: sequence models ----------------------------------------------------------------------
+    b = STAGE[2]
+    stage_band(ax, 69.0, 108.6, 2, "SEQUENCE MODELS", b)
+    sublabel(ax, 4, 108, "Stage 2 · conditional flow matching on the whole 6-day sequence  (run_step13_seqfm.py)", b)
+    y = 102
+    box(ax, 0, y, "History + target", ["x(t − 12 h), x(t − 6 h), x(t)", "+ static fields, hour", "target d_1 … d_24"],
+        "data")
+    box(ax, 1, y, "3-D DCT of d", ["time × lat × lon, lossless", "standardized per lead", "and channel"], "op")
+    box(ax, 2, y, "Conditional FM  v_θ", ["U-Net computed on the grid", "velocity in DCT coefficients"], "net")
+    box(ax, 3, y, "Flow matching loss", ["|v_θ(a_s, s) − (a₁ − a₀)|²", "torchcfm, σ = 0"], "loss")
+    for c in range(3):
+        row(ax, c, c + 1, y, b)
+
+    sublabel(ax, 4, 94.4, "Generation · v_θ and P frozen", b)
+    y = 88.5
+    box(ax, 0, y, "Gaussian noise a₀", ["8 members per IC", "same noise for every arm"], "data")
+    box(ax, 1, y, "Flow ODE in s", ["Heun, 8 steps", "no guidance (raw flow)"], "net", frozen=True)
+    box(ax, 2, y, "Frozen PINN P", ["on every member", "in DCT space, low modes"], "net", frozen=True)
+    box(ax, 3, y, "IDCT + x(t)", ["physical members x_m", "clamp q ≥ 0, tcwv ≥ 0"], "op")
+    box(ax, 4, y, "FM + PINN ensemble", ["8 members, 6 days", "spread structure used below"], "data")
+    for c in range(4):
+        row(ax, c, c + 1, y, b)
+
+    sublabel(ax, 4, 80.9, "Regression · the same U-Net trained with MSE (the paper's control, one of the means)", b)
+    y = 75
+    box(ax, 0, y, "Same inputs", ["x(t − 12 h), x(t − 6 h), x(t)", "target d_1 … d_24"], "data")
+    box(ax, 1, y, "Same U-Net, MSE", ["mean sequence, 144 h", "20 min on CPU"], "net")
+    box(ax, 2, y, "Statistical errors", ["Gaussian, diagonal in the", "3-D DCT of 2016 residuals"], "op")
+    box(ax, 3, y, "Regression mean μ_reg", ["μ_reg + errors, then frozen P", "member mean → μ_reg"], "data")
+    for c in range(3):
+        row(ax, c, c + 1, y, b)
+
+    # -- stage 3: G(x)-feature ODE core ------------------------------------------------------------------
+    o = STAGE[4]
+    stage_band(ax, 50.5, 65.6, 3, "G(x) CORE", o)
+    sublabel(ax, 4, 65, "Stage 3 · deterministic ODE core with the operator tendency as input features  "
+             "(run_step16_dynpinn.py --gfeat --lambda-p 0, step 18)", o)
+    y = 59
+    box(ax, 0, y, "x(t) + G(x) features", ["66 channels + statics + hour", "G(x) = −A(x): u, v, T, q tendency",
+                                           "48 ch, no gradient, clamped ±5"], "op")
+    box(ax, 1, y, "ResNet tendency f_θ", ["hidden 48, blocks 2 + 2", "tendency of the 66 channels",
+                                         "λ_P = 0: no physics loss"], "net")
+    box(ax, 2, y, "Heun 6 h rollout", ["x_{k+1} = x_k + Heun(f_θ, 6 h)", "one G(x) per step, shared by k1, k2",
+                                       "K = 1 → 2 → 4 → 8 curriculum"], "net")
+    box(ax, 3, y, "Rollout loss", ["lat-weighted MSE to d_1 … d_K", "best 2016 z500 RMSE kept",
+                                   "then frozen: forecast 24 … 144 h"], "loss")
+    for c in range(3):
+        row(ax, c, c + 1, y, o)
+
+    # -- stage 4: blend calibration --------------------------------------------------------------------
+    v = STAGE[3]
+    stage_band(ax, 18.5, 48.4, 4, "CALIBRATION", v)
+    y = 40
+    yl = 49.5
+    arrow(ax, [(cx(4), 88.5 - H / 2 - 0.2), (cx(4), yl), (cx(0), yl), (cx(0), y + H / 2 + 0.35)], b)
+    sublabel(ax, cx(0) + 2, 47.3, "Stage 4a · FM deviations scaled by the closed-form band energy, fitted on 2016 "
+             "with every generator frozen  (run_step13_guide.py --blend)", v)
+    box(ax, 0, y, "FM + PINN members", ["x_m, 8 per IC", "2016 for the fit, 2017–18 test", "generators frozen"],
+        "data", frozen=True)
+    box(ax, 1, y, "Member deviations", ["x_m − x̄, 2-D DCT", "5 radial bands per lead", "and variable"], "op")
+    box(ax, 2, y, "Band energy Γ_b", ["√(err² / ((1 + 1/M) spread²))", "err = error of μ* on 2016",
+                                      "closed form, per lead · var · band"], "energy")
+    box(ax, 3, y, "Scaled deviations + μ*", ["IDCT(Γ_b · DCT(x_m − x̄))", "y_m = μ* + scaled deviation",
+                                            "ensemble mean = μ* exactly"], "energy")
+    box(ax, 4, y, "blend_band ensemble", ["8 members, 6 days", "z500 RMSE 188 / 451 / 723", "5-var CRPS 0.02449 (−5 %)"],
+        "energy")
+    for c in range(4):
+        row(ax, c, c + 1, y, v)
+
+    sublabel(ax, 4, 32.0, "Stage 4b · the blended mean μ* (BlendMBM, closed form on 2016)", v)
+    y = 26.5
+    box(ax, 0, y, "Three deterministic means", ["G(x) core forecast (stage 3)", "regression mean μ_reg (stage 2)",
+                                               "persistence x(t)"], "data", frozen=True)
+    box(ax, 1, y, "BlendMBM", ["μ* = a + b·core + c·μ_reg + d·x(t)", "per lead · variable, area-weighted",
+                              "least squares, 2016 (180 ICs)"], "net")
+    box(ax, 2, y, "Blended mean μ*", ["z500 (b, c): 24 h 0.74 / 0.29", "144 h 0.38 / 0.46", "t2m regression-led"],
+        "data")
+    for c in range(2):
+        row(ax, c, c + 1, y, v)
+    arrow(ax, [(cx(2), y + H / 2 + 0.2), (cx(2), 40 - H / 2 - 0.35)], v, label="error on 2016 → Γ_b",
+          lpos=(cx(2) + 0.8, 34.6), halo=True)
+    arrow(ax, [(cx(2) + 3.0, y + H / 2 + 0.2), (cx(2) + 3.0, 33.4), (cx(3), 33.4), (cx(3), 40 - H / 2 - 0.35)], v,
+          label="μ*", lpos=(cx(3) + 0.8, 34.6), halo=True)
+
+    # -- inference summary -----------------------------------------------------------------------------
+    fill, edge = KIND["data"]
+    ax.add_patch(FancyBboxPatch((4, 8.0), 95, 6.6, boxstyle="round,pad=0,rounding_size=0.9", fc=fill, ec=edge, lw=1.6))
+    ax.text(51.5, 12.6, "Inference, 2017–2018 (ClimODE's 360 ICs)", ha="center", va="center", fontsize=14,
+            weight="bold", color=TITLE)
+    ax.text(51.5, 9.8, "x(t) → G(x) core, 24 Heun steps → core   ·   history → regression → P → μ_reg   ·   "
+            "μ* = a + b·core + c·μ_reg + d·x(t)   ·   noise → flow ODE → P → IDCT → deviations → Γ_b → + μ* → 8 members",
+            ha="center", va="center", fontsize=11.5, color=BODY)
+    ax.plot([4, 99], [6.7, 6.7], color=RULE, lw=1.2)
+    ax.text(4, 5.4, "Solid: data / loss flow.  Dashed border: weights frozen from an earlier stage.  "
+            "Orange: training losses.  Purple: energy control.", fontsize=11.5, color=BODY, va="center")
+    ax.text(4, 3.8, "Nothing trains through P, Γ_b or the blend: the four nets (P, v_θ, regression U-Net, f_θ) are "
+            "trained separately and every calibration constant is closed form on 2016.", fontsize=11.5, color=BODY,
+            va="center")
+    ax.text(4, 2.2, "The gain over regm_band is the lead-wise two-model blend: the same blend with a data-only core "
+            "scores 0.02427; G(x) helps up to 72 h and hurts from 96 h (step 20 control).", fontsize=11.5,
+            color=BODY, va="center")
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, "fig_system_blend.png")
+    fig.savefig(path, dpi=100, facecolor="white")
+    plt.close(fig)
+    print(f"[system] {path}")
+    return path
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="docs/step13")
     p.add_argument("--best", action="store_true", help="fade what the best ensemble (regm_band) does not use")
     p.add_argument("--sigma", action="store_true", help="the flow-dependent spread field (regm_flowop) instead")
+    p.add_argument("--blend", action="store_true", help="the step 20 best ensemble (blend_band) instead")
     a = p.parse_args(argv)
     if a.sigma:
         return sigma_system(a.out)
+    if a.blend:
+        return blend_system(a.out)
     best = FADE["on"] = a.best
     fig = plt.figure(figsize=(20, 22.4))
     ax = fig.add_axes([0, 0, 1, 1])

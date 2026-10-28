@@ -7,10 +7,12 @@
 ```bash
 git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
 cd physical_guide_flowmatching
-git checkout claude/project-thread-d5l3lg     # 1–7단계가 모두 들어 있는 최신 브랜치 (4단계 통합만: claude/project-thread-bessib)
+git checkout claude/project-thread-43gbu8     # PR #10: 11~21단계, best 모델 blend_band까지 (7단계까지만: claude/project-thread-d5l3lg)
 pip install -r requirements.txt               # torch는 서버 CUDA에 맞는 wheel을 먼저 설치
 python -m pytest -q                           # CPU에서 수 분, 전부 통과해야 함
 ```
+
+**처음부터 best 모델(blend_band)까지 한 번에 가는 명령 묶음은 `docs/GPU_QUICKSTART.md`에 있습니다** (클론 → 환경 → 데이터 → 스모크 → 본 실행 → 결과 읽기 → 귀속 대조군). 아래 2~11절은 1~12단계의 개별 명령입니다.
 
 PR을 main에 합칠 때 순서는 #1(데이터 계약) → #2, #3, #4, #5(서로 독립, 모두 #1 위) → #6(4단계 통합) → #7(6단계 사영) → 7단계 PR(DCT latent)입니다. 각 PR은 앞 PR 브랜치 위에 쌓여 있으므로, 순서대로 merge하면 각 PR의 diff에는 그 단계 파일만 남습니다.
 
