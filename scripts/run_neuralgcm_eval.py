@@ -58,33 +58,75 @@ def load_model(path):
 
 
 def regridders(era5_latlon, model, lat_out, lon_out):
-    """ERA5 0.25 deg -> model grid (conservative, NaN-aware) and model grid -> our 5.625 deg grid."""
+    """ERA5 0.25 deg -> model grid (conservative, NaN-aware), model grid -> our 5.625 deg grid, and the
+    coarse-IC path ERA5 -> our grid (conservative) -> model grid (bilinear)."""
     from dinosaur import horizontal_interpolation, spherical_harmonic, xarray_utils
 
     src = spherical_harmonic.Grid(
         latitude_nodes=era5_latlon.sizes["latitude"], longitude_nodes=era5_latlon.sizes["longitude"],
         latitude_spacing=xarray_utils.infer_latitude_spacing(era5_latlon.latitude),
         longitude_offset=xarray_utils.infer_longitude_offset(era5_latlon.longitude))
-    to_model = horizontal_interpolation.ConservativeRegridder(src, model.data_coords.horizontal, skipna=True)
     ours = spherical_harmonic.Grid(latitude_nodes=len(lat_out), longitude_nodes=len(lon_out),
                                    latitude_spacing=xarray_utils.infer_latitude_spacing(np.asarray(lat_out)),
                                    longitude_offset=xarray_utils.infer_longitude_offset(np.asarray(lon_out)))
     assert np.allclose(np.rad2deg(ours.latitudes), lat_out, atol=1e-3), "target grid is not our 5.625 deg grid"
-    to_ours = horizontal_interpolation.ConservativeRegridder(model.data_coords.horizontal, ours)
-    return to_model, to_ours
+    hg = model.data_coords.horizontal
+    return {"to_model": horizontal_interpolation.ConservativeRegridder(src, hg, skipna=True),
+            "to_ours": horizontal_interpolation.ConservativeRegridder(hg, ours),
+            "era5_to_ours": horizontal_interpolation.ConservativeRegridder(src, ours, skipna=True),
+            "ours_to_model": horizontal_interpolation.BilinearRegridder(ours, hg)}
 
 
-def forecast(model, ds_ic, to_model, t0, members, seed):
-    """One IC -> dict var -> (M, 7, lon, lat) on the model grid at 0, 24, ..., 144 h.
+def coarsen_like_ours(ds, era5_to_ours, levels_hpa, zero_vars=(), keep_above=False):
+    """Degrade a 0.25 deg / 37-level ERA5 slice to the information our models get: conservative 5.625 deg
+    (64 x 32), our 12 pressure levels, no cloud water (``zero_vars`` -> 0). The 37 levels are then rebuilt by
+    interpolation linear in log p (clamped outside 50-1000 hPa; geopotential above 50 hPa extended
+    isothermally, dz = R T_50 ln(50 / p)), so the model's encoder sees its usual input layout. ``keep_above``
+    keeps the (horizontally coarsened) ERA5 values above our top level instead: information we do not have."""
+    from dinosaur import xarray_utils
 
-    Mirrors the authors' forecasting demo: inputs and forcings regridded to the model grid, NaN (SST / sea ice
-    over land) filled with the nearest value, encode with the IC forcings, unroll with those forcings held
-    (the model takes the nearest forcing in time, so one time slice means persistence).
+    ds = xarray_utils.regrid_horizontal(ds, era5_to_ours)
+    lev = ds.level.values.astype(float)
+    sel = np.array(levels_hpa, float)
+    assert set(sel) <= set(lev), "our levels must be a subset of the input levels"
+    lp_in, lp_out = np.log(sel), np.log(lev)
+    out = {}
+    for v in ds.data_vars:
+        da = ds[v]
+        if "level" not in da.dims:
+            out[v] = da
+            continue
+        da = da.transpose("level", ...)
+        if v in zero_vars:
+            out[v] = xr.zeros_like(da)
+            continue
+        x = da.sel(level=sel).values  # (12, ...)
+        y = np.apply_along_axis(lambda c: np.interp(lp_out, lp_in, c), 0, x)  # clamped outside the 12 levels
+        if keep_above:
+            y[lev < sel.min()] = da.values[lev < sel.min()]
+        out[v] = xr.DataArray(y.astype(da.dtype), dims=da.dims, coords=da.coords)
+    if "geopotential" in out and "temperature" in out and not keep_above:
+        above = lev < sel.min()
+        if above.any():
+            z50 = ds["geopotential"].transpose("level", ...).sel(level=sel.min()).values
+            t50 = ds["temperature"].transpose("level", ...).sel(level=sel.min()).values
+            dz = (287.05 * t50 / 9.80665)[None] * np.log(sel.min() / lev[above])[:, None, None]
+            g = out["geopotential"].values.copy()
+            g[above] = z50[None] + dz
+            out["geopotential"] = out["geopotential"].copy(data=g)
+    return xr.Dataset(out)
+
+
+def forecast(model, ds, t0, members, seed):
+    """One IC (dataset on the model grid) -> dict var -> (M, 7, lon, lat) at 0, 24, ..., 144 h.
+
+    Mirrors the authors' forecasting demo: NaN (SST / sea ice over land) filled with the nearest value, encode
+    with the IC forcings, unroll with those forcings held (the model takes the nearest forcing in time, so one
+    time slice means persistence).
     """
     import jax
     from dinosaur import xarray_utils
 
-    ds = xarray_utils.regrid_horizontal(ds_ic, to_model)
     ds = xarray_utils.fill_nan_with_nearest(ds)
     ds = ds.assign_coords(time=t0)
     inputs = model.inputs_from_xarray(ds)
@@ -117,6 +159,11 @@ def main(argv=None):
     p.add_argument("--cpu", action="store_true", help="force the JAX CPU backend")
     p.add_argument("--arco", default=ARCO)
     p.add_argument("--forcing-lag", type=int, default=24, help="hours before the IC the SST / sea-ice forcing is taken from")
+    p.add_argument("--coarse-ic", action="store_true",
+                   help="equal-information ablation: the IC is first degraded to our 5.625 deg / 12-level data "
+                        "(cloud water set to 0), forcings unchanged")
+    p.add_argument("--keep-above-top", action="store_true",
+                   help="with --coarse-ic: keep ERA5 (coarsened) above 50 hPa instead of the isothermal extension")
     p.add_argument("--threads", type=int, default=0, help="XLA CPU threads (0 = default)")
     a = p.parse_args(argv)
     if a.cpu:
@@ -147,14 +194,21 @@ def main(argv=None):
 
     arco = xr.open_zarr(a.arco, chunks=None, storage_options={"client_kwargs": {"trust_env": True}})
     need = list(model.input_variables) + list(model.forcing_variables)
-    to_model, to_ours = regridders(arco[need[:1]], model, lat, lon)
+    rg = regridders(arco[need[:1]], model, lat, lon)
+    to_ours = rg["to_ours"]
+    if a.coarse_ic:
+        from pgcfm.contract import LEVELS_HPA
+        cloud = [v for v in model.input_variables if "cloud" in v]
+        print(f"coarse IC: conservative 64x32, levels {LEVELS_HPA}, zeroed {cloud}", flush=True)
     H, W = len(lat), len(lon)
     M = max(1, a.members)
     mean = np.full((1, len(ics), len(LEADS), 5, H, W), np.nan, np.float32)
     std = np.full_like(mean, 1e-6)
     members = np.full((len(ics), M, len(LEADS), 2, H, W), np.nan, np.float32)
     truth = np.zeros((1, len(ics), len(LEADS) + 1, 5, H, W), np.float32)
-    log = {"model": a.model, "year": a.year, "ics": ics, "members": a.members, "seconds": {}, "rmse_z500": {}, "rmse_t850": {},
+    log = {"model": a.model, "year": a.year, "ics": ics, "members": a.members, "coarse_ic": a.coarse_ic,
+           "keep_above_top": a.keep_above_top,
+           "forcing_lag": a.forcing_lag, "seconds": {}, "rmse_z500": {}, "rmse_t850": {},
            "persistence_z500": {}, "persistence_t850": {}}
     w = np.cos(np.deg2rad(lat))[:, None]
     w = w / w.mean()
@@ -167,7 +221,15 @@ def main(argv=None):
                           arco[list(model.forcing_variables)].sel(time=t_ic - np.timedelta64(a.forcing_lag, "h"))
                           .compute().drop_vars("time")])
         t_read = time.time() - tic
-        fc = forecast(model, ds_ic, to_model, t_ic, a.members, a.seed + 1000 * e)  # var -> (M, 7, lon, lat)
+        from dinosaur import xarray_utils
+        if a.coarse_ic:
+            ds_in = coarsen_like_ours(ds_ic[list(model.input_variables)], rg["era5_to_ours"], LEVELS_HPA, cloud,
+                                      keep_above=a.keep_above_top)
+            ds_m = xr.merge([xarray_utils.regrid_horizontal(ds_in, rg["ours_to_model"]),
+                             xarray_utils.regrid_horizontal(ds_ic[list(model.forcing_variables)], rg["to_model"])])
+        else:
+            ds_m = xarray_utils.regrid_horizontal(ds_ic, rg["to_model"])
+        fc = forecast(model, ds_m, t_ic, a.members, a.seed + 1000 * e)  # var -> (M, 7, lon, lat)
         for j, h in enumerate(LEADS):
             for k, (v, iv) in enumerate((("z", iz), ("t", it))):
                 fields = np.stack([np.asarray(to_ours(fc[v][m, j + 1])).T for m in range(M)])  # (M, lat, lon)
