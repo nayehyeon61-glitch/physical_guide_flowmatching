@@ -1,8 +1,9 @@
 """Step 24 figure: data-efficiency curve of the step 13 reported model (regm_band) on ClimODE's 360 test ICs.
 
 Runs with 1, 2 and 4 training years on CPU (runs/step24/y1, y2, runs/step13) plus the owner's 37-year GPU run, whose
-score json is not in this repository: its numbers are the ones in docs/step15_training_system.md (z500 RMSE
-170 / 423 / 741 at 24 / 72 / 144 h, t850 144 h 3.21 K, z500 144 h CRPS 0.0310) and are drawn as markers only.
+score json is not in this repository: its numbers are the table of docs/step13_broad/step13_broad_report.pdf
+(commit 2dd09f2; z500 RMSE 170 / 423 / 741 at 24 / 72 / 144 h, t850 1.49 / 2.22 / 3.21 K, z500 CRPS
+0.0076 / 0.0183 / 0.0310) and are drawn as markers only.
 2x2 panels: (a) z500 RMSE by lead, (b) t850 RMSE by lead, (c) z500 CRPS by lead, (d) z500 RMSE against training
 years (log axis) at 24 / 72 / 144 h. Persistence dotted.
 
@@ -27,7 +28,8 @@ from scripts.run_step11_climode import VARS, climode_minmax  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 
 ARM = "seqfm_dct_pinn_regm_band"
-BROAD = {"years": 37, "z_rmse": {24: 170, 72: 423, 144: 741}, "t_rmse": {144: 3.21}, "z_crps": {144: 0.0310}}
+BROAD = {"years": 37, "z_rmse": {24: 170, 72: 423, 144: 741}, "t_rmse": {24: 1.49, 72: 2.22, 144: 3.21},
+         "z_crps": {24: 0.0076, 72: 0.0183, 144: 0.0310}}
 
 
 def main(argv=None):
@@ -78,7 +80,7 @@ def main(argv=None):
     a_.set_xscale("log"), a_.set_xticks([1, 2, 4, 10, 37]), a_.set_xticklabels(["1", "2", "4", "10", "37"])
     a_.set_title("z500 RMSE against training years", fontsize=13)
     a_.set_xlabel("Training years (log scale; 1-4 CPU, 37 GPU with more iterations)"), a_.set_ylabel("RMSE (m²/s²)")
-    a_.legend(fontsize=9, frameon=False, title="lead", title_fontsize=9, loc="center right")
+    a_.legend(fontsize=9, frameon=False, title="lead", title_fontsize=9, loc="center", bbox_to_anchor=(0.62, 0.3))
     for a_ in ax.flat:
         a_.grid(color=GRID, lw=0.8)
         for s in ("top", "right"):
