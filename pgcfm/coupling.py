@@ -64,6 +64,7 @@ class PhysicsConfig:
     pole_cap_deg: float = 85.0  # residual rows poleward are dropped (docs/step3, E5)
     lat_weight: str = "area"
     virtual: bool = True  # T_v = T (1 + 0.608 q)
+    dt_seconds: float = contract.CONST.dt_seconds  # step of the pair (x_k, y); 6 h sequences: 21600
 
 
 class _Embed(nn.Module):
@@ -175,7 +176,7 @@ class PhysicsGuide(nn.Module):
 
     def grid(self, device) -> pgrid.SphereGrid:
         if self._grid is None or self._grid.lat.device != torch.device(device):
-            lat = torch.linspace(-90.0, 90.0, self.n_lat).tolist()
+            lat = contract.grid_latitudes(self.n_lat).tolist()
             lon = (torch.arange(self.n_lon) * (360.0 / self.n_lon)).tolist()
             self._grid = pgrid.SphereGrid(lat, lon, device=device)
         return self._grid
@@ -235,7 +236,7 @@ class PhysicsGuide(nn.Module):
             A = pgrid.strong_residuals(Fs, g, closures=C, virtual=cfg.virtual)
             acc = {k: w[i] * v for k, v in A.items()} if acc is None else \
                 {k: acc[k] + w[i] * v for k, v in A.items()}
-        dt = contract.CONST.dt_seconds
+        dt = cfg.dt_seconds
         for n in primitive.PROGNOSTIC:
             if n in acc:
                 acc[n] = acc[n] + ((F1[n] - F0[n]) / dt).index_select(-2, g.lat_rows)

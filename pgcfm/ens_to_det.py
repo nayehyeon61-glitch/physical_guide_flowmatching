@@ -136,8 +136,9 @@ def mean_only(members):
 
 
 def fit(model, train, valid, area, epochs=40, batch_size=8, lr=0.003,
-        use_ensemble=True, physics_fn=None, physics_weight=0.0):
+        use_ensemble=True, physics_fn=None, physics_weight=0.0, post_step=None):
     """train/valid = (members, target, context_or_None). Returns best-val model.
+    post_step(model), if given, runs after every optimizer step (e.g. an operator-norm projection).
 
     Only final deterministic output is compared with target; no memberwise MSE.
     Physics callback receives batch indices for selecting fixed dt/past/context.
@@ -170,6 +171,8 @@ def fit(model, train, valid, area, epochs=40, batch_size=8, lr=0.003,
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if post_step is not None:
+                post_step(model)
         model.eval()
         with torch.no_grad():
             score = float(channel_mse(model(vx, vc), vy, area).mean())

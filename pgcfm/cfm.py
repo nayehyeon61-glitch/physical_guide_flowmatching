@@ -46,8 +46,8 @@ def calendar_features(doy: torch.Tensor) -> torch.Tensor:
 
 
 def area_weights(n_lat: int, device=None) -> torch.Tensor:
-    """cos(lat) weights on the equiangular grid (poles included), mean 1. Shape (H, 1)."""
-    lat = torch.linspace(-90.0, 90.0, n_lat, device=device)
+    """cos(lat) weights (equiangular with poles unless registered in contract), mean 1. Shape (H, 1)."""
+    lat = torch.as_tensor(contract.grid_latitudes(n_lat), dtype=torch.float32, device=device)
     w = torch.cos(torch.deg2rad(lat)).clamp_min(0.0)
     return (w / w.mean())[:, None]
 

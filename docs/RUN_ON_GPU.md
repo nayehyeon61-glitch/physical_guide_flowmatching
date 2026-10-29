@@ -7,10 +7,12 @@
 ```bash
 git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
 cd physical_guide_flowmatching
-git checkout claude/project-thread-d5l3lg     # 1–7단계가 모두 들어 있는 최신 브랜치 (4단계 통합만: claude/project-thread-bessib)
+git checkout claude/project-thread-43gbu8     # PR #10: 11~21단계, best 모델 blend_band까지 (7단계까지만: claude/project-thread-d5l3lg)
 pip install -r requirements.txt               # torch는 서버 CUDA에 맞는 wheel을 먼저 설치
 python -m pytest -q                           # CPU에서 수 분, 전부 통과해야 함
 ```
+
+**처음부터 best 모델(blend_band)까지 한 번에 가는 명령 묶음은 `docs/GPU_QUICKSTART.md`에 있습니다** (클론 → 환경 → 데이터 → 스모크 → 본 실행 → 결과 읽기 → 귀속 대조군). 아래 2~11절은 1~12단계의 개별 명령입니다.
 
 PR을 main에 합칠 때 순서는 #1(데이터 계약) → #2, #3, #4, #5(서로 독립, 모두 #1 위) → #6(4단계 통합) → #7(6단계 사영) → 7단계 PR(DCT latent)입니다. 각 PR은 앞 PR 브랜치 위에 쌓여 있으므로, 순서대로 merge하면 각 PR의 diff에는 그 단계 파일만 남습니다.
 
@@ -221,3 +223,81 @@ python scripts/infer_pgcfm.py --ckpt runs/latent_serial/latent.pt --spread runs/
 - 비용: `*_tan`은 lead마다 정역학 vjp 12번(`--no-tangent`로 끔).
 
 합성 데이터 실험 재현 (CPU, 약 4시간, 7·8단계 결과 필요): `python scripts/run_step9_structure.py --out runs/step9 --step7 runs/step7`.
+
+## 11. 12단계: ClimODE를 저희 데이터로 처음부터 학습 (`docs/step12_core.md`)
+
+공개 체크포인트 대신 같은 데이터로 원본 크기 ClimODE를 다시 학습할 때 씁니다. CPU에서는 한 iteration에 수십 분이 걸려 GPU에서만 돌릴 수 있습니다.
+`third_party/climode/train_global.py`는 원저자 코드(@ e729d23)를 바꾸지 않은 사본입니다.
+
+```bash
+python scripts/wb2_to_kai.py --out data/era5_5p625 --years 2006 2007 2008 2009 2010 2011 2012 2013 2014 2015 2016 2017 2018
+cd data/era5_5p625 && mkdir -p Models
+python ../../third_party/climode/train_global.py --scale 0 --batch_size 8 --spectral 0 --solver euler   # 300 epoch, 검증 손실 최저 epoch를 Models/에 저장
+cd ../..
+python scripts/run_climode_eval.py --data data/era5_5p625/era5_data --out runs/climode_ours \
+    --ckpt data/era5_5p625/Models/ClimODE_global_euler_0_model_<epoch>.pt --lead-steps 24
+```
+
+- 원저자 스크립트는 학습 구간을 `slice('2006','2016')`로 잡아 검증 해 2016이 학습에 들어갑니다(원문 그대로 둠).
+- 평가는 11단계와 같은 함수와 초기장입니다. `--max-ics`를 빼면 시험 해당 180개씩 360개 전부를 돕니다.
+
+## 12. 19단계: 출력단 super-resolution (5.625° → 2.8125°, `docs/step19_sr_output.md`)
+
+13단계 멤버 뒤에 붙는 SR 망(`pgcfm/sr.py`, Chiang et al. 2024 축소판)을 GPU에서 학습하고, 저장된 arm을 멤버별로 SR해 2.8125° 진실(WB2 128×64, 5변수)로 채점합니다. CPU 실행(4년, 31분)과 같은 코드이고 `--device`만 다릅니다.
+
+```bash
+# (1) 2.8125° 진실: ClimODE 5변수만, 5.625° 파일과 같은 era5_data 루트에 *_2.8125deg.nc 로 들어갑니다 (한 해 240 MB; 37년 8.9 GB)
+python scripts/wb2_to_kai.py --out data/era5_5p625 --grid 128x64 --climode-only --years $(seq 1979 2018)
+# (2) SR 학습 + 저장된 arm 채점 (한 번에). --ens 는 여러 arm 가능, --save-sr 은 SR한 멤버를 npz로 (arm·해마다 0.7 GB)
+python scripts/run_step19_sr.py --coarse data/era5_5p625/era5_data --fine data/era5_5p625/era5_data --device auto \
+    --train-range 1979 2015 --val-year 2016 --test-years 2017 2018 --iters 20000 --batch 32 --chunk 30 \
+    --ens runs/step13_best/seqregress_pinn runs/step13_best/seqfm_dct_pinn_regm_band \
+          runs/step13_best/seqfm_dct_pinn_regm_sband_clim_flow \
+    --out runs/step13_best/sr --fig runs/step13_best/fig --save-sr
+# 또는 best 스크립트의 한 단계로: 위 두 명령을 $OUT/sr 에, 채점된 arm 전부에 대해 실행합니다
+SR=1 PROFILE=broad bash scripts/run_step13_best.sh          # SR_TRAIN_YEARS="2006 ... 2015" 로 학습 연수를 줄일 수 있음
+```
+
+- 학습 데이터는 호스트 메모리에 올립니다: 한 해에 coarse 60 MB + fine 120 MB(float16), 37년이면 약 6.6 GB. 141k 파라미터라 GPU 메모리는 배치 32에서 1 GB 미만입니다. `--amp`(bf16)는 선택.
+- 채점은 `--chunk` 초기장씩 GPU에서 합니다(한 chunk = chunk × 8 멤버 × 6 lead × 5변수 × 64 × 128 float32 ≈ chunk × 63 MB, 보간·SR·평균 세 벌). 24 GB GPU면 30, CPU면 6.
+- CRPS는 properscoring과 같은 추정량(E|X−y| − ½ E|X−X'|, 쌍 평균 M²)을 torch로 계산합니다(차이 1e-6 확인). 눈금은 ClimODE 최소·최대 정규화(5.625° 2006~2018)입니다.
+- 결과: `sr.json`의 `evaluation.analysis[해]`(분석장 보간/SR RMSE), `evaluation.ensemble[arm][해]`(lead × 변수: `rmse_i`/`rmse_s`/`rmse_sm`(평균의 SR)/`rmse_pers`/`rmse_c`(5.625°), `spread2_*`, `crps_*`), `train.val_curve`. 그림 `fig_sr_sr_<arm>.png`(arm이 하나면 `fig_sr_sr.png`): z500·t2m RMSE, t2m·u10 CRPS, 보간 파랑 / SR 빨강 / 5.625° 회색 점선 / 지속 점선.
+- 이미 학습한 망으로 다른 arm만 채점: `--eval-only --out <sr.pt 가 있는 폴더> --ens <새 arm ...>` (json의 `evaluation` 만 다시 씀).
+- 읽는 법(CPU 결과, `docs/step19_sr_output.md`): 2.8°에서 t2m RMSE·CRPS만 내려가고(24 h −10 %, 144 h −3 %), z500·t850은 ±0.1 %, 바람은 퍼짐만 커집니다. GPU 37년 학습에서 바뀔 수 있는 것은 SR 망의 용량(검증 비 0.76이 평평해진 지점)과 멤버의 2.8° 오차이며, SR이 5.625° 점수를 바꾸지는 않습니다.
+
+## 13. 20단계: blend_band를 ClimODE 연도로 GPU에서 (`docs/step20_pinn_score.md`)
+
+소유자 요청(2026-10-28 04:25): "ClimODE와 비교하게 GPU에서 37년이 아닌 ClimODE 정도의 데이터로". `PROFILE=climode`(학습 2006~2015, 검증 2016, 시험 2017~2018 ClimODE IC 360개)에 `BLEND=1`을 붙이면 13단계 체인 끝에 20단계 단계(G(x) 코어 학습 → 코어 예측 → 혼합 보정 → 채점·energy score·그림)가 이어집니다.
+
+```bash
+# 한 번에: 자료 → PINN → FM → 회귀 → regm_band(+σ 장, 대역×셀) → 채점 → [BLEND] G(x) 코어 → 예측 → blend_band → 채점
+BLEND=1 PROFILE=climode DATA=data/era5_5p625 OUT=runs/climode_blend bash scripts/run_step13_best.sh
+# 더 가볍게: 퍼짐장 arm 없이 (regm_band와 blend_band만)
+BLEND=1 SIGMA=0 PROFILE=climode OUT=runs/climode_blend bash scripts/run_step13_best.sh
+# 이미 13단계 결과가 있는 폴더면 그 OUT을 가리키면 됩니다: 있는 단계는 건너뛰고 BLEND 단계만 돕니다
+BLEND=1 PROFILE=climode OUT=runs/step13_climode bash scripts/run_step13_best.sh
+```
+
+BLEND 단계가 실제로 실행하는 명령(손으로 돌릴 때; `$K=$DATA/kai6h`, `$E=$DATA/era5_data`, `$OUT`은 13단계 결과 폴더):
+
+```bash
+# (1) G(x) 특징 코어: 66채널 + G(x) 48채널 → ResNet 경향 → Heun 6 h, rollout 손실 1→2→4→8 step 커리큘럼, 물리 손실 없음
+python scripts/run_step16_dynpinn.py --kai $K --era5 $E --out $OUT --tag dyn_gfeat --gfeat --lambda-p 0 \
+    --train-years $(seq -s ' ' 2006 2015) --val-year 2016 --K 8 --curriculum 1 2 4 8 --val-K 24 --val-chunk 4 \
+    --iters 20000 --batch 16 --n-val 16 --n-val-train 8 --val-every 1000 --device auto --cache $OUT/cache --threads 4
+# (2) 코어 예측: ClimODE IC(2 + 8e)에서 24..144 h, 검증 해와 시험 해 → $OUT/dyn_gfeat_pred.npz, dyn_gfeat_pred_2016.npz
+python scripts/run_step16_predict.py --kai $K --era5 $E --run $OUT --tag dyn_gfeat --val-year 2016 --test-years 2017 2018
+# (3) 혼합 보정: μ* = a + b·코어 + c·회귀 평균 + d·x(t) (lead × 변수, 2016 최소제곱) + FM·PINN 편차 × 대역 Γ
+python scripts/run_step13_guide.py --ens $OUT/seqfm_dct_pinn --era5 $E --out $OUT --core $OUT/dyn_gfeat \
+    --reg $OUT/seqregress_pinn --reg-mbm --blend --val-year 2016 --test-years 2017 2018 --save-arms blend_band
+# (4) 채점(회귀 기준 부트스트랩), energy score, 2×3 그림
+python scripts/score_step13.py --era5 $E --out $OUT/score_blend.json --ref $OUT/seqregress_pinn \
+    --arms $OUT/seqregress_pinn $OUT/seqfm_dct_pinn_regm_band $OUT/seqfm_dct_pinn_blend_band
+python scripts/step20_energy_score.py --era5 $E --out $OUT/energy_blend.json \
+    --arms $OUT/seqregress_pinn $OUT/seqfm_dct_pinn_regm_band $OUT/seqfm_dct_pinn_blend_band
+python scripts/plot_step13.py --era5 $E --scores $OUT/score_blend.json --figures fig_step20 --out $OUT/fig --step "Step 20"
+```
+
+- 시간(추정): 코어 20000 × 16은 GPU에서 1~2시간(CPU 4년 4000 × 4가 76분; G(x)는 substep마다 한 번 계산해 Heun 두 단계가 공유). 예측 수 분, 보정 약 30분(CPU, 연산자 적합 포함), 채점 5분. `CORE_ITERS`, `CORE_BATCH`, `CORE_VAL_EVERY`로 바꿀 수 있고, 트레이너는 15단계의 재개(`.train`), best 선택, `MAX_HOURS` 예산을 그대로 씁니다.
+- 읽는 법: `score_blend.json`의 `arms[...]["rmse"|"crps"]`(lead 6 × 변수 5)와 `bootstrap_vs_seqregress_pinn`; 혼합 계수는 `guide_seqfm_dct_pinn_blend_band.json`의 `blend_coef`(순서 1, 코어, 회귀, x₀); ClimODE 논문 수치는 그림의 점으로 들어갑니다(`docs/step11/climode_paper_tables.json`: z500 193/479/784).
+- 공정한 비교를 위해 적어 둘 것: ClimODE는 단일 결정론 모델(논문은 2006~2016 학습, 검증 해가 학습에 포함), blend_band의 평균은 두 모델의 lead별 가중 평균 + x(t) 항입니다. 단일 모델 비교는 `dyn_gfeat` 자체의 예측(`dyn_gfeat_pred.json`의 RMSE)과 회귀 평균으로 합니다. 이득의 귀속(물리 특징 G(x) 대 두 모델 혼합)은 같은 혼합을 `--gfeat` 없이 학습한 코어(`--tag dyn_lp0`, `--core $OUT/dyn_lp0`)로 한 번 더 돌려 가립니다(CPU 4년 결과: 20단계 문서 2.2).
