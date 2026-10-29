@@ -4,6 +4,37 @@
 ClimODE 연도(학습 2006~2015, 검증 2016, 시험 2017~2018)로 13단계 사슬과 20단계 best 모델(blend_band)까지 한 번에 돕니다.
 학습 구조는 `docs/step20/fig_system_blend.png`, 결과 해석은 `docs/step20_pinn_score.md`, 단계별 명령은 `docs/RUN_ON_GPU.md` 13절입니다.
 
+## 요약 (2026-10-29): blend_band(G(x) 코어 혼합)를 GPU로 학습하는 최신 명령
+
+소유자 요청(2026-10-29 01:25): "g core로 나온 188, 즉 best 모델을 학습할 최신 명령어"와 "ClimODE 수준으로 학습시킨 명령어".
+1~2절(클론, 환경)을 마친 뒤 아래를 위에서부터 칩니다. 셋 다 같은 `DATA` 폴더를 쓰고(있는 해는 다시 받지 않음) 결과는 각자의 `OUT`에 씁니다.
+
+```bash
+mkdir -p runs
+# (0) GPU 첫 점검 (15~20분, 수치는 의미 없음). cuda 경로는 GPU 없는 곳에서 만들었으므로 이것이 첫 GPU 실행입니다.
+SMOKE=1 BLEND=1 DEVICE=cuda DATA=data/era5_5p625 bash scripts/run_step13_best.sh
+
+# (A) 188 모델 그대로: CPU 실행과 같은 설정 (학습 2012~2015, PINN 1000 × 4, FM·회귀 3000 × 4, G(x) 코어 4000 × 4)
+nohup env BLEND=1 SIGMA=0 DEVICE=cuda DATA=data/era5_5p625 OUT=runs/blend_4y \
+    bash scripts/run_step13_best.sh > runs/blend_4y.log 2>&1 &
+
+# (B) ClimODE 수준: ClimODE의 학습 연도 (학습 2006~2015, 검증 2016, 시험 2017~2018) + 37년 실행과 같은 반복 수
+#     (PINN 8000 × 8, FM·회귀 40000 × 16, G(x) 코어 20000 × 16, 1000 반복마다 검증해 best 선택, memmap 캐시)
+nohup env BLEND=1 SIGMA=0 PROFILE=climode DEVICE=cuda DATA=data/era5_5p625 OUT=runs/blend_climode \
+    bash scripts/run_step13_best.sh > runs/blend_climode.log 2>&1 &
+```
+
+- (A)는 짧으니 먼저 돌리고, 끝난 뒤 (B)를 돌리세요 (같은 GPU에서 동시에 돌리지 않기).
+- (A)의 기준값(CPU, 시험 IC 360개): blend_band z500 RMSE 188 / 451 / 723 (24 / 72 / 144 h), 5변수 CRPS 0.02449.
+  GPU 부동소수점과 정규화 통계(내려받은 파일에서 다시 계산)가 달라 비트 단위로 같지는 않지만 가까워야 합니다. 크게 다르면 GPU 경로의 버그이니 로그를 보내 주세요.
+- (B)의 비교 대상: (A), ClimODE 논문 193 / 479 / 784, 소유자 GPU 37년 regm_band 170 / 423 / 741.
+  반복 수가 37년 실행과 같으므로 (B)의 regm_band 대 37년 regm_band는 데이터 양(10년 대 37년)만 다른 비교입니다 (24단계의 "데이터 대 반복 수" 혼동을 풉니다).
+- `SIGMA=0`은 blend_band에 쓰지 않는 퍼짐장 팔(regm_flow, regm_flowop, regm_sband_clim_flow)을 빼서 CPU 보정 시간을 약 1시간 줄입니다. regm_band와 blend_band는 그대로 나옵니다.
+- GPU에서 도는 단계: pinn_project, seqfm_dct(학습과 멤버 생성), seqregress, core_gfeat. CPU에서 도는 단계: core_predict(약 6분), guide_regm·guide_blend(약 30분씩), 채점.
+- 결과: `$OUT/score_blend.json`의 `arms["seqfm_dct_pinn_blend_band"]`, 그림 `$OUT/fig/fig_step20.png`, 혼합 계수 `$OUT/guide_seqfm_dct_pinn_blend_band.json`, 코어 단독 `$OUT/dyn_gfeat_pred.json`.
+- 선택: job 시간 제한이 있으면 `MAX_HOURS=11`(저장 후 종료 코드 75, 같은 명령으로 재개). `CLIMODE=1 CLIMODE_ICS=180`은 ClimODE 체크포인트를 시험 IC 360개 전부에서 돌려 짝 비교. `PROFILE=broad`는 같은 명령을 37년으로. ClimODE의 학습량(300 epoch, 우리 batch 16으로 약 11000 반복)까지 맞추려면 (B)에 `GEN_ITERS=11000`. `AMP=1`은 GPU에서 검증되지 않았으니 끄고 시작하세요.
+- 보내 주실 파일: `score_blend.json`, `energy_blend.json`, `guide_seqfm_dct_pinn_blend_band.json`, `dyn_gfeat.json`, `*_metrics.csv`, `manifest.jsonl`, `*.log`.
+
 ## 0. 준비물
 
 | 항목 | 필요한 것 |
@@ -21,7 +52,7 @@ cuda 경로(`--device auto`, `CACHE=1`)는 GPU가 없는 환경에서 만들었�
 ```bash
 git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
 cd physical_guide_flowmatching
-git checkout claude/project-thread-43gbu8      # PR #10: 11~21단계 (best 모델 blend_band 포함)
+git checkout claude/project-thread-43gbu8      # PR #10: 11~24단계 (best 모델 blend_band 포함)
 ```
 
 ## 2. 환경
