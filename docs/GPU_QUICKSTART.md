@@ -24,6 +24,28 @@ nohup env BLEND=1 SIGMA=0 PROFILE=climode DEVICE=cuda DATA=data/era5_5p625 OUT=r
     bash scripts/run_step13_best.sh > runs/blend_climode.log 2>&1 &
 ```
 
+한 번에 붙여 넣는 전체 명령 (클론부터 B까지; 앞 단계가 실패하면 멈추고, 같은 nohup 명령을 다시 치면 이어 갑니다):
+
+```bash
+git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git
+cd physical_guide_flowmatching
+git checkout claude/project-thread-43gbu8
+python -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cu128   # nvidia-smi의 CUDA에 맞춰 cu126 / cu128 / cu130
+pip install -r requirements.txt
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # True 여야 함
+mkdir -p runs
+nohup bash -c '
+set -e
+export DATA=data/era5_5p625 DEVICE=cuda BLEND=1
+SMOKE=1 bash scripts/run_step13_best.sh
+SIGMA=0 OUT=runs/blend_4y bash scripts/run_step13_best.sh
+SIGMA=0 PROFILE=climode OUT=runs/blend_climode bash scripts/run_step13_best.sh
+' > runs/all.log 2>&1 &
+tail -f runs/all.log
+```
+
 - (A)는 짧으니 먼저 돌리고, 끝난 뒤 (B)를 돌리세요 (같은 GPU에서 동시에 돌리지 않기).
 - (A)의 기준값(CPU, 시험 IC 360개): blend_band z500 RMSE 188 / 451 / 723 (24 / 72 / 144 h), 5변수 CRPS 0.02449.
   GPU 부동소수점과 정규화 통계(내려받은 파일에서 다시 계산)가 달라 비트 단위로 같지는 않지만 가까워야 합니다. 크게 다르면 GPU 경로의 버그이니 로그를 보내 주세요.
