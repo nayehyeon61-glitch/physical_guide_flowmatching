@@ -241,38 +241,30 @@ done
 `--train-years`는 5절에서 쓴 것과 같아야 합니다(정규화 통계가 거기서 옵니다). CPU에서는 `--cpu --threads 4`로 같은 명령이 돌고 2.8° 결정론만 현실적입니다.
 학습 자료·해상도·연산 자원이 다르니(NeuralGCM: 0.25°·37층 ERA5 39년, TPU; 우리: 5.625°·12층) 결과는 "이긴다"가 아니라 상한 참조로 적습니다(`docs/step23_neuralgcm.md`).
 
-### 9b. `PROFILE=ngcm` 결과를 NeuralGCM과 5.625°에서 비교 (소유자 요청 2026-11-02)
+### 9b. 우리 37년 학습(`PROFILE=ngcm`) 대 NeuralGCM 공식 체크포인트, 5.625°에서 (소유자 요청 2026-11-02)
 
-NeuralGCM에는 5.625° 체크포인트가 없으므로 "5.625°에서 비교"는 두 가지를 뜻합니다. (1) 모든 점수를 우리 5.625° 격자에서 매기고(NeuralGCM 출력은 보존 재격자),
-(2) NeuralGCM을 우리와 같은 5.625°·12층 초기장에서도 출발시킵니다(`--coarse-ic`, 23단계 4.4절의 같은 정보 비교). 시험 해는 2020(NeuralGCM 학습 1979~2017 밖)이고, 우리 가중치와 2016 상수는 고정합니다.
+소유자 요청: "5.625도 output, NeuralGCM은 공식 parameter, 우리는 39년(2년 제외)으로 학습". 우리는 NeuralGCM-2.8°의 학습 기간 1979~2017에서
+보정 해 2016과 시험 해 2017을 뺀 1979~2015(37년)로 학습하고, 둘 다 2020년(두 학습 자료 밖)에 우리 5.625° 격자에서 채점합니다.
+NeuralGCM에는 5.625° 체크포인트가 없으므로 2.8° 출력을 5.625°로 보존 재격자하고, 우리와 같은 5.625°·12층 초기장에서도 한 번 더 돌립니다(`--coarse-ic`).
+`scripts/run_ngcm_vs_neuralgcm.sh` 하나가 학습(`run_step13_best.sh PROFILE=ngcm`) → 2020년 멤버(고정 가중치, 2016 상수) → NeuralGCM 2회 → 짝 비교·초기 정보 몫·그림을 차례로 돌리고,
+끝난 단계는 건너뜁니다.
 
 ```bash
-pip install neuralgcm dinosaur-dycore gcsfs && pip install -U "jax[cuda12]"
-python scripts/wb2_to_kai.py --out data/era5_5p625 --all-hours --years 2020
-O=runs/blend_ngcm; N=$O/ngcm2020; mkdir -p $N
-K=data/era5_5p625/kai6h; E=data/era5_5p625/era5_data
-for f in pinn_project.pt pinn_project.json seqfm_dct.pt seqregress.pt dyn_gfeat.pt dyn_gfeat.json stats \
-         seqfm_dct_pinn_ens_2016.npz seqregress_pinn_ens_2016.npz; do ln -sfn ../$f $N/$f; done
-# 2020년 우리 멤버 (학습 없음: .pt를 불러 생성만; --train-years는 ngcm 학습 해와 같아야 정규화가 맞음)
-C="--kai $K --era5 $E --out $N --pinn $N/pinn_project.pt --save-ens --resume-ens --train-years $(seq -s ' ' 1979 2015) --val-year 2016 --test-years 2020 --device cuda --cache $O/cache --val-every 0 --patience 0 --max-hours 0 --val-members 0"
-python scripts/run_step13_seqfm.py $C --basis dct
-python scripts/run_step13_seqfm.py $C --model regress
-python scripts/run_step16_predict.py --kai $K --era5 $E --run $N --tag dyn_gfeat --val-year 2016 --test-years 2020
-python scripts/run_step13_guide.py --ens $N/seqfm_dct_pinn --era5 $E --out $N --core $N/dyn_gfeat --reg $N/seqregress_pinn \
-    --reg-mbm --blend --val-year 2016 --test-years 2020 --save-arms regm_band blend_band
-# NeuralGCM 2.8° 결정론: (1) 자기 초기장(ERA5 0.25°·37층), (2) 우리 5.625°·12층 초기장. 2020년 IC 180개 전부
-python scripts/run_neuralgcm_eval.py --era5 $E --out $N/ngcm_full --model v1/deterministic_2_8_deg --year 2020
-python scripts/run_neuralgcm_eval.py --era5 $E --out $N/ngcm_coarse --model v1/deterministic_2_8_deg --year 2020 --coarse-ic
-# 같은 IC에서 짝 비교(5.625°), 초기 정보 몫, 2×2 그림
-for R in ngcm_full ngcm_coarse; do
-python scripts/compare_step13_climode.py --era5 $E --climode $N/$R/neuralgcm_pred.npz --ref-name "NeuralGCM 2.8° ($R)" \
-    --arms $N/seqregress_pinn $N/seqfm_dct_pinn_regm_band $N/seqfm_dct_pinn_blend_band --core $N/dyn_gfeat --out $N/${R}_paired.json
-done
-python scripts/step23_coarse_ic.py --era5 $E --full $N/ngcm_full/neuralgcm_pred.npz --coarse $N/ngcm_coarse/neuralgcm_pred.npz --out $N/coarse_ic.json
-python scripts/plot_step23_coarse.py --era5 $E --coarse-json $N/coarse_ic.json --paired $N/ngcm_coarse_paired.json \
-    --full-paired $N/ngcm_full_paired.json --out $N/fig_ngcm_5p625.png
+# NeuralGCM용 환경 (JAX GPU와 torch CUDA 라이브러리가 섞이지 않게 따로; torch는 CPU판이면 충분)
+python -m venv .venv-ngcm && .venv-ngcm/bin/pip install --upgrade pip
+.venv-ngcm/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv-ngcm/bin/pip install -r requirements.txt git+https://github.com/patrick-kidger/torchcubicspline.git
+.venv-ngcm/bin/pip install neuralgcm dinosaur-dycore gcsfs "jax[cuda12]"
+.venv-ngcm/bin/python -c "import jax; print(jax.devices())"        # CudaDevice 가 보여야 함
+# 학습부터 비교까지 (주 환경 .venv 에서)
+source .venv/bin/activate && mkdir -p runs
+nohup env NGCM_PY=.venv-ngcm/bin/python DATA=data/era5_5p625 OUT=runs/blend_ngcm \
+    bash scripts/run_ngcm_vs_neuralgcm.sh > runs/ngcm_vs_neuralgcm.log 2>&1 &
+tail -f runs/ngcm_vs_neuralgcm.log
 ```
 
-- 결과: `$N/ngcm_full_paired.json`(NeuralGCM 원래 초기장 대 우리), `$N/ngcm_coarse_paired.json`(같은 5.625° 초기장 대 우리), `$N/coarse_ic.json`(격차 중 초기 정보 몫), `$N/fig_ngcm_5p625.png`.
+- 결과(`runs/blend_ngcm/ngcm2020/`): `ngcm_full_paired.json`(NeuralGCM 원래 초기장 대 우리), `ngcm_coarse_paired.json`(같은 5.625° 초기장 대 우리), `coarse_ic.json`(격차 중 초기 정보 몫), `fig_ngcm_5p625.png`(2×2), `score_2020.json`(우리 팔 2020 점수). 2017~18 ClimODE 시험 점수는 `runs/blend_ngcm/score_blend.json`.
 - 기준값(CPU 4년 모델, 2020년 IC 9개): NeuralGCM z500 46/143/405 → 5.625° 초기장 172/307/587, blend_band 201/472/742 (`docs/step23_neuralgcm.md` 4.4).
-- 같은 명령을 B(`O=runs/blend_climode`, `--train-years 2006 … 2015`)나 A(`O=runs/blend_4y`, `--train-years 2012 … 2015`)에 쓰면 학습량별로 NeuralGCM과의 격차를 비교할 수 있습니다.
+- NeuralGCM을 GPU에서 못 돌리면 `NGCM_ARGS="--cpu --threads 8 --ic-offset 5 --ic-stride 10"`(2020년 IC 18개, CPU에서 IC당 수 분~15분).
+- 이미 학습이 끝났으면 `SKIP_TRAIN=1`. 실행 없이 명령만 보려면 `DRYRUN=1`.
+- 학습 이후 단계(채점, 짝 비교, 초기 정보 몫, 그림)는 23단계 산출물로 이 컨테이너에서 끝까지 돌려 23단계 수치와 같게 나오는 것을 확인했습니다. 학습과 NeuralGCM GPU 실행은 소유자 서버에서 처음입니다.
