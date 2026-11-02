@@ -31,6 +31,10 @@
 #   PROFILE=broad_long        broad with FM / regression 120000 it and PATIENCE=10 (stop after 10 validations
 #                             without improvement, the best state is selected)
 #   PROFILE=climode           ClimODE's years: train 2006-2015 (validation 2016, test 2017-2018), broad settings
+#   PROFILE=ngcm              NeuralGCM-like training: train 1979-2015 (NeuralGCM-2.8 deg: 1979-2017; we keep
+#                             2016-2018 out), broad_long's FM / regression 120000 it with PATIENCE=10, and the G(x)
+#                             core on rollouts up to 5 days as NeuralGCM (CORE_K=20 six-hour steps, curriculum
+#                             1 2 4 8 12 16 20, CORE_ITERS 60000 x 16)
 #   PROFILE=smoke             = SMOKE=1
 #   Comparing profiles: scripts/run_step15_compare.sh (climode + broad_long, then the reports side by side)
 # Every profile value can be overridden: TRAIN_YEARS="1990 ... 2015" PINN_ITERS GEN_ITERS GEN_BATCH VAL_EVERY
@@ -38,8 +42,9 @@
 # (1 = memory-mapped years under $OUT/cache) AMP (1 = bf16 autocast on cuda). With SR=1: SR_TRAIN_YEARS (default
 # TRAIN_YEARS; 2.8125 deg files are 240 MB a year), SR_ITERS, SR_BATCH, SR_CHUNK (ICs per scoring chunk), SR_SAVE
 # (1 = write the super-resolved members, 0.7 GB per arm and year). With BLEND=1: CORE_ITERS, CORE_BATCH (the G(x)
-# core; small 4000 x 4, broad / climode 20000 x 16). Each step appends a line to
-# $OUT/manifest.jsonl (command, commit, start, end, exit).
+# core; small 4000 x 4, broad / climode 20000 x 16, ngcm 60000 x 16), CORE_K and CORE_CURRICULUM (its rollout
+# window in 6 h steps; 8 and "1 2 4 8" except ngcm). Each step appends a line to $OUT/manifest.jsonl (command,
+# commit, start, end, exit). DRYRUN=1 prints every step's command instead of running it.
 #
 # Trained weights: put pinn_project.pt, pinn_project.json, seqfm_dct.pt, seqregress.pt and stats/ in $OUT
 # first and the three trainers load them instead of training (sampling and calibration still run).
@@ -71,24 +76,30 @@ case "$PROFILE" in
         SR_ITERS=${SR_ITERS:-3000}; SR_BATCH=${SR_BATCH:-16}; SR_CHUNK=${SR_CHUNK:-6}
         CORE_ITERS=${CORE_ITERS:-4000}; CORE_BATCH=${CORE_BATCH:-4}; CORE_VAL_EVERY=${CORE_VAL_EVERY:-500}
         DEVICE=${DEVICE:-cpu}; CACHE=${CACHE:-0} ;;
-    broad|broad_long|climode)
+    broad|broad_long|climode|ngcm)
         # broad: the owner's 2026-10-27 GPU run (37 years). broad_long: the same data, 3x the FM / regression
         # steps (cosine over 120000) with early stopping on the validation loss. climode: ClimODE's data
         # years (train 2006-2015, validation 2016, test 2017-2018) with the broad training settings, so the
-        # comparison with broad isolates the 27 extra years (docs/step15_training_system.md 7).
+        # comparison with broad isolates the 27 extra years (docs/step15_training_system.md 7). ngcm: broad_long
+        # plus NeuralGCM's longest training rollout (5 days) for the G(x) core (Kochkov et al. 2024, Methods).
+        LONG=$(case "$PROFILE" in broad_long|ngcm) echo 1 ;; *) echo 0 ;; esac)
         case "$PROFILE" in
             climode) TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 2006 2015)"} ;;
             *) TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 1979 2015)"} ;;
         esac
         PINN_ITERS=${PINN_ITERS:-8000}; PINN_BATCH=${PINN_BATCH:-8}
-        GEN_ITERS=${GEN_ITERS:-$([ "$PROFILE" = broad_long ] && echo 120000 || echo 40000)}; GEN_BATCH=${GEN_BATCH:-16}
+        GEN_ITERS=${GEN_ITERS:-$([ "$LONG" = 1 ] && echo 120000 || echo 40000)}; GEN_BATCH=${GEN_BATCH:-16}
         VAL_EVERY=${VAL_EVERY:-1000}; VAL_MEMBERS=${VAL_MEMBERS:-4}
-        PATIENCE=${PATIENCE:-$([ "$PROFILE" = broad_long ] && echo 10 || echo 0)}
+        PATIENCE=${PATIENCE:-$([ "$LONG" = 1 ] && echo 10 || echo 0)}
         SR_ITERS=${SR_ITERS:-20000}; SR_BATCH=${SR_BATCH:-32}; SR_CHUNK=${SR_CHUNK:-30}
-        CORE_ITERS=${CORE_ITERS:-20000}; CORE_BATCH=${CORE_BATCH:-16}; CORE_VAL_EVERY=${CORE_VAL_EVERY:-1000}
+        CORE_ITERS=${CORE_ITERS:-$([ "$PROFILE" = ngcm ] && echo 60000 || echo 20000)}; CORE_BATCH=${CORE_BATCH:-16}
+        CORE_VAL_EVERY=${CORE_VAL_EVERY:-1000}
+        if [ "$PROFILE" = ngcm ]; then CORE_K=${CORE_K:-20}; CORE_CURRICULUM=${CORE_CURRICULUM:-"1 2 4 8 12 16 20"}; fi
         DEVICE=${DEVICE:-auto}; CACHE=${CACHE:-1} ;;
-    *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, smoke)"; exit 2 ;;
+    *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, ngcm, smoke)"; exit 2 ;;
 esac
+CORE_K=${CORE_K:-8}
+CORE_CURRICULUM=${CORE_CURRICULUM:-"1 2 4 8"}
 PATIENCE=${PATIENCE:-0}
 MAX_HOURS=${MAX_HOURS:-0}
 AMP=${AMP:-0}
@@ -121,6 +132,7 @@ echo "[best] profile $PROFILE, train $TRAIN_YEARS, device $DEVICE, out $OUT, com
 run() {  # run <name> <done-file> <command...>: skip when <done-file> exists, log to $OUT/<name>.log
     local name=$1 done=$2; shift 2
     if [ -e "$done" ]; then echo "[best] $name: $done exists, skipped"; return; fi
+    if [ "${DRYRUN:-0}" = 1 ]; then echo "[dry] $name: $(printf '%q ' "$@")"; return; fi
     local start; start=$(date -u +%FT%TZ)
     echo "[best] $name: start $(date +%H:%M), log $OUT/$name.log"
     local rc=0
@@ -214,7 +226,7 @@ fi
 if [ "$BLEND" = 1 ]; then
     CORE=$OUT/dyn_gfeat
     run core_gfeat "$CORE.json" python scripts/run_step16_dynpinn.py --kai "$K" --era5 "$E" --out "$OUT" --tag dyn_gfeat \
-        --gfeat --lambda-p 0 $PINN_YEARS_ARGS --K 8 --curriculum 1 2 4 8 --val-chunk 4 $TRAIN_ARGS $CORE_ARGS
+        --gfeat --lambda-p 0 $PINN_YEARS_ARGS --K "$CORE_K" --curriculum $CORE_CURRICULUM --val-chunk 4 $TRAIN_ARGS $CORE_ARGS
     run core_predict "${CORE}_pred.npz" python scripts/run_step16_predict.py --kai "$K" --era5 "$E" --run "$OUT" \
         --tag dyn_gfeat --val-year "$VAL_YEAR" --test-years $TEST_YEARS --threads "$THREADS" $PREDICT_ARGS
     run guide_blend "${FM}_blend_band_ens_$LAST_TEST.npz" python scripts/run_step13_guide.py --ens "$FM" --era5 "$E" \

@@ -34,6 +34,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cu128   # nvidia-smi의 CUDA에 맞춰 cu126 / cu128 / cu130
 pip install -r requirements.txt
+pip install git+https://github.com/patrick-kidger/torchcubicspline.git   # requirements.txt에 없음, ClimODE 코드가 import
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # True 여야 함
 mkdir -p runs
 nohup bash -c '
@@ -55,6 +56,20 @@ tail -f runs/all.log
 - GPU에서 도는 단계: pinn_project, seqfm_dct(학습과 멤버 생성), seqregress, core_gfeat. CPU에서 도는 단계: core_predict(약 6분), guide_regm·guide_blend(약 30분씩), 채점.
 - 결과: `$OUT/score_blend.json`의 `arms["seqfm_dct_pinn_blend_band"]`, 그림 `$OUT/fig/fig_step20.png`, 혼합 계수 `$OUT/guide_seqfm_dct_pinn_blend_band.json`, 코어 단독 `$OUT/dyn_gfeat_pred.json`.
 - 선택: job 시간 제한이 있으면 `MAX_HOURS=11`(저장 후 종료 코드 75, 같은 명령으로 재개). `CLIMODE=1 CLIMODE_ICS=180`은 ClimODE 체크포인트를 시험 IC 360개 전부에서 돌려 짝 비교. `PROFILE=broad`는 같은 명령을 37년으로. ClimODE의 학습량(300 epoch, 우리 batch 16으로 약 11000 반복)까지 맞추려면 (B)에 `GEN_ITERS=11000`. `AMP=1`은 GPU에서 검증되지 않았으니 끄고 시작하세요.
+- **(C) NeuralGCM 수준** (소유자 요청 2026-11-02): `PROFILE=ngcm`. NeuralGCM-2.8°(Kochkov et al. 2024, Extended Data Table 1: TPU v4 16개로 1일, batch 16, ERA5 1979~2017, rollout 6 h → 5일 커리큘럼)에 맞춘 것:
+  학습 1979~2015(2016은 보정, 2017~18은 시험이라 뺌), PINN 8000 × 8, FM·회귀 120000 × 16 + 조기 종료(PATIENCE=10),
+  G(x) 코어 60000 × 16에 **rollout을 5일(6시간 20스텝)까지** 늘림(커리큘럼 1 2 4 8 12 16 20). A·B가 끝난 뒤 돌리세요:
+
+  ```bash
+  nohup env BLEND=1 SIGMA=0 PROFILE=ngcm DEVICE=cuda DATA=data/era5_5p625 OUT=runs/blend_ngcm \
+      bash scripts/run_step13_best.sh > runs/blend_ngcm.log 2>&1 &
+  ```
+
+  - 맞춘 것: 학습 해 수(37년 대 39년), 코어의 최장 rollout(5일), batch 16. 못 맞춘 것: 해상도(5.625°·12층 대 2.8°·37층), 연산량(TPU v4 16개 × 1일), 정확한 반복 수(논문 본문에 없음).
+  - 시간: FM·회귀는 B의 약 3배(조기 종료로 줄 수 있음), 코어는 반복 3배 × rollout이 길어 약 7배. job 제한이 있으면 `MAX_HOURS=11`을 붙이고 같은 명령으로 이어 가세요.
+  - 디스크: 6시간 자료 1979~2018 약 25 GB + memmap 캐시 약 30 GB + 앙상블 약 4 GB, 합쳐 60 GB 정도.
+  - 실행 전 명령 확인: `DRYRUN=1 PROFILE=ngcm BLEND=1 SIGMA=0 DEVICE=cuda OUT=runs/blend_ngcm bash scripts/run_step13_best.sh`는 실행하지 않고 단계별 명령만 출력합니다.
+  - 5일 rollout 코어는 CPU에서 7회 반복으로 끝까지 도는 것만 확인했습니다(K가 20까지 올라가고 검증·저장까지). GPU에서는 처음입니다.
 - 보내 주실 파일: `score_blend.json`, `energy_blend.json`, `guide_seqfm_dct_pinn_blend_band.json`, `dyn_gfeat.json`, `*_metrics.csv`, `manifest.jsonl`, `*.log`.
 
 ## 0. 준비물
@@ -85,8 +100,9 @@ pip install --upgrade pip
 # 서버 CUDA에 맞는 torch를 먼저: nvidia-smi 의 CUDA 버전에 맞춰 cu126 / cu128 / cu130 중 하나
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
+pip install git+https://github.com/patrick-kidger/torchcubicspline.git   # requirements.txt에 없음, ClimODE 코드가 import
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # 두 번째가 True 여야 함
-python -m pytest -q                                                             # CPU에서 수 분, 전부 통과
+# (선택) python -m pytest -q : tests/test_kai_vendored.py, tests/test_latent.py는 학습 사슬과 무관하게 실패할 수 있음
 ```
 
 ## 3. 데이터
@@ -204,7 +220,7 @@ O=runs/climode_blend; N=runs/climode_blend/ngcm; mkdir -p $N
 for f in pinn_project.pt pinn_project.json seqfm_dct.pt seqregress.pt dyn_gfeat.pt dyn_gfeat.json stats \
          seqfm_dct_pinn_ens_2016.npz seqregress_pinn_ens_2016.npz; do ln -s ../$f $N/$f; done
 # 2020년 멤버 (고정 가중치): FM, 회귀, G(x) 코어, 보정(regm_band, blend_band)
-K=data/era5_5p625; E=data/era5_5p625/era5_data
+K=data/era5_5p625/kai6h; E=data/era5_5p625/era5_data
 C="--kai $K --era5 $E --out $N --pinn $N/pinn_project.pt --save-ens --resume-ens --train-years 2006 2007 2008 2009 2010 2011 2012 2013 2014 2015 --val-year 2016 --test-years 2020 --device cuda --val-every 0 --patience 0 --max-hours 0 --val-members 0"
 python scripts/run_step13_seqfm.py $C --basis dct
 python scripts/run_step13_seqfm.py $C --model regress
