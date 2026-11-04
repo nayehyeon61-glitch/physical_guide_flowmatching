@@ -42,5 +42,5 @@ Andrae 모델은 `scripts/compare_recent/run_andrae_cef.py`로 2020 IC에서 재
 서버에서 `run_blend_plus.sh`가 끝나면 아래처럼 실행합니다.
 
 ```
-python scripts/compare_recent/report.py --extra runs/blend_plus/ngcm2020/climode_paired_plus_2020.json:plus_blend_band:"ours blend_band+"
+python scripts/compare_recent/report.py --extra runs/blend_plus/y2020/climode_paired_plus_2020.json:plus_blend_band:"ours blend_band+"
 ```
