@@ -133,7 +133,7 @@ def main():
     ap.add_argument("--runs", default="runs")
     ap.add_argument("--out", default="docs/results_2026_11")
     a = ap.parse_args()
-    data, figs, raw = (os.path.join(a.out, d) for d in ("data", "figures", "data/raw"))
+    data, figs, raw = (os.path.join(a.out, d) for d in ("scores", "figures", "scores/raw"))
     for d in (figs, raw):
         os.makedirs(d, exist_ok=True)
 

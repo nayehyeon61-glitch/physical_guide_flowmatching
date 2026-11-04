@@ -70,10 +70,10 @@ ClimODE와 거의 같은 학습 연도를 쓴 `blend_climode`도 같은 34개 IC
 
 | 경로 | 내용 |
 |---|---|
-| `data/run_summary.csv` | 실행 × 팔별 요약 |
-| `data/scores_long.csv` | 전체 IC 앙상블 점수 (run, arm, lead, var, metric) |
-| `data/paired_vs_climode.csv` | ClimODE 짝 비교 평균과 95 % 구간 |
-| `data/raw/*.json` | 원본 점수 파일 |
+| `scores/run_summary.csv` | 실행 × 팔별 요약 |
+| `scores/scores_long.csv` | 전체 IC 앙상블 점수 (run, arm, lead, var, metric) |
+| `scores/paired_vs_climode.csv` | ClimODE 짝 비교 평균과 95 % 구간 |
+| `scores/raw/*.json` | 원본 점수 파일 |
 | `figures/` | 위 그림 4개 |
 
 예측장, 체크포인트, ERA5 파생 자료는 용량 때문에 올리지 않았습니다(`runs/`, `data/`는 git 제외).
