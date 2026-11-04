@@ -145,6 +145,8 @@ def main(argv=None):
     p.add_argument("--reg-mbm", action="store_true", help="with --reg: also mu* = a + b mu_reg + c x0 (regm_*)")
     p.add_argument("--blend", action="store_true", help="with --core and --reg: mu* = a + b core + c mu_reg + d x0 "
                    "per lead and channel (step 20 lead-dependent blend), arm blend_band")
+    p.add_argument("--core-extra", nargs="*", default=[], help="step 26 (blend_band+): more core prefixes in the "
+                   "blend, mu* = a + b core + sum_i b_i core_i + c mu_reg + d x0 (e.g. a short- and a long-rollout core)")
     p.add_argument("--flow-sigma", action="store_true", help="with --reg --reg-mbm: adds regm_flow")
     p.add_argument("--flow-op", action="store_true",
                    help="with --reg --reg-mbm: adds regm_flowop (operator pretrained on the regm_band members)")
@@ -285,17 +287,19 @@ def main(argv=None):
         if not (a.core and a.reg):
             raise SystemExit("--blend needs --core and --reg")
         ics_v = load(a.ens, a.val_year)[3][:n]
-        mus_v = [torch.from_numpy(core_predictions(a.core, a.era5, a.val_year, ics_v)),
-                 torch.from_numpy(ens_mean(a.reg, a.val_year, ics_v))]
+        mus_v = [torch.from_numpy(core_predictions(c, a.era5, a.val_year, ics_v)) for c in [a.core] + a.core_extra]
+        mus_v.append(torch.from_numpy(ens_mean(a.reg, a.val_year, ics_v)))
         blend = BlendMBM(5, L, len(mus_v)).fit(mus_v, torch.from_numpy(O[:n]), torch.from_numpy(X0[:n]))
         mu_blend = nz(blend(mus_v, torch.from_numpy(X0[:n]))).reshape(-1, 5, H, W)
         gam["blend_band"] = per_lead_gamma(band_error2(mu_blend, tgt, bidx, nb), sp_b, L, M)
-        res["blend_coef"] = {"order": ["1", "core", "reg", "x0"], "z500": blend.coef[:, VARS.index("z")].tolist(),
-                             "t2m": blend.coef[:, VARS.index("t2m")].tolist()}
+        order = ["1", "core"] + [os.path.basename(c) for c in a.core_extra] + ["reg", "x0"]
+        res["blend_coef"] = {"order": order, "z500": blend.coef[:, VARS.index("z")].tolist(),
+                             **{v: blend.coef[:, VARS.index(v)].tolist() for v in VARS if v != "z"}}
         log("[blend] val z500 RMSE of a + b core + c mu_reg + d x0 by lead (normalized) "
             + " ".join(f"{float(((mu_blend[j::L] - tgt[j::L])[:, VARS.index('z')] ** 2 * w).mean().sqrt()):.3f}"
                        for j in range(L))
-            + " | z500 coef (core, reg) by lead " + " ".join(f"({c[1]:.2f},{c[2]:.2f})" for c in res["blend_coef"]["z500"]))
+            + f" | z500 coef ({', '.join(order[1:-1])}) by lead "
+            + " ".join("(" + ",".join(f"{q:.2f}" for q in c[1:-1]) + ")" for c in res["blend_coef"]["z500"]))
     if a.flow_sigma or a.flow_op:  # flow-dependent spread factors on top of regm_band (pgcfm/flow_sigma.py)
         lat_, lon_, oro_, lsm_ = load_static(a.era5)
         static = static_features(lat_, lon_, oro_, lsm_)
@@ -394,7 +398,8 @@ def main(argv=None):
         if a.reg and a.reg_mbm:
             mus["regm"] = nz(torch.from_numpy(reg_mbm_mean(a.reg, y, ics, reg_mbm)[1])).reshape(-1, 5, H, W)
         if a.blend:
-            mus_t = [torch.from_numpy(core_predictions(a.core, a.era5, y, ics)), torch.from_numpy(ens_mean(a.reg, y, ics))]
+            mus_t = [torch.from_numpy(core_predictions(c, a.era5, y, ics)) for c in [a.core] + a.core_extra]
+            mus_t.append(torch.from_numpy(ens_mean(a.reg, y, ics)))
             mus["blend"] = nz(blend(mus_t, torch.from_numpy(X0))).reshape(-1, 5, H, W)
         sp = band_spread2(mem, bidx, nb)
         with torch.no_grad():

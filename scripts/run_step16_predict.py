@@ -27,7 +27,7 @@ from pgcfm import contract  # noqa: E402
 from pgcfm.core import static_features  # noqa: E402
 from pgcfm.coupling import PhysicsConfig, PhysicsGuide  # noqa: E402
 from pgcfm.dyncore import DynCore, DynCoreConfig, OperatorFeatures, StrongPhysics  # noqa: E402
-from pgcfm.runs import load_years  # noqa: E402
+from pgcfm.runs import device_from, load_years  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_truth  # noqa: E402
 from scripts.run_step12_core import load_static  # noqa: E402
 from scripts.run_step13_pinn import gather  # noqa: E402
@@ -49,8 +49,10 @@ def main(argv=None):
     p.add_argument("--chunk", type=int, default=12)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--max-ics", type=int, default=0)
+    p.add_argument("--device", default="cpu", help="cpu | cuda | auto (step 26: wide cores)")
     a = p.parse_args(argv)
     torch.set_num_threads(a.threads)
+    dev = device_from(a.device)
     info = json.load(open(os.path.join(a.run, f"{a.tag}.json")))
     stats = os.path.join(a.run, "stats")
     mean, std = np.load(os.path.join(stats, "global_mean.npy")), np.load(os.path.join(stats, "global_std.npy"))
@@ -61,15 +63,15 @@ def main(argv=None):
     cfg = DynCoreConfig(**{**c, "blocks": tuple(c["blocks"])})
     model = DynCore(cfg, static_features(lat, lon, oro, lsm), torch.ones(contract.N_DYNAMIC), mean[DYN], std[DYN], lat)
     model.load_state_dict(torch.load(os.path.join(a.run, f"{a.tag}.pt"), map_location="cpu"))
-    model.eval()
+    model.eval().to(dev)
     if cfg.gfeat:  # the operator features need the guide and the (constant) normalized orography
-        guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
+        guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0)).to(dev)
         with nc.Dataset(os.path.join(a.kai, f"{a.val_year}.nc")) as d:
             orog = (np.asarray(d["fields"][0, contract.STATIC_CHANNELS], dtype=np.float32)
                     - mean[contract.STATIC_CHANNELS][:, None, None]) / (std[contract.STATIC_CHANNELS]
                                                                          + contract.KAI_STD_EPS)[:, None, None]
-        model.features = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC)),
-                                          torch.from_numpy(orog)[None], model.gscale)
+        model.features = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC, device=dev)),
+                                          torch.from_numpy(orog)[None].to(dev), model.gscale)
     unscale = lambda q: q * std[DYN][:, None, None] + mean[DYN][:, None, None]  # noqa: E731
     w = np.cos(np.deg2rad(lat))
     w = (w / w.mean())[:, None]
@@ -93,8 +95,8 @@ def main(argv=None):
                 part = ics[i:i + a.chunk]
                 x0, d, _, hour0 = gather(data, [y] * len(part), part, K)
                 tisr = (x0[:, None] + d)[:, :, contract.DYNAMIC_CHANNELS.index(contract.CHANNEL_INDEX["tisr"])]
-                r = model.rollout(x0, hour0, K, tisr)
-                r = r[:, LEAD_STEPS]
+                r = model.rollout(x0.to(dev), hour0.to(dev), K, tisr.to(dev))
+                r = r[:, LEAD_STEPS].cpu()
                 e = unscale(r.numpy())
                 v5 = np.stack([e[..., DYN_IDX[v], :, :] for v in VARS], -3)
                 for v in ("u10", "v10"):

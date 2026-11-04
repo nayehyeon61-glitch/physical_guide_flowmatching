@@ -70,6 +70,18 @@ FIGURES = {  # (score key, label, line style, categorical slot); calibration: sl
         ("seqfm_dct_pinn_blend_band", "blend_band: + G(x)-feature core (dyn_gfeat)", "-", 0),
         ("seqfm_dct_pinn_blend_lp0_band", "blend with the data-only core (dyn_lp0, control)", "--", 0),
     ]),
+    # step 26 (docs/step26_blend_plus.md): blend_band+ = wide G(x) cores (long + short rollout) in the blend
+    "fig_step26": ("blend_band+: wide G(x) cores in the blended mean, same FM deviations + band Γ", [
+        ("seqregress_pinn", "Regression ensemble (reference)", "-", 5),
+        ("base_blend_band", "blend_band (base: small core, 0.2 M parameters)", "-", 0),
+        ("plus1_blend_band", "+ wide 5-day-rollout core in place of the small one", "--", 1),
+        ("plus_blend_band", "blend_band+: wide long + wide short + small core", "-", 1),
+    ]),
+    "fig_step26_cpu": ("several 4-year cores in the blended mean (CPU check of blend_band+)", [
+        ("blend1", "blend_band: G(x) core (step 20)", "-", 0),
+        ("blend2", "+ data-only core (dyn_lp0)", "--", 1),
+        ("blend4", "+ dyn_lp0 + two balance cores (dyn_balA, dyn_balB)", "-", 1),
+    ]),
     "fig_resfm_cal": ("The same members after the band Gamma on the regression mean (regm_band)", [
         ("seqfm_dct_core_pinn_regm_band", "PINN projection + regm_band", "--", 1),
         ("seqfm_dct_core_pinn_mbm_band", "PINN projection + MBM mean + band", ":", 1),
@@ -110,6 +122,11 @@ PAIRED = [  # (score key, label, line style, categorical slot)
     ("dyn_gfeat", "G(x)-feature ODE core alone (deterministic)", "-.", 1),
     ("seqfm_dct_pinn_blend_band", "blend_band: a + b·G(x) core + c·μ_reg + d·x(t) + FM deviations + band Γ", "-", 2),
     ("seqfm_dct_pinn_blend_lp0_band", "the same blend with the data-only core (control)", "--", 4),
+    # step 26 (scripts/run_blend_plus.sh)
+    ("base_blend_band", "blend_band (base: small G(x) core)", "-", 2),
+    ("plus_long", "wide 5-day-rollout G(x) core alone (deterministic)", "-.", 3),
+    ("plus1_blend_band", "+ wide 5-day core in place of the small one", "--", 3),
+    ("plus_blend_band", "blend_band+: wide long + wide short + small core", "-", 3),
 ]
 
 

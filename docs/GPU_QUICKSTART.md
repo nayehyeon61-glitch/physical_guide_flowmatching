@@ -70,6 +70,14 @@ tail -f runs/all.log
   - 디스크: 6시간 자료 1979~2018 약 25 GB + memmap 캐시 약 30 GB + 앙상블 약 4 GB, 합쳐 60 GB 정도.
   - 실행 전 명령 확인: `DRYRUN=1 PROFILE=ngcm BLEND=1 SIGMA=0 DEVICE=cuda OUT=runs/blend_ngcm bash scripts/run_step13_best.sh`는 실행하지 않고 단계별 명령만 출력합니다.
   - 5일 rollout 코어는 CPU에서 7회 반복으로 끝까지 도는 것만 확인했습니다(K가 20까지 올라가고 검증·저장까지). GPU에서는 처음입니다.
+- **(D) blend_band+** (소유자 요청 2026-11-04, `docs/step26_blend_plus.md`): (C)와 그 2020 hold-out(`run_ngcm_vs_neuralgcm.sh SKIP_TRAIN=1`)이
+  끝난 뒤, 학습된 PINN·FM·회귀는 그대로 두고 넓은 G(x) 코어 2개(128채널 × 8블록, 5일 rollout과 2일 rollout)만 새로 학습해 혼합에 넣습니다.
+  목표는 5.625° 초기장 NeuralGCM의 2일 232, 3일 307(z500, 2020 같은 IC 9개)입니다.
+
+  ```bash
+  nohup env BASE=runs/blend_ngcm OUT=runs/blend_plus DATA=data/era5_5p625 DEVICE=cuda \
+      bash scripts/run_blend_plus.sh > runs/blend_plus.log 2>&1 &
+  ```
 - 보내 주실 파일: `score_blend.json`, `energy_blend.json`, `guide_seqfm_dct_pinn_blend_band.json`, `dyn_gfeat.json`, `*_metrics.csv`, `manifest.jsonl`, `*.log`.
 
 ## 0. 준비물

@@ -24,6 +24,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from . import contract
 from .balance import PositiveMass
@@ -88,6 +89,9 @@ class DynCore(nn.Module):
             nn.init.zeros_(self.bal_head.bias)
             self.register_buffer("bal_idx", torch.tensor(BAL_DYN))
         self.last_balanced = None  # x~ of the last step (for the loss and the gates)
+        # step 26 (blend_band+): gradient checkpointing per 6 h step, so a wide core fits a K = 20 rollout in
+        # memory; set by the trainer, not part of the saved config (prediction runs without gradients)
+        self.grad_ckpt = False
 
     def _trunk(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, _, H, W = x.shape
@@ -141,8 +145,15 @@ class DynCore(nn.Module):
         """(B, steps, 66, H, W): the states 6 h, 12 h, ... after x0; tisr (B, steps, H, W) from the data.
         ``balanced`` (with cfg.balance) also returns the corrected states x~ at 0, 6, ... (steps - 1) x 6 h."""
         x, hours, out, bal = x0, hour0.float(), [], []
+        ckpt = self.grad_ckpt and torch.is_grad_enabled()
+        if ckpt and balanced:
+            raise ValueError("grad_ckpt does not keep the balanced states; use it without cfg.balance")
         for k in range(steps):
-            x = self.step(x, hours, None if tisr is None else tisr[:, k])
+            tk = None if tisr is None else tisr[:, k]
+            if ckpt:  # step 26: keep only the 6 h states, recompute each step's activations in backward
+                x = torch.utils.checkpoint.checkpoint(self.step, x, hours, tk, use_reentrant=False)
+            else:
+                x = self.step(x, hours, tk)
             hours = hours + HOURS_PER_STEP
             out.append(x)
             if balanced:

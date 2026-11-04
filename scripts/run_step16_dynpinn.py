@@ -108,6 +108,8 @@ def main(argv=None):
     p.add_argument("--select", default="best", choices=["best", "last"])
     p.add_argument("--max-hours", type=float, default=0.0)
     p.add_argument("--ckpt-every", type=int, default=50)
+    p.add_argument("--grad-ckpt", action="store_true", help="step 26: gradient checkpointing per 6 h rollout step "
+                   "(memory of one step instead of K; a wide core with K = 20 on one GPU)")
     p.add_argument("--quick", action="store_true")
     a = p.parse_args(argv)
     if a.quick:
@@ -171,6 +173,7 @@ def main(argv=None):
     cfg = DynCoreConfig(hidden=a.hidden, blocks=tuple(a.blocks), dt_hours=a.dt_hours, solver=a.solver,
                         positive=not a.no_positive, balance=a.balance, bal_detach=a.bal_detach, gfeat=a.gfeat)
     model = DynCore(cfg, static_features(lat, lon, oro, lsm), t6v.cpu(), mean[DYN], std[DYN], lat).to(dev)
+    model.grad_ckpt = a.grad_ckpt
     if a.gfeat:
         feats = OperatorFeatures(phys, triples[0][3])
         model.gscale.copy_(feats.estimate_scale(torch.cat([t[1] for t in triples])))
