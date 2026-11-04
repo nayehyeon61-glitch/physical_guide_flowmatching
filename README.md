@@ -29,6 +29,7 @@ built on the KAI-α ERA5 data contract (1.5°, 121×240, 67 channels).
 | `pgcfm/adaptive_band.py`, `pgcfm/space_band.py`, `pgcfm/ens_relation.py` | Step 13 owner's proposals: case-adaptive band Γ, band × cell spread multipliers, LOO ensemble-relation FNO (`scripts/run_step13_aband.py`, `scripts/run_step13_relation.py`) |
 | `scripts/run_step13_best.sh` | Step 13 reported ensembles (regm_band, regm_flow, regm_flowop, regm_sband_clim_flow) end to end: ERA5 download, PINN, FM, regression, calibration, spread field, scores |
 | `docs/step13_reproduce.md` | How to run step 13 yourself, with timings and the expected scores |
+| `docs/results_2026_11/` | Latest results in one place: tables, figures and CSVs (ours vs ClimODE on 2020, training-year comparison) |
 | `docs/` | Per-step implementation notes and weakness analysis (`docs/step4_pgcfm.md`: coupling results) |
 
 ```bash
