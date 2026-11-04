@@ -15,6 +15,9 @@ torch-dct==0.1.6
 neuraloperator
 torch-harmonics
 scoringrules
+properscoring
+zarr
+aiohttp
 pytorch-lightning
 einops
 omegaconf

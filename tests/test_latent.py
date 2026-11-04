@@ -93,6 +93,28 @@ def test_carry_highpass_keeps_unresolved_scales():
     assert torch.allclose(hp(y), hp(x), atol=1e-4)  # high modes persist, low modes generated
 
 
+def test_carry_tendency_cancels_the_autoencoder_error():
+    from pgcfm.latent import floors, serial_terms
+    m = LatentPGCFM(LatentConfig(k_lat=3, k_lon=4, latent=8, enc_hidden=(32,), dec_hidden=(32,), pinn_hidden=(16,),
+                                 cfm_width=16, carry_tendency=True, coupling="serial"), H, W)
+    b = _batch()
+    m.fit_dct(b["x0"], b["static"])
+    x, st, d = b["x0"], b["static"], b["doy"]
+    z0 = m.encode(x, st, d[:, 0])
+    assert torch.allclose(m.decode(z0, x, z0), x, atol=1e-5)  # a latent step that does nothing = persistence
+    assert m.sample(x, st, d[:, 1], steps=2).shape == x.shape
+    terms, _ = m.stage1_terms(b)
+    assert torch.isfinite(terms["data"])
+    loss, logs = m.cfm_loss(b, train_ae=True)  # stage 2 retrain still trains the decoder
+    loss.backward()
+    assert logs["recon"] > 0 and m.decoder.layers[0].weight.grad.abs().sum() > 0
+    m.zero_grad()
+    terms, _ = serial_terms(m, b, members=2, steps=2)
+    assert torch.isfinite(terms["crps"])
+    f = floors(m, [b])
+    assert f["rmse_ae"] < 1e-6 and f["rmse_ae_tendency"] > 0
+
+
 def test_checkpoint_resume_roundtrip(tmp_path):
     import numpy as np
     from pgcfm.ens_operator import EnsembleOperator

@@ -16,6 +16,20 @@ N_LAT, N_LON = 121, 240
 LATITUDES = np.linspace(-90.0, 90.0, N_LAT)
 LONGITUDES = np.arange(N_LON) * 1.5
 
+# Grids other than "equiangular with poles" (e.g. ClimODE's 5.625 deg 32x64 without poles, step 11)
+# register their latitudes here; every module that needs latitudes asks grid_latitudes(n_lat).
+_LATITUDE_OVERRIDES: Dict[int, np.ndarray] = {}
+
+
+def register_latitudes(lat_deg) -> None:
+    lat = np.asarray(lat_deg, dtype=np.float64)
+    _LATITUDE_OVERRIDES[len(lat)] = lat
+
+
+def grid_latitudes(n_lat: int) -> np.ndarray:
+    """Latitudes [deg, S -> N] of an n_lat grid: registered ones, else equiangular with poles."""
+    return _LATITUDE_OVERRIDES.get(n_lat, np.linspace(-90.0, 90.0, n_lat))
+
 # ----------------------------------------------------------------------
 # Channels: z, q, t, u, v x 12 pressure levels, then 7 surface fields
 # ----------------------------------------------------------------------

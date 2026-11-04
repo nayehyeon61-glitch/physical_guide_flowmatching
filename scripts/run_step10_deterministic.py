@@ -105,6 +105,37 @@ class PersistenceMBM(nn.Module):
         return ens + (a + (b - 1) * mu + c * x0[:, None])[:, None]
 
 
+class BlendMBM(nn.Module):
+    """Step 20: the classical regression on several deterministic means per lead and channel,
+    mu' = a + sum_i b_i mu_i + c x0 (area-weighted least squares), e.g. the step 18 G(x) core (good to
+    72 h) blended with the regression mean (good beyond) by lead-dependent weights."""
+
+    def __init__(self, C, K, n_mu):
+        super().__init__()
+        self.register_buffer("coef", torch.zeros(K, C, n_mu + 2))
+        self.coef[..., 1] = 1.0
+
+    @torch.no_grad()
+    def fit(self, mus, obs, x0):
+        """mus: list of (n, K, C, H, W) means, obs (n, K, C, H, W), x0 (n, C, H, W)."""
+        w = area_weights(obs.shape[-2]).expand(obs.shape[-2:]).sqrt()
+        for k in range(obs.shape[1]):
+            for c in range(obs.shape[2]):
+                cols = [torch.ones_like(obs[:, k, c])] + [mu[:, k, c] for mu in mus] + [x0[:, c]]
+                X = torch.stack(cols, -1) * w[..., None]
+                self.coef[k, c] = torch.linalg.lstsq(X.reshape(-1, len(cols)).double(),
+                                                     (obs[:, k, c] * w).reshape(-1, 1).double()).solution[:, 0].float()
+        return self
+
+    def forward(self, mus, x0):
+        """-> (n, K, C, H, W) blended mean."""
+        K = mus[0].shape[1]
+        out = self.coef[:K, :, 0][None, :, :, None, None] + self.coef[:K, :, -1][None, :, :, None, None] * x0[:, None]
+        for i, mu in enumerate(mus):
+            out = out + self.coef[:K, :, 1 + i][None, :, :, None, None] * mu
+        return out
+
+
 class MemberChain(nn.Module):
     """Owner's 2026-10-24 path: each member (already member-wise MBM) -> shared local CNN residual ->
     shared FNO residual (official neuraloperator FNO, member-wise, no pooling) -> average.

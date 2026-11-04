@@ -204,6 +204,7 @@ class LatentConfig:
     cfm_width: int = 256
     tisr_mode: str = "target"
     carry_highpass: bool = False  # copy the modes above the DCT cut from x_k (W1 fix)
+    carry_tendency: bool = False  # x_{k+1} = x_k + D(z_{k+1}) - D(z_k): only the tendency passes the AE (step 11)
     coupling: str = "anchor"  # "anchor": z = P(z_k) + s * CFM; "serial": z = Q(z_k + s * CFM, z_k), Q trained
 
 
@@ -238,11 +239,17 @@ class LatentPGCFM(nn.Module):
     def encode(self, x, static, doy):
         return self.encoder(x, static, doy)
 
-    def decode(self, z, carry=None):
+    def decode(self, z, carry=None, z_carry=None):
         """D(z). With ``cfg.carry_highpass`` and ``carry`` = the state the latent came from
         (or advances), the modes above the DCT cut are copied from it: they persist instead of
-        being lost (docs/step7_latent.md, weakness W1)."""
+        being lost (docs/step7_latent.md, weakness W1). With ``cfg.carry_tendency`` the output is
+        carry + D(z) - D(z_carry) (z_carry = E(carry)): the autoencoder error cancels at z = z_carry,
+        so a latent step that does nothing returns persistence (docs/step11_climode.md)."""
         out = self.decoder(z)
+        if self.cfg.carry_tendency and carry is not None:
+            if z_carry is None:
+                raise ValueError("carry_tendency needs z_carry = E(carry)")
+            return carry + out - self.decoder(z_carry)
         if self.cfg.carry_highpass and carry is not None:
             out = out + carry - self.dct_x.filter(carry)
         return out
@@ -278,10 +285,13 @@ class LatentPGCFM(nn.Module):
         x, y, st, d = batch["x0"], batch["targets"][:, 0], batch["static"], batch["doy"]
         w = self.w_area
         z0, z1 = self.encode(x, st, d[:, 0]), self.encode(y, st, d[:, 1])
-        x0r, x1r = self.decode(z0, x), self.decode(z1, y)
+        x0r, x1r = self.decode(z0, x, z0), self.decode(z1, y, z1)
         zp = self.pinn(z0, d[:, 1])
-        xp = self.decode(zp, x)
-        recon = 0.5 * (_wmse(x0r, x, w) + _wmse(x1r, y, w))
+        xp = self.decode(zp, x, z0)
+        if self.cfg.carry_tendency:  # x0r = x, x1r = y exactly: reconstruct the tendency instead
+            recon = _wmse(self.decoder(z1) - self.decoder(z0), y - x, w)
+        else:
+            recon = 0.5 * (_wmse(x0r, x, w) + _wmse(x1r, y, w))
         pred = _wmse(xp, y, w)
         lat = F.mse_loss(zp, z1.detach())
         terms = {"data": recon + pred + lat}
@@ -307,7 +317,11 @@ class LatentPGCFM(nn.Module):
         loss = ((self.velocity(tau, zt, cond) - u) ** 2).mean()
         logs = {"cfm": loss.item()}
         if train_ae:
-            recon = 0.5 * (_wmse(self.decode(z0, x), x, self.w_area) + _wmse(self.decode(z1, y), y, self.w_area))
+            if self.cfg.carry_tendency:  # decode(z0, x, z0) = x exactly: reconstruct the tendency (as stage 1)
+                recon = _wmse(self.decoder(z1) - self.decoder(z0), y - x, self.w_area)
+            else:
+                recon = 0.5 * (_wmse(self.decode(z0, x, z0), x, self.w_area) +
+                               _wmse(self.decode(z1, y, z1), y, self.w_area))
             loss = loss + recon
             logs["recon"] = recon.item()
         return loss, logs
@@ -331,7 +345,8 @@ class LatentPGCFM(nn.Module):
 
     def sample(self, x, static, doy_next, tisr_next=None, steps=8, generator=None, grad=False, eps=None):
         with torch.set_grad_enabled(grad):
-            return self.decode(self.sample_latent(x, static, doy_next, steps, generator, eps), x)
+            z0 = self.encode(x, static, (doy_next - 1) % 366) if self.cfg.carry_tendency else None
+            return self.decode(self.sample_latent(x, static, doy_next, steps, generator, eps), x, z0)
 
     def decoder_crps_loss(self, batch, members: int = 2, steps: int = 8):
         """Decoded fair CRPS of ``members`` latent samples, gradient only into the decoder."""
@@ -339,7 +354,8 @@ class LatentPGCFM(nn.Module):
         rep = lambda t: t.repeat(members, *([1] * (t.dim() - 1)))  # noqa: E731
         with torch.no_grad():
             z = self.sample_latent(rep(x), rep(st), rep(d[:, 1]), steps)
-        ens = self.decode(z, rep(x)).view(members, *x.shape)
+            z0 = self.encode(rep(x), rep(st), rep(d[:, 0])) if self.cfg.carry_tendency else None
+        ens = self.decode(z, rep(x), z0).view(members, *x.shape)
         keep = [i for i in range(x.shape[1]) if i != TISR_DYN]
         loss = metrics.crps(ens[:, :, keep], y[:, keep]).mean()
         return loss, {"crps": loss.item()}
@@ -359,10 +375,10 @@ def serial_terms(model: "LatentPGCFM", batch, guide=None, members: int = 2, step
     xs, sts, dn = rep(x), rep(st), rep(d[:, 1])
     with torch.no_grad():
         z0 = model.encode(xs, sts, rep(d[:, 0]))
-        x0r = model.decode(z0, xs)
+        x0r = model.decode(z0, xs, z0)
     with torch.set_grad_enabled(joint):
         zc = model.sample_latent(xs, sts, dn, steps, refine=False)
-    xh = model.decode(model.serial(zc, z0, dn), xs)
+    xh = model.decode(model.serial(zc, z0, dn), xs, z0)
     keep = [i for i in range(x.shape[1]) if i != TISR_DYN]
     crps = metrics.crps(xh.view(members, *x.shape)[:, :, keep], y[:, keep]).mean()
     terms, logs = {"crps": crps}, {"crps": crps.item()}
@@ -383,7 +399,8 @@ class DeterministicPINN(nn.Module):
     def sample(self, x, static, doy_next, tisr_next=None, steps=8, generator=None, grad=False, eps=None):
         with torch.set_grad_enabled(grad):
             m = self.m
-            return m.decode(m.pinn(m.encode(x, static, (doy_next - 1) % 366), doy_next), x)
+            z0 = m.encode(x, static, (doy_next - 1) % 366)
+            return m.decode(m.pinn(z0, doy_next), x, z0)
 
 
 class DCTFiltered(nn.Module):
@@ -589,22 +606,26 @@ def _rms(t: torch.Tensor) -> float:
 def floors(model: LatentPGCFM, batches) -> Dict[str, float]:
     """The climate_diffusion check: reconstruction floors vs the 24 h tendency.
 
-    rmse_dct: truncation only; rmse_ae: D(E(x)); rmse_pinn: D(P(E(x_k))) vs x_{k+1};
+    rmse_dct: truncation only; rmse_ae: D(E(x)); rmse_ae_tendency: D(E(x_{k+1})) - D(E(x_k)) vs the
+    tendency (the floor that matters with carry_tendency); rmse_pinn: D(P(E(x_k))) vs x_{k+1};
     tendency_rms: |x_{k+1} - x_k| (= persistence RMSE); pinn_tendency_ratio: |D(P(E(x_k))) - x_k| / |x_{k+1} - x_k|.
     """
     acc = {}
     for b in batches:
         x, y, st, d = b["x0"], b["targets"][:, 0], b["static"], b["doy"]
         z0 = model.encode(x, st, d[:, 0])
-        xp = model.decode(model.pinn(z0, d[:, 1]), x)
+        xp = model.decode(model.pinn(z0, d[:, 1]), x, z0)
         tend = _rms(y - x)
-        for k, v in {"rmse_dct": _rms(model.dct_x.filter(x) - x), "rmse_ae": _rms(model.decode(z0, x) - x),
+        z1 = model.encode(y, st, d[:, 1])
+        for k, v in {"rmse_dct": _rms(model.dct_x.filter(x) - x), "rmse_ae": _rms(model.decode(z0, x, z0) - x),
+                     "rmse_ae_tendency": _rms(model.decoder(z1) - model.decoder(z0) - (y - x)),
                      "rmse_pinn": _rms(xp - y), "tendency_rms": tend,
                      "pinn_tendency_ratio": _rms(xp - x) / tend,
                      "tendency_rms_after_dct": _rms(model.dct_x.filter(y - x))}.items():
             acc.setdefault(k, []).append(v)
     out = {k: float(np.mean(v)) for k, v in acc.items()}
     out["ae_floor_over_tendency"] = out["rmse_ae"] / out["tendency_rms"]
+    out["ae_tendency_floor_over_tendency"] = out["rmse_ae_tendency"] / out["tendency_rms"]
     out["dct_floor_over_tendency"] = out["rmse_dct"] / out["tendency_rms"]
     out["pinn_over_persistence"] = out["rmse_pinn"] / out["tendency_rms"]
     return out
@@ -661,7 +682,7 @@ def encoder_drift(new: LatentPGCFM, old: LatentPGCFM, batches) -> Dict[str, floa
         x, y, st, d = b["x0"], b["targets"][:, 0], b["static"], b["doy"]
         z_new, z_old = new.encode(x, st, d[:, 0]), old.encode(x, st, d[:, 0])
         dz.append(float((z_new - z_old).pow(2).mean().sqrt() / z_old.pow(2).mean().sqrt()))
-        rp.append(_rms(new.decode(new.pinn(z_new, d[:, 1]), x) - y))
+        rp.append(_rms(new.decode(new.pinn(z_new, d[:, 1]), x, z_new) - y))
     return {"latent_rel_shift": float(np.mean(dz)), "rmse_frozen_pinn_after": float(np.mean(rp))}
 
 
