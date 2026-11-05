@@ -44,3 +44,14 @@ Andrae 모델은 `scripts/compare_recent/run_andrae_cef.py`로 2020 IC에서 재
 ```
 python scripts/compare_recent/report.py --extra runs/blend_plus/y2020/climode_paired_plus_2020.json:plus_blend_band:"ours blend_band+"
 ```
+
+## 5. blend_band+ 약점 확인 (서버, 재학습 없음)
+
+`bash scripts/run_plus_weakness.sh` (run_blend_plus.sh의 2020 hold-out이 끝난 뒤). 결과는 `runs/blend_plus/weak2020/`에 쌓입니다.
+
+| 약점 | 단계 | 무엇을 보나 | 판정 |
+|---|---|---|---|
+| W1 24~72 h 정확도 | `w1_paired` | 코어 각각 단독 / blend / ClimODE, IC 179개 짝 비교 | 24 h 오차가 코어(평균장)에서 오는지 blend에서 오는지 |
+| W2 멤버 잡음 | `w2_prob` | 파수 대역 스펙트럼, SSR, rank, Brier | 파수 10~20, 21~32 비율이 +에서 줄었는지 |
+| W3 PINN 기여 | `w3_*` | PINN projection 없는 멤버로 같은 blend를 만든 대조군 | plus − nopinn의 CRPS·RMSE 95 % 구간이 0을 포함하는지 |
+| W4 최신 모델 | `w4_report` | 4절 표·그림에 plus, nopinn 추가 | WB2 모델·ClimODE 대비 위치 |

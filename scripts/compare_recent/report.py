@@ -100,7 +100,7 @@ def figure(out, path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--runs", default=os.path.join(C.R, "runs", "step27"))
+    p.add_argument("--runs", default=os.path.join(C.R, "docs", "step27"), help="folder with <sub>/<model>.npz per-IC scores")
     p.add_argument("--out", default=os.path.join(C.R, "docs", "step27"))
     p.add_argument("--extra", nargs="*", default=[], help="JSON:ARM:LABEL, e.g. "
                    "runs/blend_plus/y2020/climode_paired_plus_2020.json:seqfm_dct_pinn_blend_plus:'ours blend_band+'")
