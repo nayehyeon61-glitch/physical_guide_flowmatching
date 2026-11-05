@@ -10,6 +10,7 @@
 #   NGCM_PY=.venv-ngcm/bin/python bash scripts/run_ngcm_vs_neuralgcm.sh   # python with neuralgcm + JAX for NeuralGCM
 #   NGCM_ARGS="--cpu --threads 8 --ic-offset 5 --ic-stride 10"  # NeuralGCM on CPU, 18 of the 180 ICs
 #   SKIP_TRAIN=1                                                # weights already in $OUT
+#   SKIP_NGCM=1                                                 # stop after our $YEAR members (no JAX needed)
 #   DRYRUN=1                                                    # print the commands only
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -62,6 +63,7 @@ step score python scripts/score_step13.py --era5 "$E" --out "$N/score_$YEAR.json
     --test-years "$YEAR" --arms $ARMS
 
 # 3. NeuralGCM 2.8 deg deterministic, official checkpoint, regridded to our 5.625 deg grid
+if [ "${SKIP_NGCM:-0}" = 1 ]; then echo "[ngcm] SKIP_NGCM=1: $YEAR members and $N/score_$YEAR.json only"; exit 0; fi
 step ngcm_full $NGCM_PY scripts/run_neuralgcm_eval.py --era5 "$E" --out "$N/ngcm_full" \
     --model v1/deterministic_2_8_deg --year "$YEAR" $NGCM_ARGS
 step ngcm_coarse $NGCM_PY scripts/run_neuralgcm_eval.py --era5 "$E" --out "$N/ngcm_coarse" \

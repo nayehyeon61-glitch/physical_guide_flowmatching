@@ -11,8 +11,9 @@ WeatherBench1-style ``<out>/era5_data``), built from one ``YYYYMMDD.nc`` per UTC
 
 The archive is only read. One process per year:
 
-    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5/hourly --out data/era5_5p625 \
-        --years 1979 1980 ... 2018 --workers 20
+    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5_0p25_DAILY --check --years 2016 --out data/era5_5p625
+    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5_0p25_DAILY --out data/era5_5p625 \
+        --years 1979 1980 ... 2020 --workers 20
 """
 
 import argparse
@@ -34,6 +35,44 @@ CLIMODE = {"z": ("z", 500, "geopotential_500"), "t": ("t", 850, "temperature_850
            "t2m": ("t2m", None, "2m_temperature"), "u10": ("u10", None, "10m_u_component_of_wind"),
            "v10": ("v10", None, "10m_v_component_of_wind")}
 HOURS = (0, 6, 12, 18)
+ALIASES = {"mslp": ("mslp", "msl"), "time": ("time", "valid_time"), "level": ("level", "pressure_level", "isobaricInhPa"),
+           "latitude": ("latitude", "lat"), "longitude": ("longitude", "lon")}
+PATTERN = "{ymd}.nc"  # file of one UTC day under --src; --pattern "{year}/{ymd}.nc" for per-year folders
+
+
+def var(d, name):
+    """d[name] under the archive's own spelling (ERA5 CDS: msl, valid_time, pressure_level)."""
+    for n in ALIASES.get(name, (name,)):
+        if n in d.variables:
+            return d[n]
+    raise KeyError(f"{name} (tried {ALIASES.get(name, (name,))}) not in {sorted(d.variables)}")
+
+
+def day_path(src, day):
+    ymd = str(day).replace("-", "")
+    return os.path.join(src, PATTERN.format(ymd=ymd, year=ymd[:4], ymd_dash=str(day)))
+
+
+def check(src, year):
+    """Print what the converter needs from one day file and stop with a clear message if it is not there."""
+    day = np.datetime64(f"{year}-01-01")
+    f = day_path(src, day)
+    print("file:", f, "exists:", os.path.exists(f))
+    with nc.Dataset(f) as d:
+        print("variables:", sorted(d.variables))
+        t = var(d, "time")
+        hrs = [x.hour for x in nc.num2date(t[:], t.units)]
+        lev = [int(x) for x in np.asarray(var(d, "level")[:])]
+        print("hours:", hrs, "levels:", lev, "lat:", var(d, "latitude").shape, "lon:", var(d, "longitude").shape)
+        need_v = list(contract.UPPER_AIR_VARS) + [n for n in SURF.values() if n != "mslp"] + ["u10", "v10"]
+        miss = [v for v in need_v if v not in d.variables] + ([] if any(a in d.variables for a in ALIASES["mslp"]) else ["msl"])
+        miss_h = [h for h in HOURS if h not in hrs]
+        miss_l = [p for p in contract.LEVELS_HPA if p not in lev]
+    ok = not (miss or miss_h or miss_l)
+    print("missing variables:", miss, "missing hours:", miss_h, "missing levels:", miss_l)
+    print("OK: the converter can read this archive" if ok else
+          "NOT OK: send this output (daily means without 00/06/12/18 UTC cannot feed the 6-hourly model)")
+    return ok
 
 
 def overlap(src_lo, src_hi, dst_lo, dst_hi):
@@ -65,16 +104,17 @@ def day_fields(path, wy, wx):
     cm = {}
     with nc.Dataset(path) as d:
         d.set_auto_mask(False)
-        hrs = [t.hour for t in nc.num2date(d["time"][:], d["time"].units)]
+        tv = var(d, "time")
+        hrs = [t.hour for t in nc.num2date(tv[:], tv.units)]
         ti = [hrs.index(h) for h in HOURS]
-        lev = list(np.asarray(d["level"][:]).astype(int))
+        lev = list(np.asarray(var(d, "level")[:]).astype(int))
         for v in contract.UPPER_AIR_VARS:
             sl = contract.level_slice(v)
             for k, ti_ in enumerate(ti):
                 x = d[v][ti_]
                 f[k, sl] = regrid(x[[lev.index(p) for p in contract.LEVELS_HPA]], wy, wx)
         for c, name in SURF.items():
-            f[:, contract.CHANNEL_INDEX[c]] = regrid(d[name][ti], wy, wx)
+            f[:, contract.CHANNEL_INDEX[c]] = regrid(var(d, name)[ti], wy, wx)
         for short, (name, level, _) in CLIMODE.items():
             if level is None:
                 cm[short] = f[:, contract.CHANNEL_INDEX[name]] if name in SURF else regrid(d[name][ti], wy, wx)
@@ -140,18 +180,20 @@ def constants(root, orog_file, lsm_file):
     os.replace(p + ".tmp", p)
 
 
-def year_job(src, out, year, orog_z):
+def year_job(src, out, year, orog_z, pattern=PATTERN):
+    global PATTERN
+    PATTERN = pattern
     kai = os.path.join(out, "kai6h", f"{year}.nc")
     root = os.path.join(out, "era5_data")
     if os.path.exists(kai) and os.path.exists(os.path.join(root, "geopotential_500", f"geopotential_500_{year}_5.625deg.nc")):
         return f"{year} exists"
     days = np.arange(np.datetime64(f"{year}-01-01"), np.datetime64(f"{year + 1}-01-01"))
-    with nc.Dataset(os.path.join(src, str(days[0]).replace("-", "") + ".nc")) as d:
-        wy, wx = weights(np.asarray(d["latitude"][:], np.float64), np.asarray(d["longitude"][:], np.float64))
+    with nc.Dataset(day_path(src, days[0])) as d:
+        wy, wx = weights(np.asarray(var(d, "latitude")[:], np.float64), np.asarray(var(d, "longitude")[:], np.float64))
     f = np.empty((4 * len(days), contract.N_CHANNELS, H, W), dtype=np.float32)
     cm = {k: np.empty((4 * len(days), H, W), dtype=np.float32) for k in CLIMODE}
     for i, day in enumerate(days):
-        fd, cd = day_fields(os.path.join(src, str(day).replace("-", "") + ".nc"), wy, wx)
+        fd, cd = day_fields(day_path(src, day), wy, wx)
         f[4 * i:4 * i + 4] = fd
         for k in cm:
             cm[k][4 * i:4 * i + 4] = cd[k]
@@ -167,21 +209,27 @@ def year_job(src, out, year, orog_z):
 
 
 def main(argv=None):
+    global PATTERN
     p = argparse.ArgumentParser()
-    p.add_argument("--src", default="/lustre/home/mahmed/ERA5/hourly")
+    p.add_argument("--src", default="/lustre/home/mahmed/ERA5_0p25_DAILY")
     p.add_argument("--orog", default="/lustre/home/mahmed/ERA5_0p25_DAILY/era5_orography_0p25.nc")
     p.add_argument("--lsm", default="/lustre/home/mahmed/ERA5_0p25_DAILY/era5_land_sea_mask_0p25.nc")
     p.add_argument("--out", required=True)
     p.add_argument("--years", type=int, nargs="+", required=True)
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--pattern", default=PATTERN, help='day file under --src: "{ymd}.nc" (default), "{year}/{ymd}.nc", ...')
+    p.add_argument("--check", action="store_true", help="only check the first year's first day file and stop")
     a = p.parse_args(argv)
+    PATTERN = a.pattern
+    if a.check:
+        sys.exit(0 if check(a.src, a.years[0]) else 1)
     constants(os.path.join(a.out, "era5_data"), a.orog, a.lsm)
     import xarray as xr
     with xr.open_dataset(os.path.join(a.out, "era5_data", "constants", "constants_5.625deg.nc")) as c:
         orog_z = c["geopotential_at_surface"].values.astype(np.float32)
     with ProcessPoolExecutor(a.workers) as ex:
         for r in ex.map(year_job, [a.src] * len(a.years), [a.out] * len(a.years), a.years,
-                        [orog_z] * len(a.years)):
+                        [orog_z] * len(a.years), [a.pattern] * len(a.years)):
             print(r, flush=True)
 
 
