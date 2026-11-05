@@ -139,7 +139,7 @@ def main(argv=None):
     w = w_lat.view(1, 1, 1, -1, 1)
     t6v = tendency_std(data, a.train_years, DYN).clamp_min(1e-6).to(dev)
     t6 = t6v.view(1, 1, -1, 1, 1)
-    guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
+    guide = PhysicsGuide(len(lat), len(lon), mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
     est = []
     for _ in range(10):
         x0, d, orog, _ = sample(data, a.train_years, 1, rng, 16)
@@ -167,7 +167,7 @@ def main(argv=None):
             for k, v in phys.mean_squares({q: R1[q] - R0[q] for q in ("u", "v", "T")}, m).items():
                 tend[k] = tend.get(k, 0.0) + float(v) / len(triples)
         tend = {k: math.sqrt(v) for k, v in tend.items()}
-    pert = SeqDCT(a.K, contract.N_DYNAMIC, 32, 64, spatial=True)
+    pert = SeqDCT(a.K, contract.N_DYNAMIC, len(lat), len(lon), spatial=True)
     pert.fit(sample(data, a.train_years, a.K, rng, 16)[1] for _ in range(16))
     pert.to(dev)
     cfg = DynCoreConfig(hidden=a.hidden, blocks=tuple(a.blocks), dt_hours=a.dt_hours, solver=a.solver,

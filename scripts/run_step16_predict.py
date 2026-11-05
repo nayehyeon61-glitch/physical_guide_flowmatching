@@ -65,7 +65,7 @@ def main(argv=None):
     model.load_state_dict(torch.load(os.path.join(a.run, f"{a.tag}.pt"), map_location="cpu"))
     model.eval().to(dev)
     if cfg.gfeat:  # the operator features need the guide and the (constant) normalized orography
-        guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0)).to(dev)
+        guide = PhysicsGuide(len(lat), len(lon), mean, std, PhysicsConfig(dt_seconds=6 * 3600.0)).to(dev)
         with nc.Dataset(os.path.join(a.kai, f"{a.val_year}.nc")) as d:
             orog = (np.asarray(d["fields"][0, contract.STATIC_CHANNELS], dtype=np.float32)
                     - mean[contract.STATIC_CHANNELS][:, None, None]) / (std[contract.STATIC_CHANNELS]

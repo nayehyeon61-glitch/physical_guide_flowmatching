@@ -117,6 +117,8 @@ def main(argv=None):
     p.add_argument("--test-years", type=int, nargs="+", default=[2017, 2018])
     p.add_argument("--K", type=int, default=24)
     p.add_argument("--channels", type=int, default=64)
+    p.add_argument("--channel-mult", type=int, nargs="+", default=[1, 2, 2],
+                   help="U-Net stages; one more per doubling keeps the bottleneck at the same physical scale")
     p.add_argument("--iters", type=int, default=3000)
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -168,8 +170,8 @@ def main(argv=None):
     static = static_features(lat, lon, oro, lsm)
     w = torch.from_numpy(np.cos(np.deg2rad(lat)).astype(np.float32))
     w = (w / w.mean()).view(1, 1, 1, -1, 1).to(dev)
-    cfg = SeqFMConfig(K=a.K, basis=a.basis, model_channels=a.channels)
-    model = SeqFM(cfg, static) if a.model == "fm" else SeqRegressor(cfg, static)
+    cfg = SeqFMConfig(K=a.K, basis=a.basis, model_channels=a.channels, channel_mult=tuple(a.channel_mult))
+    model = (SeqFM if a.model == "fm" else SeqRegressor)(cfg, static, H=len(lat), W=len(lon))
     res = {"args": vars(a), "cfg": dataclasses.asdict(cfg), "n_params": sum(q.numel() for q in model.unet.parameters()),
            "run": run_record(dev)}
     log(f"[stage 2 {tag}] {res['n_params']} parameters, {res['run']['device_name']} commit {res['run']['commit']}")
@@ -332,7 +334,7 @@ def main(argv=None):
         P.eval()
         if P.cfg.K != a.K:
             raise ValueError("PINN and FM need the same K")
-    guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
+    guide = PhysicsGuide(len(lat), len(lon), mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
     est, r_est = [], np.random.default_rng(a.seed)  # its own stream: the scales no longer depend on training/resume
     for _ in range(10):
         h, d, orog, _ = batch(data, random_picks(data, a.train_years, 1, r_est, 16), 1)
@@ -458,7 +460,7 @@ def main(argv=None):
         n_ic = min(n_ic, a.max_ics or n_ic)
         if existing == set(here):  # saved by an earlier run: replay its noise draws (one per chunk) and skip
             for c0 in range(0, n_ic, a.ic_chunk):
-                torch.randn((min(a.ic_chunk, n_ic - c0) * a.members, a.K, contract.N_DYNAMIC, 32, 64), generator=g)
+                torch.randn((min(a.ic_chunk, n_ic - c0) * a.members, a.K, contract.N_DYNAMIC, len(lat), len(lon)), generator=g)
             skipped.append(y)
             log(f"  {y}: ensembles exist, skipped (noise replayed)")
             continue

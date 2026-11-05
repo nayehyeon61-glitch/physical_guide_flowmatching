@@ -4,6 +4,8 @@ Single source of truth for channel order, units, normalization statistics,
 grid and the physical constants used by the PG-CFM physics residuals.
 """
 
+import glob
+import os
 from dataclasses import dataclass
 from typing import Dict, List
 
@@ -29,6 +31,16 @@ def register_latitudes(lat_deg) -> None:
 def grid_latitudes(n_lat: int) -> np.ndarray:
     """Latitudes [deg, S -> N] of an n_lat grid: registered ones, else equiangular with poles."""
     return _LATITUDE_OVERRIDES.get(n_lat, np.linspace(-90.0, 90.0, n_lat))
+
+
+def era5_deg(root: str) -> str:
+    """Grid label of a WeatherBench-style era5_data folder ("5.625", "2.8125", ...), from its constants file.
+    5.625 wins when a folder holds several (run_step13_best.sh SR=1 keeps the 2.8125 deg truth next to it)."""
+    names = glob.glob(os.path.join(root, "constants", "constants_*deg.nc"))
+    degs = sorted(os.path.basename(n)[len("constants_"):-len("deg.nc")] for n in names)
+    if not degs:
+        return "5.625"
+    return "5.625" if "5.625" in degs else degs[0]
 
 # ----------------------------------------------------------------------
 # Channels: z, q, t, u, v x 12 pressure levels, then 7 surface fields

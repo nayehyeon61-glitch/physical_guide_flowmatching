@@ -26,6 +26,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
+from pgcfm import contract  # noqa: E402
 from pgcfm.core import Core, CoreConfig, area_weights, rollout_loss, static_features  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_minmax, climode_scores, climode_truth  # noqa: E402
 
@@ -34,9 +35,10 @@ LEADS_H = (24, 48, 72, 96, 120, 144)
 
 def load_static(era5_data):
     import xarray as xr
-    with xr.open_dataset(os.path.join(era5_data, "constants", "constants_5.625deg.nc")) as d:
+    deg = contract.era5_deg(era5_data)
+    with xr.open_dataset(os.path.join(era5_data, "constants", f"constants_{deg}deg.nc")) as d:
         oro, lsm = d["orography"].values.astype(np.float32), d["lsm"].values.astype(np.float32)
-    with xr.open_dataset(os.path.join(era5_data, "2m_temperature", "2m_temperature_2017_5.625deg.nc")) as d:
+    with xr.open_dataset(os.path.join(era5_data, "2m_temperature", f"2m_temperature_2017_{deg}deg.nc")) as d:
         lat, lon = d["lat"].values, d["lon"].values
     return lat, lon, oro, lsm
 

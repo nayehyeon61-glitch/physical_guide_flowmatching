@@ -35,6 +35,10 @@
 #                             2016-2018 out), broad_long's FM / regression 120000 it with PATIENCE=10, and the G(x)
 #                             core on rollouts up to 5 days as NeuralGCM (CORE_K=20 six-hour steps, curriculum
 #                             1 2 4 8 12 16 20, CORE_ITERS 60000 x 16)
+#   PROFILE=sr28              blend_sr S1 (docs/step28_blend_sr.md): ngcm's years and iterations on the 2.8125 deg grid
+#                             of local_era5_to_kai.py --grid 2.8125, GPU only: U-Net one stage deeper, PINN on 16x32
+#                             DCT modes (the same fraction of the spectrum), deeper core with gradient checkpointing,
+#                             batches halved for the 4x grid. DATA must hold the converted years (no download).
 #   PROFILE=smoke             = SMOKE=1
 #   Comparing profiles: scripts/run_step15_compare.sh (climode + broad_long, then the reports side by side)
 # Every profile value can be overridden: TRAIN_YEARS="1990 ... 2015" PINN_ITERS GEN_ITERS GEN_BATCH VAL_EVERY
@@ -76,13 +80,18 @@ case "$PROFILE" in
         SR_ITERS=${SR_ITERS:-3000}; SR_BATCH=${SR_BATCH:-16}; SR_CHUNK=${SR_CHUNK:-6}
         CORE_ITERS=${CORE_ITERS:-4000}; CORE_BATCH=${CORE_BATCH:-4}; CORE_VAL_EVERY=${CORE_VAL_EVERY:-500}
         DEVICE=${DEVICE:-cpu}; CACHE=${CACHE:-0} ;;
-    broad|broad_long|climode|ngcm)
+    broad|broad_long|climode|ngcm|sr28)
         # broad: the owner's 2026-10-27 GPU run (37 years). broad_long: the same data, 3x the FM / regression
         # steps (cosine over 120000) with early stopping on the validation loss. climode: ClimODE's data
         # years (train 2006-2015, validation 2016, test 2017-2018) with the broad training settings, so the
         # comparison with broad isolates the 27 extra years (docs/step15_training_system.md 7). ngcm: broad_long
         # plus NeuralGCM's longest training rollout (5 days) for the G(x) core (Kochkov et al. 2024, Methods).
-        LONG=$(case "$PROFILE" in broad_long|ngcm) echo 1 ;; *) echo 0 ;; esac)
+        LONG=$(case "$PROFILE" in broad_long|ngcm|sr28) echo 1 ;; *) echo 0 ;; esac)
+        if [ "$PROFILE" = sr28 ]; then
+            PINN_BATCH=${PINN_BATCH:-4}; GEN_BATCH=${GEN_BATCH:-8}; CORE_BATCH=${CORE_BATCH:-8}
+            CHANNEL_MULT=${CHANNEL_MULT:-"1 2 2 2"}; PINN_K_LAT=${PINN_K_LAT:-16}; PINN_K_LON=${PINN_K_LON:-32}
+            CORE_BLOCKS=${CORE_BLOCKS:-"2 2 2 2"}; CORE_CKPT=1; PREDICT_DEVICE=${PREDICT_DEVICE:-cuda}; DEVICE=${DEVICE:-cuda}
+        fi
         case "$PROFILE" in
             climode) TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 2006 2015)"} ;;
             *) TRAIN_YEARS=${TRAIN_YEARS:-"$(seq -s ' ' 1979 2015)"} ;;
@@ -92,11 +101,11 @@ case "$PROFILE" in
         VAL_EVERY=${VAL_EVERY:-1000}; VAL_MEMBERS=${VAL_MEMBERS:-4}
         PATIENCE=${PATIENCE:-$([ "$LONG" = 1 ] && echo 10 || echo 0)}
         SR_ITERS=${SR_ITERS:-20000}; SR_BATCH=${SR_BATCH:-32}; SR_CHUNK=${SR_CHUNK:-30}
-        CORE_ITERS=${CORE_ITERS:-$([ "$PROFILE" = ngcm ] && echo 60000 || echo 20000)}; CORE_BATCH=${CORE_BATCH:-16}
+        CORE_ITERS=${CORE_ITERS:-$(case "$PROFILE" in ngcm|sr28) echo 60000 ;; *) echo 20000 ;; esac)}; CORE_BATCH=${CORE_BATCH:-16}
         CORE_VAL_EVERY=${CORE_VAL_EVERY:-1000}
-        if [ "$PROFILE" = ngcm ]; then CORE_K=${CORE_K:-20}; CORE_CURRICULUM=${CORE_CURRICULUM:-"1 2 4 8 12 16 20"}; fi
+        if [ "$PROFILE" = ngcm ] || [ "$PROFILE" = sr28 ]; then CORE_K=${CORE_K:-20}; CORE_CURRICULUM=${CORE_CURRICULUM:-"1 2 4 8 12 16 20"}; fi
         DEVICE=${DEVICE:-auto}; CACHE=${CACHE:-1} ;;
-    *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, ngcm, smoke)"; exit 2 ;;
+    *) echo "unknown PROFILE $PROFILE (small, broad, broad_long, climode, ngcm, sr28, smoke)"; exit 2 ;;
 esac
 CORE_K=${CORE_K:-8}
 CORE_CURRICULUM=${CORE_CURRICULUM:-"1 2 4 8"}
@@ -125,6 +134,11 @@ else
     PREDICT_ARGS=""
 fi
 [ "$AMP" = 1 ] && SR_ARGS="$SR_ARGS --amp"
+PINN_ARGS="$PINN_ARGS --k-lat ${PINN_K_LAT:-8} --k-lon ${PINN_K_LON:-16}"
+GEN_ARGS="$GEN_ARGS --channel-mult ${CHANNEL_MULT:-1 2 2}"
+CORE_ARGS="$CORE_ARGS --blocks ${CORE_BLOCKS:-2 2}"
+[ "${CORE_CKPT:-0}" = 1 ] && CORE_ARGS="$CORE_ARGS --grad-ckpt"
+PREDICT_ARGS="$PREDICT_ARGS --device ${PREDICT_DEVICE:-cpu}"
 [ "$SR_SAVE" = 1 ] && SR_ARGS="$SR_ARGS --save-sr"
 mkdir -p "$OUT"
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "")
@@ -153,16 +167,26 @@ run() {  # run <name> <done-file> <command...>: skip when <done-file> exists, lo
 #    Every year is checked on its own (wb2_to_kai.py skips years already there), so a profile with more
 #    training years than an earlier run in the same DATA folder downloads only the years it lacks.
 LAST_TEST=${TEST_YEARS##* }
+GRID_DEG=5.625  # the grid of this DATA folder (contract.era5_deg): 5.625 unless only a finer constants file is there
+if [ ! -e "$E/constants/constants_5.625deg.nc" ]; then
+    for c in "$E"/constants/constants_*deg.nc; do [ -e "$c" ] && { GRID_DEG=${c##*/constants_}; GRID_DEG=${GRID_DEG%deg.nc}; }; done
+fi
 MISSING=""
 for y in $TRAIN_YEARS $VAL_YEAR $TEST_YEARS; do [ -e "$K/$y.nc" ] || MISSING="$MISSING $y"; done
+if [ -n "$MISSING" ] && { [ "$PROFILE" = sr28 ] || [ "$GRID_DEG" != 5.625 ]; }; then
+    echo "[best] $K lacks:$MISSING; run local_era5_to_kai.py --grid 2.8125 first"; exit 1
+fi
 if [ -n "$MISSING" ]; then
     run data_6h "$K/.never" python scripts/wb2_to_kai.py --out "$DATA" --all-hours --years $MISSING
 fi
 CLIM_YEARS=""
 for y in $(seq 2006 2015); do
     case " $TRAIN_YEARS " in *" $y "*) continue ;; esac
-    [ -e "$E/geopotential_500/geopotential_500_${y}_5.625deg.nc" ] || CLIM_YEARS="$CLIM_YEARS $y"
+    [ -e "$E/geopotential_500/geopotential_500_${y}_${GRID_DEG}deg.nc" ] || CLIM_YEARS="$CLIM_YEARS $y"
 done
+if [ -n "$CLIM_YEARS" ] && [ "$GRID_DEG" != 5.625 ]; then  # wb2_to_kai.py would add 5.625 deg files to this folder
+    echo "[best] $E lacks the climatology years:$CLIM_YEARS; run local_era5_to_kai.py --grid $GRID_DEG first"; exit 1
+fi
 if [ -n "$CLIM_YEARS" ]; then
     run data_clim "$E/.never" python scripts/wb2_to_kai.py --out "$DATA" --years $CLIM_YEARS
 fi

@@ -50,12 +50,12 @@ for f in pinn_project.pt pinn_project.json seqfm_dct.pt seqregress.pt dyn_gfeat.
     [ -e "$N/$f" ] || ln -sfn "../$f" "$N/$f"
 done
 C="--kai $K --era5 $E --out $N --pinn $N/pinn_project.pt --save-ens --resume-ens --train-years $TRAIN_YEARS"
-C="$C --val-year 2016 --test-years $YEAR --device $DEVICE --val-every 0 --patience 0 --max-hours 0 --val-members 0"
+C="$C --channel-mult ${CHANNEL_MULT:-1 2 2} --val-year 2016 --test-years $YEAR --device $DEVICE --val-every 0 --patience 0 --max-hours 0 --val-members 0"
 [ -d "$OUT/cache" ] && C="$C --cache $OUT/cache"
 step seqfm python scripts/run_step13_seqfm.py $C --basis dct
 step seqregress python scripts/run_step13_seqfm.py $C --model regress
 step core python scripts/run_step16_predict.py --kai "$K" --era5 "$E" --run "$N" --tag dyn_gfeat --val-year 2016 \
-    --test-years "$YEAR"
+    --test-years "$YEAR" --device "${PREDICT_DEVICE:-cpu}"
 step guide python scripts/run_step13_guide.py --ens "$N/seqfm_dct_pinn" --era5 "$E" --out "$N" --core "$N/dyn_gfeat" \
     --reg "$N/seqregress_pinn" --reg-mbm --blend --val-year 2016 --test-years "$YEAR" --save-arms regm_band blend_band
 ARMS="$N/seqregress_pinn $N/seqfm_dct_pinn_regm_band $N/seqfm_dct_pinn_blend_band"

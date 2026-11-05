@@ -11,8 +11,8 @@ WeatherBench1-style ``<out>/era5_data``), built from one ``YYYYMMDD.nc`` per UTC
 
 The archive is only read. One process per year:
 
-    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5_0p25_DAILY --check --years 2016 --out data/era5_5p625
-    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5_0p25_DAILY --out data/era5_5p625 \
+    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5/hourly --check --years 2016 --out data/era5_5p625
+    python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5/hourly --out data/era5_5p625 \
         --years 1979 1980 ... 2020 --workers 20
 """
 
@@ -27,9 +27,22 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
 
-H, W = 32, 64
-LAT = -90 + 5.625 * (np.arange(H) + 0.5)  # -87.1875 .. 87.1875, S -> N
-LON = 5.625 * np.arange(W)
+H, W, DEG, LAT, LON = None, None, None, None, None
+GRIDS = {"5.625": (32, 64), "2.8125": (64, 128), "1.40625": (128, 256), "0.703125": (256, 512)}
+
+
+def set_grid(deg):
+    """Equiangular grid without poles: ClimODE's 64x32, or a 2, 4, 8 times finer grid whose cells split the 64x32
+    cells exactly in both directions (longitudes shifted accordingly), so that the area-weighted average of the
+    fine cells IS the 5.625 deg analysis (scripts/coarsen_ens.py) and forecasts score on the same truth."""
+    global H, W, DEG, LAT, LON
+    H, W = GRIDS[deg]
+    DEG = deg
+    LAT = -90 + float(deg) * (np.arange(H) + 0.5)  # S -> N
+    LON = float(deg) * np.arange(W) if deg == "5.625" else -2.8125 + float(deg) * (np.arange(W) + 0.5)
+
+
+set_grid("5.625")
 SURF = {"t2m": "t2m", "sp": "sp", "tisr": "tisr", "tcwv": "tcwv", "msl": "mslp", "skt": "skt"}
 CLIMODE = {"z": ("z", 500, "geopotential_500"), "t": ("t", 850, "temperature_850"),
            "t2m": ("t2m", None, "2m_temperature"), "u10": ("u10", None, "10m_u_component_of_wind"),
@@ -85,21 +98,21 @@ def weights(src_lat, src_lon):
     d = abs(src_lat[1] - src_lat[0])
     lo, hi = np.clip(src_lat - d / 2, -90, 90), np.clip(src_lat + d / 2, -90, 90)
     s = lambda q: np.sin(np.deg2rad(q))  # noqa: E731
-    wy = overlap(s(lo), s(hi), s(LAT - 2.8125), s(LAT + 2.8125))
+    wy = overlap(s(lo), s(hi), s(LAT - float(DEG) / 2), s(LAT + float(DEG) / 2))
     dl = src_lon[1] - src_lon[0]
     wx = np.zeros((W, len(src_lon)))
     for shift in (-360.0, 0.0, 360.0):  # periodic in longitude
-        wx += overlap(src_lon - dl / 2 + shift, src_lon + dl / 2 + shift, LON - 2.8125, LON + 2.8125)
+        wx += overlap(src_lon - dl / 2 + shift, src_lon + dl / 2 + shift, LON - float(DEG) / 2, LON + float(DEG) / 2)
     return wy / wy.sum(1, keepdims=True), wx / wx.sum(1, keepdims=True)
 
 
 def regrid(x, wy, wx):
-    """(..., 721, 1440) -> (..., 32, 64) float32."""
+    """(..., 721, 1440) -> (..., H, W) float32."""
     return (wy @ np.asarray(x, np.float64) @ wx.T).astype(np.float32)
 
 
 def day_fields(path, wy, wx):
-    """(4, 66 + 1 unused orog slot, 32, 64) KAI channels and {climode var: (4, 32, 64)} of one day."""
+    """(4, 66 + 1 unused orog slot, H, W) KAI channels and {climode var: (4, H, W)} of one day."""
     f = np.zeros((len(HOURS), contract.N_CHANNELS, H, W), dtype=np.float32)
     cm = {}
     with nc.Dataset(path) as d:
@@ -145,7 +158,7 @@ def write_kai(path, f, year):
             ch[i] = n
         out.createVariable("latitude", "f8", ("latitude",))[:] = LAT
         out.createVariable("longitude", "f8", ("longitude",))[:] = LON
-        out.title = "ERA5 (local 0.25 deg hourly, conservative to 64x32) 6-hourly snapshots, KAI channel layout"
+        out.title = f"ERA5 (local 0.25 deg hourly, conservative to {W}x{H}) 6-hourly snapshots, KAI channel layout"
     os.replace(path + ".tmp", path)
 
 
@@ -154,7 +167,7 @@ def write_climode(root, year, cm):
     t = times_of(year)
     for short, (_, _, folder) in CLIMODE.items():
         os.makedirs(os.path.join(root, folder), exist_ok=True)
-        p = os.path.join(root, folder, f"{folder}_{year}_5.625deg.nc")
+        p = os.path.join(root, folder, f"{folder}_{year}_{DEG}deg.nc")
         if os.path.exists(p):
             continue
         xr.Dataset({short: (("time", "lat", "lon"), cm[short])}, coords={"time": t, "lat": LAT, "lon": LON}) \
@@ -164,7 +177,7 @@ def write_climode(root, year, cm):
 
 def constants(root, orog_file, lsm_file):
     import xarray as xr
-    p = os.path.join(root, "constants", "constants_5.625deg.nc")
+    p = os.path.join(root, "constants", f"constants_{DEG}deg.nc")
     if os.path.exists(p):
         return
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -180,12 +193,13 @@ def constants(root, orog_file, lsm_file):
     os.replace(p + ".tmp", p)
 
 
-def year_job(src, out, year, orog_z, pattern=PATTERN):
+def year_job(src, out, year, orog_z, pattern=PATTERN, deg="5.625"):
     global PATTERN
     PATTERN = pattern
+    set_grid(deg)
     kai = os.path.join(out, "kai6h", f"{year}.nc")
     root = os.path.join(out, "era5_data")
-    if os.path.exists(kai) and os.path.exists(os.path.join(root, "geopotential_500", f"geopotential_500_{year}_5.625deg.nc")):
+    if os.path.exists(kai) and os.path.exists(os.path.join(root, "geopotential_500", f"geopotential_500_{year}_{DEG}deg.nc")):
         return f"{year} exists"
     days = np.arange(np.datetime64(f"{year}-01-01"), np.datetime64(f"{year + 1}-01-01"))
     with nc.Dataset(day_path(src, days[0])) as d:
@@ -211,7 +225,9 @@ def year_job(src, out, year, orog_z, pattern=PATTERN):
 def main(argv=None):
     global PATTERN
     p = argparse.ArgumentParser()
-    p.add_argument("--src", default="/lustre/home/mahmed/ERA5_0p25_DAILY")
+    p.add_argument("--src", default="/lustre/home/mahmed/ERA5/hourly",
+                   help="one file per UTC day with hourly fields (ERA5_0p25_DAILY holds daily means: --check says NOT OK)")
+    p.add_argument("--grid", default="5.625", choices=sorted(GRIDS), help="output grid in degrees")
     p.add_argument("--orog", default="/lustre/home/mahmed/ERA5_0p25_DAILY/era5_orography_0p25.nc")
     p.add_argument("--lsm", default="/lustre/home/mahmed/ERA5_0p25_DAILY/era5_land_sea_mask_0p25.nc")
     p.add_argument("--out", required=True)
@@ -221,15 +237,16 @@ def main(argv=None):
     p.add_argument("--check", action="store_true", help="only check the first year's first day file and stop")
     a = p.parse_args(argv)
     PATTERN = a.pattern
+    set_grid(a.grid)
     if a.check:
         sys.exit(0 if check(a.src, a.years[0]) else 1)
     constants(os.path.join(a.out, "era5_data"), a.orog, a.lsm)
     import xarray as xr
-    with xr.open_dataset(os.path.join(a.out, "era5_data", "constants", "constants_5.625deg.nc")) as c:
+    with xr.open_dataset(os.path.join(a.out, "era5_data", "constants", f"constants_{DEG}deg.nc")) as c:
         orog_z = c["geopotential_at_surface"].values.astype(np.float32)
     with ProcessPoolExecutor(a.workers) as ex:
         for r in ex.map(year_job, [a.src] * len(a.years), [a.out] * len(a.years), a.years,
-                        [orog_z] * len(a.years), [a.pattern] * len(a.years)):
+                        [orog_z] * len(a.years), [a.pattern] * len(a.years), [a.grid] * len(a.years)):
             print(r, flush=True)
 
 

@@ -146,7 +146,7 @@ def main(argv=None):
     w = torch.from_numpy(np.cos(np.deg2rad(lat)).astype(np.float32))
     w = (w / w.mean()).view(1, 1, 1, -1, 1).to(dev)
     t6 = tendency_std(data, a.train_years, DYN).clamp_min(1e-6).view(1, 1, -1, 1, 1).to(dev)
-    guide = PhysicsGuide(32, 64, mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
+    guide = PhysicsGuide(len(lat), len(lon), mean, std, PhysicsConfig(dt_seconds=6 * 3600.0))
     est = []
     for _ in range(10):
         x0, d, orog, _ = sample(data, a.train_years, 1, rng, 16)
@@ -155,7 +155,7 @@ def main(argv=None):
     for q in guide.parameters():
         q.requires_grad_(False)
     guide.to(dev)
-    pert = SeqDCT(a.K, contract.N_DYNAMIC, 32, 64, spatial=True)
+    pert = SeqDCT(a.K, contract.N_DYNAMIC, len(lat), len(lon), spatial=True)
     pert.fit(sample(data, a.train_years, a.K, rng, 16)[1] for _ in range(16))
     pert.to(dev)
     cfg = PINNConfig(K=a.K, k_lat=a.k_lat, k_lon=a.k_lon, hidden=a.hidden)

@@ -92,7 +92,7 @@ def climode_truth(era5_data, year):
     import xarray as xr
     out = []
     for v, f in zip(VARS, FOLDERS):
-        with xr.open_dataset(os.path.join(era5_data, f, f"{f}_{year}_5.625deg.nc")) as d:
+        with xr.open_dataset(os.path.join(era5_data, f, f"{f}_{year}_{contract.era5_deg(era5_data)}deg.nc")) as d:
             out.append(d[v].values.astype(np.float32))
     return np.stack(out, 1)
 

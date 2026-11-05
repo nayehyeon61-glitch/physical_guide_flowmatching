@@ -85,7 +85,8 @@ def coarsen_like_ours(ds, era5_to_ours, levels_hpa, zero_vars=(), keep_above=Fal
     keeps the (horizontally coarsened) ERA5 values above our top level instead: information we do not have."""
     from dinosaur import xarray_utils
 
-    ds = xarray_utils.regrid_horizontal(ds, era5_to_ours)
+    if era5_to_ours is not None:  # None: ds is already on our 5.625 deg grid (cached IC)
+        ds = xarray_utils.regrid_horizontal(ds, era5_to_ours)
     lev = ds.level.values.astype(float)
     sel = np.array(levels_hpa, float)
     assert set(sel) <= set(lev), "our levels must be a subset of the input levels"
@@ -144,6 +145,37 @@ def forecast(model, ds, t0, members, seed):
     return {v: np.stack(a) for v, a in out.items()}
 
 
+def read_ic(arco, model, t_ic, forcing_lag, rg, cache, retries=10):
+    """ERA5 inputs at the IC + forcings ``forcing_lag`` h earlier, regridded to the model grid ("model") and, for
+    the coarse-IC path, the inputs conservatively regridded to our grid ("ours"). With ``cache`` the two small
+    regridded datasets are stored per IC as netCDF, so reruns / the second NeuralGCM run never touch the network.
+    HTTP reads are retried with backoff (GCS reads time out now and then)."""
+    from dinosaur import xarray_utils
+    tag = str(t_ic)[:13]
+    paths = {k: os.path.join(cache, f"{tag}_{k}.nc") for k in ("model", "ours")} if cache else {}
+    if cache and all(os.path.exists(f) for f in paths.values()):
+        return {k: xr.load_dataset(f) for k, f in paths.items()}, True
+    for attempt in range(retries):
+        try:
+            ds_ic = xr.merge([arco[list(model.input_variables)].sel(time=t_ic).compute(),
+                              arco[list(model.forcing_variables)].sel(time=t_ic - np.timedelta64(forcing_lag, "h"))
+                              .compute().drop_vars("time")])
+            break
+        except Exception as exc:  # noqa: BLE001  (aiohttp / fsspec timeouts, connection resets)
+            if attempt == retries - 1:
+                raise
+            wait = min(300, 15 * 2 ** attempt)
+            print(f"read {tag} failed ({type(exc).__name__}: {exc}), retry {attempt + 1}/{retries} in {wait} s", flush=True)
+            time.sleep(wait)
+    out = {"model": xarray_utils.regrid_horizontal(ds_ic, rg["to_model"]),
+           "ours": xarray_utils.regrid_horizontal(ds_ic[list(model.input_variables)], rg["era5_to_ours"])}
+    if cache:
+        for k, f in paths.items():
+            out[k].to_netcdf(f + ".tmp", format="NETCDF4")
+            os.replace(f + ".tmp", f)
+    return out, False
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--era5", required=True, help="our era5_data folder (truth, min / max)")
@@ -164,6 +196,8 @@ def main(argv=None):
                         "(cloud water set to 0), forcings unchanged")
     p.add_argument("--keep-above-top", action="store_true",
                    help="with --coarse-ic: keep ERA5 (coarsened) above 50 hPa instead of the isothermal extension")
+    p.add_argument("--cache", default=None, help="folder for per-IC regridded ERA5 inputs (shared by both runs)")
+    p.add_argument("--prefetch-only", action="store_true", help="only fill --cache (no forecasts, no outputs)")
     p.add_argument("--threads", type=int, default=0, help="XLA CPU threads (0 = default)")
     a = p.parse_args(argv)
     if a.cpu:
@@ -172,6 +206,8 @@ def main(argv=None):
         os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_cpu_multi_thread_eigen=false "
                                    f"intra_op_parallelism_threads={a.threads}").strip()
     os.makedirs(a.out, exist_ok=True)
+    if a.cache:
+        os.makedirs(a.cache, exist_ok=True)
     ckpt = a.checkpoint or os.path.join(a.out, a.model.replace("/", "_") + ".pkl")
     if not os.path.exists(ckpt):
         print(f"downloading {CKPT.format(model=a.model)}", flush=True)
@@ -217,18 +253,18 @@ def main(argv=None):
         t_ic = np.datetime64(f"{a.year}-01-01") + np.timedelta64(6 * ic, "h")
         # inputs at the IC; forcings (SST, sea ice) from 24 h earlier, as in the authors' demo (selective_temporal_shift
         # of the forcing variables by 24 h: the forcing is what was known the day before)
-        ds_ic = xr.merge([arco[list(model.input_variables)].sel(time=t_ic).compute(),
-                          arco[list(model.forcing_variables)].sel(time=t_ic - np.timedelta64(a.forcing_lag, "h"))
-                          .compute().drop_vars("time")])
+        got, hit = read_ic(arco, model, t_ic, a.forcing_lag, rg, a.cache)
         t_read = time.time() - tic
+        if a.prefetch_only:
+            print(f"prefetch {e + 1}/{len(ics)} ({t_ic}): {'cached' if hit else f'read {t_read:.0f} s'}", flush=True)
+            continue
         from dinosaur import xarray_utils
         if a.coarse_ic:
-            ds_in = coarsen_like_ours(ds_ic[list(model.input_variables)], rg["era5_to_ours"], LEVELS_HPA, cloud,
-                                      keep_above=a.keep_above_top)
+            ds_in = coarsen_like_ours(got["ours"], None, LEVELS_HPA, cloud, keep_above=a.keep_above_top)
             ds_m = xr.merge([xarray_utils.regrid_horizontal(ds_in, rg["ours_to_model"]),
-                             xarray_utils.regrid_horizontal(ds_ic[list(model.forcing_variables)], rg["to_model"])])
+                             got["model"][list(model.forcing_variables)]])
         else:
-            ds_m = xarray_utils.regrid_horizontal(ds_ic, rg["to_model"])
+            ds_m = got["model"]
         fc = forecast(model, ds_m, t_ic, a.members, a.seed + 1000 * e)  # var -> (M, 7, lon, lat)
         for j, h in enumerate(LEADS):
             for k, (v, iv) in enumerate((("z", iz), ("t", it))):
@@ -254,6 +290,8 @@ def main(argv=None):
                             ics=np.array(ics[:e + 1]), years=np.array([a.year]), max_lev=mx, min_lev=mn)
         with open(os.path.join(a.out, "neuralgcm_eval.json"), "w") as f:
             json.dump(log, f, indent=1)
+    if a.prefetch_only:
+        return
     n = len(ics)
     for key in ("z500", "t850"):
         r = np.sqrt(np.mean([np.square(log["rmse_" + key][str(ic)]) for ic in ics], 0))

@@ -31,6 +31,7 @@ import properscoring as ps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
+from pgcfm import contract  # noqa: E402
 from scripts.run_step11_climode import VARS, climode_minmax, climode_truth  # noqa: E402
 
 BANDS = {"k1-4": (1, 5), "k5-12": (5, 13), "k13-32": (13, 33)}
@@ -130,7 +131,7 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
     import xarray as xr
-    with xr.open_dataset(os.path.join(a.era5, "2m_temperature", f"2m_temperature_{a.test_years[0]}_5.625deg.nc")) as d:
+    with xr.open_dataset(os.path.join(a.era5, "2m_temperature", f"2m_temperature_{a.test_years[0]}_{contract.era5_deg(a.era5)}deg.nc")) as d:
         lat = d["lat"].values
     mx, mn = climode_minmax(a.era5)
     terc = tercile_thresholds(a.era5, a.clim_years)
