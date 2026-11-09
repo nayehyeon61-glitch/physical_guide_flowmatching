@@ -8,6 +8,9 @@ from pgcfm import contract
 from pgcfm.data import PGCFMSequenceDataset, assemble_full_state, kai_data_config, kai_utils
 from scripts.make_synthetic_era5 import main as make_synthetic
 
+# Every test here builds the dataset on the KAI loader, which is not in this branch.
+pytestmark = pytest.mark.skipif(kai_utils is None, reason="third_party/kai is not in this branch")
+
 DAYS = 6
 
 

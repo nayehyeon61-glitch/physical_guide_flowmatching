@@ -1,8 +1,14 @@
-"""PG-CFM data pipeline on top of the vendored KAI loader.
+"""PG-CFM data pipeline on top of the KAI loader (steps 2-11).
 
-Keeps KAI's file discovery, z-score normalization and within-year pairing
-(``third_party/kai/src/utils.py``) and adds what PG-CFM needs:
+Kept KAI's file discovery, z-score normalization and within-year pairing
+(``third_party/kai/src/utils.py``) and added what PG-CFM needs:
 dynamic/static channel split, calendar condition and K-step sequences.
+
+``third_party/kai`` is not in this branch. The module still imports (the
+step 13+ chain imports it only for names and loads data with
+``pgcfm.runs.load_years``), but ``kai_data_config`` and
+``PGCFMSequenceDataset`` raise ImportError when used. ``assemble_full_state``
+does not need KAI.
 """
 
 import importlib.util
@@ -17,10 +23,16 @@ import torch
 from . import contract
 
 _KAI_UTILS = os.path.join(os.path.dirname(__file__), "..", "third_party", "kai", "src", "utils.py")
+KAI_MISSING = ("third_party/kai is not in this branch, so the daily KAI loader (kai_data_config, "
+               "PGCFMSequenceDataset) of the step 2-11 scripts is not available. The step 13+ chain "
+               "(scripts/run_step13_best.sh) does not use it.")
 
 
 def _load_kai_utils():
-    spec = importlib.util.spec_from_file_location("kai_utils", os.path.abspath(_KAI_UTILS))
+    path = os.path.abspath(_KAI_UTILS)
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("kai_utils", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -29,8 +41,17 @@ def _load_kai_utils():
 kai_utils = _load_kai_utils()
 
 
+class _KAIMissing:
+    """Base class in place of KAI's ClimateNetCDFDataset when third_party/kai is absent."""
+
+    def __init__(self, *args, **kwargs):
+        raise ImportError(KAI_MISSING)
+
+
 def kai_data_config(global_means_path: str, global_stds_path: str, **kwargs) -> "kai_utils.DataConfig":
     """DataConfig matching configs/KAI.yaml (dt=1, n_history=0, all 67 channels)."""
+    if kai_utils is None:
+        raise ImportError(KAI_MISSING)
     params = dict(
         dt=1,
         n_history=0,
@@ -46,7 +67,7 @@ def kai_data_config(global_means_path: str, global_stds_path: str, **kwargs) -> 
     return kai_utils.DataConfig(**params)
 
 
-class PGCFMSequenceDataset(kai_utils.ClimateNetCDFDataset):
+class PGCFMSequenceDataset(kai_utils.ClimateNetCDFDataset if kai_utils is not None else _KAIMissing):
     """K-step daily sequences from KAI yearly NetCDF files.
 
     Sample t of a file yields states t, t+1, ..., t+K, all inside that file
