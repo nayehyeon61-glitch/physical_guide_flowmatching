@@ -8,7 +8,10 @@ import torch
 from pgcfm import contract
 from pgcfm.cfm import CFMConfig, CFMTransition
 from pgcfm.coupling import PGCFM, PhysicsConfig, PhysicsGuide, estimate_scales
+from pgcfm.data import kai_utils
 from pgcfm.physics import grid as pgrid
+
+needs_kai = pytest.mark.skipif(kai_utils is None, reason="needs the KAI loader; third_party/kai is not in this branch")
 
 H, W = 17, 32
 
@@ -95,6 +98,7 @@ def test_scales_are_floored():
         assert getattr(s, k) >= 0.1 * getattr(ref, k)
 
 
+@needs_kai
 def test_train_and_infer_scripts(tmp_path):
     from scripts.infer_pgcfm import main as infer
     from scripts.make_balanced_era5 import main as make_balanced

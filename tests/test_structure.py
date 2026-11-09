@@ -6,8 +6,11 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import metrics  # noqa: E402
+from pgcfm.data import kai_utils  # noqa: E402
 from pgcfm.structure import (SpreadCalibrator, StructureOperator, crps_from_parts, crps_parts,  # noqa: E402
                              match_spread, rescale_ensemble_spread, structure_scores)
+
+needs_kai = pytest.mark.skipif(kai_utils is None, reason="needs the KAI loader; third_party/kai is not in this branch")
 
 
 def test_rescale_ensemble_spread_classical1():
@@ -138,6 +141,7 @@ def test_sfno_structure_operator():
     torch.testing.assert_close(op(U[:, perm], cond[:, perm]), out[:, perm], atol=1e-5, rtol=1e-5)
 
 
+@needs_kai
 def test_quick_experiment(tmp_path):
     """Step 7 quick serial chain -> step 9 quick: every calibration on base, a spread-preserving
     operator and an operator on the in-loop calibrated chain."""

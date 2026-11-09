@@ -1,7 +1,11 @@
+import pytest
 import torch
 
 from pgcfm import contract
+from pgcfm.data import kai_utils
 from pgcfm.spread import CovarianceOperator, DCTBands, HydrostaticTangent
+
+needs_kai = pytest.mark.skipif(kai_utils is None, reason="needs the KAI loader; third_party/kai is not in this branch")
 
 
 def test_bands_partition_and_identity():
@@ -38,6 +42,7 @@ def test_covariance_operator_keeps_mean_and_starts_at_identity():
     assert not torch.allclose(out, U)
 
 
+@needs_kai
 def test_quick_experiment(tmp_path):
     from scripts.run_step7_latent import main as step7
     from scripts.run_step8_spread import main as step8
@@ -50,6 +55,7 @@ def test_quick_experiment(tmp_path):
     assert r["contraction"]["kept_total"] > 0 and "nophys_contraction" in r
 
 
+@needs_kai
 def test_fit_spread_and_infer_scripts(tmp_path):
     import json
 

@@ -1,9 +1,13 @@
+import pytest
 import torch
 
 from pgcfm import contract
+from pgcfm.data import kai_utils
 from pgcfm.latent import DCTTruncation, LatentConfig, LatentPGCFM, dct, idct
 
 H, W = 9, 16
+
+needs_kai = pytest.mark.skipif(kai_utils is None, reason="needs the KAI loader; third_party/kai is not in this branch")
 
 
 def _batch(B=3):
@@ -44,6 +48,7 @@ def test_latent_model_shapes_and_eps0():
     assert torch.allclose(m.dct_x.filter(x), x, atol=1e-4)
 
 
+@needs_kai
 def test_quick_experiment(tmp_path):
     from scripts.run_step7_latent import main
     r = main(["--out", str(tmp_path), "--quick"])
@@ -54,6 +59,7 @@ def test_quick_experiment(tmp_path):
     assert all(v == v for v in r["floors"].values())
 
 
+@needs_kai
 def test_train_latent_and_infer_scripts(tmp_path, capsys):
     import netCDF4 as nc
     from scripts.infer_pgcfm import main as infer
