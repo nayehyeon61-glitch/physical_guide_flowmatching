@@ -527,16 +527,20 @@ def score(a, tags):
             print("scored", name, flush=True)
             if other in a.loop_blend:  # the same two models coupled every step: the day-1 weights, fed back
                 w1 = torch.from_numpy(wk[0]).view(1, -1, 1, 1)
-                base = CoreBase(get_core(other))
+                base = CoreBase(get_core(other), stateful=True)
 
                 def loop_fn(x0, doy, tis, pv=None, w1=w1, base=base, kai_m=kai_m):
                     x, p, out = x0, pv, []
+                    if base.mem:  # a memory core: pv = the days before the IC; its memory follows the mixed states
+                        base.start(pv, doy, x0)
+                        p = pv[:, -1]
                     for k in range(L):
                         y = w1 * kai_m(x, doy + k, tis[:, k], prev=p) + (1 - w1) * base(x, doy + k, tis[:, k], prev=p)
                         x, p = y, x
                         out.append(x)
                     return torch.stack(out, 1)
                 lname = ("loop" if other == "core" else f"loop_{other}") + sfx
+                loop_fn.mem = base.mem
                 fns[lname] = loop_fn
                 res[lname] = metrics(rollout(loop_fn, tez, ics))
                 res[lname]["kai_weight"] = np.repeat(wk[:1], L, 0)

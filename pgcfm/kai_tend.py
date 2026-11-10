@@ -310,12 +310,24 @@ def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
 
 class CoreBase:
     """The frozen tendency core as a map of the full 67-channel state: (x, doy, tisr_next) -> next-day state.
-    ``prev`` (history cores): the full state one day before x; None = no trend."""
+    ``prev`` (history cores): the full state one day before x; None = no trend.
 
-    def __init__(self, core):
-        if getattr(core, "mem", 0):  # its state lives across steps: only whole rollouts (core_rollout) so far
-            raise NotImplementedError("a memory core cannot be called step by step yet (use core_rollout)")
-        self.core, self.dyn, self.hist = core, torch.tensor(DYN), getattr(core, "hist", False)
+    A memory core keeps its state across the steps, so it can only be stepped along ONE trajectory at a time
+    (``stateful=True``, a coupled rollout): ``start(history, doy, x0)`` warms the memory up on the days before the
+    IC, then every call advances the memory with the state it is given. In a coupled rollout that is the mixed
+    state, so the memory integrates the trajectory actually followed, and a Mori-Zwanzig core sees the difference
+    between the mixed state and its own last forecast as the innovation."""
+
+    def __init__(self, core, stateful: bool = False):
+        self.mem = getattr(core, "mem", 0)
+        if self.mem and not stateful:  # e.g. inside KAI's training, where every batch is a new trajectory
+            raise NotImplementedError("a memory core is stepped along one trajectory only (CoreBase(core, stateful=True))")
+        self.core, self.dyn, self.hist = core, torch.tensor(DYN), getattr(core, "hist", False) and not self.mem
+
+    def start(self, history, doy, x0):
+        """history (B, W, 67, H, W): the full states of the W days before the IC x0 (B, 67, H, W), oldest first."""
+        self.core.reset(None if history is None else history.index_select(-3, self.dyn), doy.float() * 24.0,
+                        x0[:, self.dyn])
 
     def __call__(self, x, doy, tisr_next=None, prev=None):
         if self.hist:
