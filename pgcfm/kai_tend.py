@@ -78,11 +78,12 @@ def stateless_norm(module: nn.Module) -> nn.Module:
 
 
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
-              hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1):
+              hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
-    per day (DynCore's dt_hours, in units of its nominal 6 h step)."""
+    per day (DynCore's dt_hours, in units of its nominal 6 h step). ``stride`` > 1 = the long-scale core: one
+    solver step = ``stride`` days (``inc_std`` is then the std of the stride-day increment)."""
     from .dyncore import DynCore, DynCoreConfig
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True)
     core = DynCore(cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
@@ -90,6 +91,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
         stateless_norm(core.net)
     elif norm != "bn":
         raise ValueError(norm)
+    core.stride = int(stride)
     return core
 
 
@@ -99,9 +101,10 @@ def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[tor
 
 
 def core_rollout(core, xd, doy, steps, tisr=None):
-    x, out = xd, []
+    """``steps`` solver steps of core.stride days each; tisr (B, steps, H, W) = the forcing at the end of each."""
+    x, out, st = xd, [], getattr(core, "stride", 1)
     for k in range(steps):
-        x = core_step(core, x, doy + k, None if tisr is None else tisr[:, k])
+        x = core_step(core, x, doy + k * st, None if tisr is None else tisr[:, k])
         out.append(x)
     return torch.stack(out, 1)
 

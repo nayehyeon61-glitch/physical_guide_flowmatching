@@ -114,7 +114,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         oro, lsm, lon = d["orography"].values.astype(np.float32), d["lsm"].values.astype(np.float32), d["lon"].values
         assert np.allclose(d["lat"].values, lat)
     contract.register_latitudes(lat)
-    opts = dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm=a.core_norm, substeps=a.core_substeps)
+    opts = dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm=a.core_norm, substeps=a.core_substeps,
+                stride=a.core_stride)
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -156,7 +157,11 @@ def train(a, arm):
     vaz = torch.from_numpy(zscore(va, mean, std))
     is_core = arm == "core"
     dyn = torch.tensor(DYN)
+    st = a.core_stride if is_core else 1  # days per training step (long-scale core: > 1)
     if is_core:
+        if st > 1:  # the tendency unit of a long-scale core: std of the st-day increment
+            inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
+            inc = np.where(inc > 0, inc, 1.0)
         m = build_core(a, mean, std, inc, lat, load=False)
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
@@ -184,9 +189,9 @@ def train(a, arm):
         ys = rng.choice(years, a.batch)
         xs, tg, doy = [], [], []
         for y in ys:
-            d = int(rng.integers(0, len(trz[y]) - K))
+            d = int(rng.integers(0, len(trz[y]) - K * st))
             xs.append(trz[y][d])
-            tg.append(trz[y][d + 1:d + 1 + K])
+            tg.append(trz[y][d + st:d + st * K + 1:st])
             doy.append(d)
         return torch.stack(xs), torch.stack(tg), torch.tensor(doy)
 
@@ -198,11 +203,11 @@ def train(a, arm):
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
         with torch.no_grad():
-            idx = np.arange(0, len(vaz) - 1, max(1, (len(vaz) - 1) // 64))[:64]
+            idx = np.arange(0, len(vaz) - st, max(1, (len(vaz) - st) // 64))[:64]
             tot = 0.0
             for i in range(0, len(idx), 16):
                 j = idx[i:i + 16]
-                tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + 1]), vaz[j + 1])) * len(j)
+                tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + st]), vaz[j + st])) * len(j)
         m.train()
         return tot / len(idx)
 
@@ -300,16 +305,23 @@ def score(a, tags):
     res["persistence"] = metrics(np.repeat(te[ics][:, None], L, 1))
     res["climatology"] = metrics(cl.astype(np.float32))
     keep = {}  # test forecasts kept for the blends
+    fns, models = {}, {}  # tag -> forecast function (x0, doy, tisr) -> (B, L, 67, H, W); tag -> KAIPos
     core_tags = a.score_cores if a.score_cores is not None else [a.core_tag]
     for ct in core_tags:
-        keep[ct] = rollout(core_fn(ct), tez, ics)
+        assert get_core(ct).stride == 1, f"{ct}: a long-scale core is scored through --hier"
+        fns[ct] = core_fn(ct)
+        keep[ct] = rollout(fns[ct], tez, ics)
         res[ct] = metrics(keep[ct])
+        if a.blend_cores is not None and ct not in a.blend_cores:
+            del keep[ct]
         ckc = torch.load(os.path.join(a.out, f"{ct}.pt"), map_location="cpu", weights_only=False)
         res[ct].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
         print("scored", ct, flush=True)
     for tag in tags:
         m, ck = load(tag)
-        pred = rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics)
+        models[tag] = m
+        fns[tag] = lambda x, d, t, m=m: m.rollout(x, d, L, t)
+        pred = rollout(fns[tag], tez, ics)
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
         if hasattr(m, "gate"):
@@ -324,6 +336,40 @@ def score(a, tags):
                 res[f"{tag}~open"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t, open_loop=True), tez, ics))
         del pred
         print("scored", tag, flush=True)
+
+    def hier_fn(jump, daily):
+        """Hierarchical rollout: lead = a * stride + b; the long-scale core takes the a stride-day steps from x0,
+        the daily model (a core or a scored position tag) the b < stride remaining days."""
+        jc, st = CoreBase(get_core(jump)), get_core(jump).stride
+        dstep = models[daily] if daily in models else CoreBase(get_core(daily))
+
+        def fn(x0, doy, tis):
+            out, y = [None] * L, x0
+            for j in range(L // st + 1):
+                x = y
+                for b in range(1, st):
+                    lead = j * st + b
+                    if lead > L:
+                        break
+                    x = dstep(x, doy + lead - 1, tis[:, lead - 1])
+                    out[lead - 1] = x
+                lead = (j + 1) * st
+                if lead <= L:
+                    y = jc(y, doy + j * st, tis[:, lead - 1])
+                    out[lead - 1] = y
+            return torch.stack(out, 1)
+        return fn
+
+    for pair in a.hier:
+        jump, daily = pair.split(":")
+        name = f"hier_{jump}+{daily}"
+        fns[name] = hier_fn(jump, daily)
+        pred = rollout(fns[name], tez, ics)
+        res[name] = metrics(pred)
+        if name in a.blend_with:
+            keep[name] = pred
+        del pred
+        print("scored", name, flush=True)
     # output-level position without training: lead-wise blend of a KAI (``--blend-bases``) with a core or another
     # scored tag, weights from the validation year. Names: blend / blend_<other>, with @<base> if base != kai.
     bases = [b for b in a.blend_bases if b in keep]
@@ -331,15 +377,12 @@ def score(a, tags):
         va = load_years(a, [a.val_year])[a.val_year]
         vics, vaz, vtruth = setup(va)
     for bt in bases:
-        kai_m, _ = load(bt)
+        kai_m = models[bt]
         sfx = "" if bt == "kai" else f"@{bt}"
-        vk = rollout(lambda x, d, t: kai_m.rollout(x, d, L, t), vaz, vics)
-        for other in core_tags + [t for t in a.blend_with if t in keep and t not in core_tags and t != bt]:
-            if other in core_tags:
-                vc = rollout(core_fn(other), vaz, vics)
-            else:
-                om, _ = load(other)
-                vc = rollout(lambda x, d, t: om.rollout(x, d, L, t), vaz, vics)
+        vk = rollout(fns[bt], vaz, vics)
+        for other in [t for t in core_tags if t in keep] + [t for t in a.blend_with
+                                                            if t in keep and t not in core_tags and t != bt]:
+            vc = rollout(fns[other], vaz, vics)
             num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
             den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
             wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
@@ -377,7 +420,8 @@ def summarize(a, res, std, ics):
     for k, d in res.items():
         rmse = np.sqrt(d["mse"].mean(0))  # (L, 67)
         e = {"rmse": rmse.tolist(), "acc": d["acc"].mean(0).tolist(),
-             "nrmse": (rmse[:, scored] / std[scored]).mean(1).tolist()}
+             "nrmse": (rmse[:, scored] / std[scored]).mean(1).tolist(),
+             "acc_mean": d["acc"].mean(0)[:, scored].mean(1).tolist()}  # amplitude-free: is the gain damping only?
         for x in ("train_seconds", "params"):
             if x in d:
                 e[x] = float(d[x])
@@ -438,7 +482,8 @@ def summarize(a, res, std, ics):
         r = np.array(e["rmse"])
         print(f"{k:12s}", " ".join(f"{n}:" + "/".join(f"{r[q, names.index(n)]:.3g}" for q in ls)
                                     for n in ("z500", "t850", "t2m", "u850")),
-              " nrmse", "/".join(f"{e['nrmse'][q]:.3f}" for q in ls))
+              " nrmse", "/".join(f"{e['nrmse'][q]:.3f}" for q in ls),
+              " acc", "/".join(f"{e['acc_mean'][q]:.3f}" for q in ls))
 
 
 def main(argv=None):
@@ -462,6 +507,7 @@ def main(argv=None):
                    help="position arms: rollout days of the training loss, a curriculum over the iterations")
     p.add_argument("--init", default=None, help="position arms: start from this checkpoint tag (fine-tuning)")
     p.add_argument("--gate-lr", type=float, default=1e-2, help="arm gate: learning rate of the 67 mixing weights")
+    p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
     p.add_argument("--blend-bases", nargs="*", default=["kai"],
                    help="scored KAI tags that are blended with the cores / --blend-with tags")
     p.add_argument("--loop-blend", nargs="*", default=[],
@@ -489,6 +535,11 @@ def main(argv=None):
     p.add_argument("--core-norm", default="bn", choices=["bn", "gn"],
                    help="bn = ClimODE's block as it is; gn = GroupNorm, no dropout (no train / inference mismatch)")
     p.add_argument("--core-substeps", type=int, default=1, help="Heun steps per day")
+    p.add_argument("--core-stride", type=int, default=1,
+                   help="days per solver step of the core (long-scale core; --curriculum then counts these steps)")
+    p.add_argument("--hier", nargs="*", default=[],
+                   help="JUMP:DAILY pairs: the long-scale core JUMP takes the stride-day steps, DAILY (a core tag of "
+                        "--score-cores or a scored position tag) the remaining days; scored as hier_JUMP+DAILY")
     p.add_argument("--core-zm", type=float, default=0.0, help="weight of a zonal-mean error term in the core loss")
     p.add_argument("--score-cores", nargs="*", default=None, help="core tags to score alone (default: --core-tag)")
     p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 3, 4], help="core rollout days")
