@@ -283,6 +283,7 @@ def score(a, tags):
     w = np.cos(np.deg2rad(lat))
     w = (w / w.mean())[:, None].astype(np.float32)
     L = a.leads
+    regions = [np.abs(lat) < 20, lat >= 20, lat <= -20]
     sd = (std + EPS).astype(np.float32)[None, None, :, None, None]
     mn = mean.astype(np.float32)[None, None, :, None, None]
     cores, dyn = {}, torch.tensor(DYN)
@@ -348,6 +349,18 @@ def score(a, tags):
         pa, ta = pred - cl, truth - cl
         out["acc"] = ((pa * ta * w).sum((-2, -1))
                       / np.sqrt((pa ** 2 * w).sum((-2, -1)) * (ta ** 2 * w).sum((-2, -1)) + 1e-30)).astype(np.float32)
+        # the MSE of every forecast split exactly into three terms, on the anomalies (scripts/eval_kai_breakdown.py):
+        # mean_w(e^2) = (mean_w e)^2 + (s_f - s_o)^2 + 2 s_f s_o (1 - r)  = bias + amplitude + phase (pattern) error
+        mf, mo = (pa * w).mean((-2, -1), dtype=np.float64), (ta * w).mean((-2, -1), dtype=np.float64)
+        vf = (pa ** 2 * w).mean((-2, -1), dtype=np.float64) - mf ** 2
+        vo = (ta ** 2 * w).mean((-2, -1), dtype=np.float64) - mo ** 2
+        cov = (pa * ta * w).mean((-2, -1), dtype=np.float64) - mf * mo
+        sf, so = np.sqrt(np.maximum(vf, 0)), np.sqrt(np.maximum(vo, 0))
+        out["dec"] = np.stack([(mf - mo) ** 2, (sf - so) ** 2, 2 * (sf * so - cov)], -1).astype(np.float32)
+        out["act"] = (sf / (so + 1e-30)).astype(np.float32)  # activity: pattern amplitude of the forecast / truth's
+        # the same MSE by region: tropics (rows with |lat| < 20 = 22.5S-22.5N), north and south of it (area weights)
+        out["mse_reg"] = np.stack([(err[:, :, :, r] ** 2 * w[r]).mean((-2, -1)) / w[r].mean() for r in regions],
+                                  -1).astype(np.float32)
         if spectra:  # zonal power (cos-lat weighted over rows) of prediction, truth and error per wavenumber
             P = lambda f: (np.abs(np.fft.rfft(f, axis=-1)) ** 2 * w).mean(-2).mean(0).astype(np.float32)  # noqa: E731
             out.update(sp_pred=P(pred), sp_true=P(truth), sp_err=P(err))
