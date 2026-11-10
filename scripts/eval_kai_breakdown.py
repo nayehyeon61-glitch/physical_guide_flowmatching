@@ -9,10 +9,14 @@ outdir/breakdown.json):
 
   by item      RMSE change (%) of every variable x level x lead, paired bootstrap over the ICs
                (a dot = the 95 % interval contains zero)
-  by term      the normalized MSE split exactly into three terms, on anomalies from the climatology:
-               mean_w(e^2) = (mean_w e)^2 + (s_f - s_o)^2 + 2 s_f s_o (1 - r)
-               bias (global-mean error) + amplitude (the forecast pattern too weak / too strong)
-               + phase (the pattern in the wrong place: what is left when the amplitude is right)
+  by term      the normalized MSE of every forecast split exactly into three terms, on anomalies from the
+               climatology (s_f, s_o = pattern amplitude of forecast / truth, a = s_f / s_o, r = their correlation):
+               mean_w(e^2) = (mean_w e)^2 + s_o^2 (1 - r^2) + s_o^2 (a - r)^2
+               bias + pattern (information) term: what is left at the best amplitude, falls only with r
+               + amplitude cost: what RMSE charges for an amplitude other than a = r (a full-strength field,
+               a = 1, pays (1 - r)^2; a field damped to a = r pays nothing)
+               The textbook split (s_f - s_o)^2 + 2 s_f s_o (1 - r) is printed too; its second term also falls
+               when the field is only damped.
   by scale     error in zonal wavenumber bands k0 (zonal mean) / k1-3 / k4-9 / k10+
   by region    tropics (22.5S-22.5N: the 8 rows with |lat| < 20), north and south of it
   by season    DJF / MAM / JJA / SON of the IC (table)
@@ -42,7 +46,8 @@ LEVVARS = ["z", "q", "t", "u", "v"]
 SFC = ["t2m", "msl", "sp", "skt", "tcwv"]
 BANDS = [("k0 (zonal mean)", 0, 0), ("k1-3 (planetary)", 1, 3), ("k4-9 (synoptic)", 4, 9), ("k10+ (small)", 10, 32)]
 REGIONS = ["tropics (22.5S-22.5N)", "north of 22.5N", "south of 22.5S"]
-TERMS = ["bias", "amplitude", "phase"]
+TERMS = ["bias", "amplitude", "phase"]  # the textbook split
+TERMS2 = ["bias", "pattern (information)", "amplitude cost"]
 SEASONS = ["DJF", "MAM", "JJA", "SON"]
 
 
@@ -81,28 +86,45 @@ def breakdown(S, raw, std, a, b):
     aa, ab = raw[f"{a}__acc"], raw[f"{b}__acc"]
     out["acc"] = {a: aa.mean(0)[:, sc].mean(1), b: ab.mean(0)[:, sc].mean(1)}
     out["dacc_group"] = {g: (aa.mean(0) - ab.mean(0))[:, c].mean(1) for g, c in groups.items()}
-    # scale: error power per zonal wavenumber band, normalized per channel (Parseval weights of the rfft bins)
+    # scale: the error in zonal wavenumber bands, as the score's nRMSE of the band-filtered error
+    # (Parseval weights of the rfft bins: the bands add up to the MSE)
     if f"{a}__sp_err" in raw and f"{b}__sp_err" in raw:
         ea, eb = raw[f"{a}__sp_err"].astype(np.float64), raw[f"{b}__sp_err"].astype(np.float64)
         K = ea.shape[-1]
         wk = np.full(K, 2.0)
         wk[0] = wk[-1] = 1.0
-        nb = lambda e, lo, hi: ((e[:, sc, lo:hi + 1] * wk[lo:hi + 1]).sum(-1) / std[sc] ** 2).mean(1)  # noqa: E731
-        out["scale"] = {n: np.sqrt(nb(ea, lo, hi) / nb(eb, lo, hi)) - 1 for n, lo, hi in BANDS}
-        tot = nb(eb, 0, K - 1)
-        out["scale_share"] = {n: nb(eb, lo, hi) / tot for n, lo, hi in BANDS}
-    # terms: bias^2 + amplitude + phase = MSE, normalized per channel and averaged over the 65 channels
-    if f"{a}__dec" in raw and f"{b}__dec" in raw:
-        ta = (raw[f"{a}__dec"].astype(np.float64).mean(0)[:, sc] / std[sc, None] ** 2).mean(1)  # (L, 3)
-        tb = (raw[f"{b}__dec"].astype(np.float64).mean(0)[:, sc] / std[sc, None] ** 2).mean(1)
-        out["terms"] = {a: ta, b: tb}
-        out["dterm_pct"] = 100 * (ta - tb) / tb.sum(1, keepdims=True)  # in % of b's normalized MSE
-        tg = {}
-        for g, c in groups.items():  # the same split per variable group
-            ga = (raw[f"{a}__dec"].astype(np.float64).mean(0)[:, c] / std[c, None] ** 2).mean(1)
-            gb = (raw[f"{b}__dec"].astype(np.float64).mean(0)[:, c] / std[c, None] ** 2).mean(1)
-            tg[g] = 100 * (ga - gb) / gb.sum(1, keepdims=True)
-        out["dterm_group_pct"] = tg
+        pw = lambda e, lo, hi: (e[:, sc, lo:hi + 1] * wk[lo:hi + 1]).sum(-1)  # noqa: E731  (L, 65)
+        nb = lambda e, lo, hi: (np.sqrt(pw(e, lo, hi)) / std[sc]).mean(1)  # noqa: E731
+        out["scale"] = {n: nb(ea, lo, hi) / nb(eb, lo, hi) - 1 for n, lo, hi in BANDS}
+        out["scale_share"] = {n: (pw(eb, lo, hi) / pw(eb, 0, K - 1)).mean(1) for n, lo, hi in BANDS}
+    # terms. RMSE_A - RMSE_B = (MSE_A - MSE_B) / (RMSE_A + RMSE_B) per channel, and the MSE is a sum of terms, so
+    # the change of the 65-channel nRMSE splits exactly into one contribution per term (in % of B's nRMSE)
+    ra, rb = np.sqrt(ma.mean(0)), np.sqrt(mb.mean(0))  # (L, 67)
+
+    def contrib(ta, tb, c):
+        num = ((ta - tb)[:, c] / ((ra + rb)[:, c, None] * std[c, None])).mean(1)
+        return 100 * num / (rb[:, c] / std[c]).mean(1)[:, None]
+
+    def share(t, r, c):  # the part of the nRMSE that belongs to each term
+        return (t[:, c] / (r[:, c, None] * std[c, None])).mean(1) / (r[:, c] / std[c]).mean(1)[:, None]
+
+    if all(f"{k}__{m}" in raw for k in (a, b) for m in ("dec", "act")) and "climatology__dec" in raw:
+        so2 = raw["climatology__dec"][..., 1].astype(np.float64)  # the truth's pattern variance (s_f = 0 there)
+
+        def split(k):  # (L, 67, 3): bias, s_o^2 (1 - r^2), s_o^2 (a - r)^2, mean over the forecasts
+            d, am = raw[f"{k}__dec"].astype(np.float64), raw[f"{k}__act"].astype(np.float64)
+            cov = am * so2 - d[..., 2] / 2
+            info = so2 - np.where(am > 1e-6, cov ** 2 / (am ** 2 * so2 + 1e-30), 0.0)
+            return np.stack([d[..., 0], info, d[..., 1] + d[..., 2] - info], -1).mean(0)
+
+        sa, sb = split(a), split(b)
+        out["dterm2_pct"] = contrib(sa, sb, sc)
+        out["term2_share"] = {a: share(sa, ra, sc), b: share(sb, rb, sc)}
+        out["dterm2_group_pct"] = {g: contrib(sa, sb, np.array(c)) for g, c in groups.items()}
+    if f"{a}__dec" in raw and f"{b}__dec" in raw:  # the textbook split
+        ta, tb = raw[f"{a}__dec"].astype(np.float64).mean(0), raw[f"{b}__dec"].astype(np.float64).mean(0)
+        out["dterm_pct"] = contrib(ta, tb, sc)
+        out["term_share"] = {a: share(ta, ra, sc), b: share(tb, rb, sc)}
     if f"{a}__mse_reg" in raw and f"{b}__mse_reg" in raw:
         ra, rb = raw[f"{a}__mse_reg"].astype(np.float64), raw[f"{b}__mse_reg"].astype(np.float64)
         out["region"] = {n: nrmse(ra[..., i]) / nrmse(rb[..., i]) - 1 for i, n in enumerate(REGIONS)}
@@ -126,9 +148,9 @@ def figure(B, path, title):
     vmax = float(np.clip(5 * np.ceil(np.percentile(np.abs(rel[:, allc]), 98) / 5), 5, 60))
     plt.rcParams.update({"font.size": 10, "axes.edgecolor": MUTED, "axes.labelcolor": MUTED, "text.color": INK,
                          "xtick.color": MUTED, "ytick.color": MUTED, "axes.titlecolor": INK})
-    lines = [k for k in ("dterm_pct", "scale", "region", "dacc_group", "act") if k in B]
+    lines = [k for k in ("dterm2_pct", "scale", "region", "dacc_group", "act") if k in B]
     fig = plt.figure(figsize=(19, 10.2), facecolor=SURFACE)
-    gs = fig.add_gridspec(2, 60, height_ratios=[1.0, 0.9], hspace=0.42, wspace=0.0, left=0.04, right=0.985,
+    gs = fig.add_gridspec(2, 60, height_ratios=[1.0, 0.9], hspace=0.42, wspace=0.0, left=0.04, right=0.955,
                           top=0.9, bottom=0.07)
     im = None
     for i, g in enumerate(LEVVARS + ["surface"]):  # row 1: the scorecard
@@ -174,15 +196,15 @@ def figure(B, path, title):
     span = 60 // max(n, 1)
     for j, k in enumerate(lines):  # row 2: the same change split in other ways
         p = fig.add_subplot(gs[1, j * span + 2:(j + 1) * span - 2])
-        if k == "dterm_pct":
-            base(p, "by error term: change of the normalized MSE\n(% of B's MSE; below 0 = A better)")
+        if k == "dterm2_pct":
+            base(p, "by error term: contribution to the nRMSE change\n(%; the bars add up to the total; below 0 = A better)")
             wdt = 0.26
-            for t, name in enumerate(TERMS):
+            for t, name in enumerate(TERMS2):
                 p.bar(days + (t - 1) * wdt, B[k][:, t], wdt * 0.9, color=CAT[t], label=name)
             p.plot(days, B[k].sum(1), color=INK, lw=1.6, marker="o", ms=4, label="total")
-            p.legend(frameon=False, fontsize=9, ncol=2)
+            p.legend(frameon=False, fontsize=8.5)
         elif k == "scale":
-            base(p, "by scale: error in zonal wavenumber bands\n(RMSE change, %; share of B's error at day 1 / last day)")
+            base(p, "by scale: nRMSE change in zonal wavenumber bands\n(%; share of B's MSE at day 1 / last day)")
             for t, (name, _, _) in enumerate(BANDS):
                 sh = B["scale_share"][name]
                 p.plot(days, 100 * B[k][name], color=CAT[t], lw=2,
@@ -227,14 +249,20 @@ def table(B):
     for g in B["groups"]:
         nb, nw, nt = B["cells"][g]
         print(f"    {g:8s} {f(B['rel_group'][g]):38s} | {f(B['dacc_group'][g], 1, 3):38s} | {nb}/{nw} of {nt}")
-    if "dterm_pct" in B:
-        print("  by term: change of the normalized MSE in % of B's MSE (sum = total)")
-        for t, name in enumerate(TERMS):
-            print(f"    {name:10s} {f(B['dterm_pct'][:, t], 1)}   share in B: "
-                  + "/".join(f"{100 * B['terms'][b][x, t] / B['terms'][b][x].sum():.0f}" for x in q) + " %")
-        print(f"    {'total':10s} {f(B['dterm_pct'].sum(1), 1)}")
+    if "dterm2_pct" in B:
+        print("  by term: contribution to the change of the 65-channel nRMSE, % (sum = total)")
+        for t, name in enumerate(TERMS2):
+            print(f"    {name:22s} {f(B['dterm2_pct'][:, t], 1)}   part of the nRMSE of A: "
+                  + "/".join(f"{100 * B['term2_share'][a][x, t]:.0f}" for x in q) + " %, of B: "
+                  + "/".join(f"{100 * B['term2_share'][b][x, t]:.0f}" for x in q) + " %")
+        print(f"    {'total':22s} {f(B['dterm2_pct'].sum(1), 1)}")
         for g in B["groups"]:
-            print(f"      {g:8s} " + "  ".join(f"{name} {f(B['dterm_group_pct'][g][:, t], 1)}" for t, name in enumerate(TERMS)))
+            print(f"      {g:8s} " + "  ".join(f"{name.split(' ')[0]} {f(B['dterm2_group_pct'][g][:, t], 1)}"
+                                              for t, name in enumerate(TERMS2)))
+    if "dterm_pct" in B:
+        print("  textbook split (s_f - s_o)^2 + 2 s_f s_o (1 - r): contribution to the nRMSE change, %")
+        for t, name in enumerate(TERMS):
+            print(f"    {name:22s} {f(B['dterm_pct'][:, t], 1)}")
     if "scale" in B:
         print("  by scale: RMSE change %  (share of B's error)")
         for name, _, _ in BANDS:
