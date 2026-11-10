@@ -255,6 +255,22 @@ def train(a, arm):
 
 
 # ---------------------------------------------------------------------------------------------- scoring
+def simplex2(b1, b2, g11, g22, g12):
+    """argmin over w1, w2 >= 0, w1 + w2 <= 1 of |r - w1 d1 - w2 d2|^2 from the moments b_i = <d_i r>,
+    g_ij = <d_i d_j> (arrays): the optimum of a convex problem on a triangle lies inside or on an edge."""
+    eps = 1e-30
+    det = g11 * g22 - g12 ** 2
+    full = np.stack([(b1 * g22 - b2 * g12) / np.maximum(det, eps), (b2 * g11 - b1 * g12) / np.maximum(det, eps)])
+    ok = (full >= 0).all(0) & (full.sum(0) <= 1) & (det > eps)
+    t = np.clip((b1 - b2 - g12 + g22) / np.maximum(g11 - 2 * g12 + g22, eps), 0, 1)
+    z = np.zeros_like(b1)
+    cands = [np.stack([z, z]), np.stack([np.clip(b1 / np.maximum(g11, eps), 0, 1), z]),
+             np.stack([z, np.clip(b2 / np.maximum(g22, eps), 0, 1)]), np.stack([t, 1 - t]), np.where(ok, full, 0.0)]
+    cost = np.stack([-2 * (c[0] * b1 + c[1] * b2) + c[0] ** 2 * g11 + c[1] ** 2 * g22 + 2 * c[0] * c[1] * g12
+                     for c in cands])
+    return np.take_along_axis(np.stack(cands), cost.argmin(0)[None, None], 0)[0].astype(np.float32)
+
+
 def score(a, tags):
     mean, std, inc, clim = stats(a)
     te = load_years(a, [a.test_year])[a.test_year]
@@ -459,18 +475,7 @@ def score(a, tags):
             d2 = rollout(fns[oth[1]], vaz, vics) - vk
             b1, b2, g11, g22, g12 = avg(d1 * r), avg(d2 * r), avg(d1 * d1), avg(d2 * d2), avg(d1 * d2)
             del r, d1, d2
-            eps = 1e-30
-            det = g11 * g22 - g12 ** 2
-            full = np.stack([(b1 * g22 - b2 * g12) / np.maximum(det, eps), (b2 * g11 - b1 * g12) / np.maximum(det, eps)])
-            ok = (full >= 0).all(0) & (full.sum(0) <= 1) & (det > eps)
-            t = np.clip((b1 - b2 - g12 + g22) / np.maximum(g11 - 2 * g12 + g22, eps), 0, 1)
-            z = np.zeros_like(b1)
-            cands = [np.stack([z, z]), np.stack([np.clip(b1 / np.maximum(g11, eps), 0, 1), z]),
-                     np.stack([z, np.clip(b2 / np.maximum(g22, eps), 0, 1)]), np.stack([t, 1 - t]),
-                     np.where(ok, full, 0.0)]  # the optimum of a convex problem on a triangle: inside or on an edge
-            cost = np.stack([-2 * (c[0] * b1 + c[1] * b2) + c[0] ** 2 * g11 + c[1] ** 2 * g22 + 2 * c[0] * c[1] * g12
-                             for c in cands])
-            best = np.take_along_axis(np.stack(cands), cost.argmin(0)[None, None], 0)[0].astype(np.float32)  # (2, L, 67)
+            best = simplex2(b1, b2, g11, g22, g12)  # (2, L, 67)
             w1, w2 = (x[None, :, :, None, None] for x in best)
             name = f"blend_{combo}" + sfx
             res[name] = metrics(keep[bt] + w1 * (keep[oth[0]] - keep[bt]) + w2 * (keep[oth[1]] - keep[bt]))
@@ -478,6 +483,54 @@ def score(a, tags):
             res[name]["other_weights"] = best
             print("scored", name, flush=True)
         del vk
+    # --seq-mix A+B[+C]: the members' one-day forecasts mixed EVERY step with weights per lead and channel and fed
+    # back (the step-wise coupling with lead-dependent weights). The weights are fitted on the validation year
+    # step by step: given the mixed states of day k, the weights of day k + 1 minimize that day's error.
+    for combo in a.seq_mix:
+        mem = combo.split("+")
+        if not (2 <= len(mem) <= 3) or not all(t in models or t in a.seq_cores for t in mem):
+            continue
+        steps = [models[t] if t in models else CoreBase(get_core(t)) for t in mem]
+        va = load_years(a, [a.val_year])[a.val_year]
+        vics = np.arange(0, len(va) - L, a.ic_stride)
+        vaz = zscore(va, mean, std)
+        wl = torch.from_numpy(w)
+
+        def members(x, doy, tk, pv):
+            with torch.no_grad():
+                return [torch.cat([st(x[i:i + 16], doy[i:i + 16], tk[i:i + 16], prev=pv[i:i + 16])
+                                   for i in range(0, len(x), 16)]) for st in steps]
+
+        x = torch.from_numpy(vaz[vics])
+        pv = torch.from_numpy(vaz[np.maximum(vics - 1, 0)])
+        doy = torch.tensor(vics)
+        W = np.zeros((L, len(mem), contract.N_CHANNELS), dtype=np.float32)
+        avg = lambda f: (f * wl).mean((0, -2, -1)).double().numpy()  # noqa: E731
+        for k in range(L):
+            tgt = torch.from_numpy(vaz[vics + k + 1])
+            F = members(x, doy + k, tgt[:, TISR], pv)
+            r, d = tgt - F[0], [f - F[0] for f in F[1:]]
+            if len(d) == 1:
+                best = np.clip(avg(d[0] * r) / np.maximum(avg(d[0] * d[0]), 1e-30), 0, 1)[None].astype(np.float32)
+            else:
+                best = simplex2(avg(d[0] * r), avg(d[1] * r), avg(d[0] * d[0]), avg(d[1] * d[1]), avg(d[0] * d[1]))
+            W[k, 1:], W[k, 0] = best, 1 - best.sum(0)
+            pv, x = x, sum(torch.from_numpy(W[k, m]).view(1, -1, 1, 1) * F[m] for m in range(len(mem)))
+        del va, vaz
+        Wt = torch.from_numpy(W)
+
+        def seq_fn(x0, doy, tis, pv=None, steps=steps, Wt=Wt):
+            x, p, out = x0, pv, []
+            for k in range(L):
+                y = sum(Wt[k, m].view(1, -1, 1, 1) * st(x, doy + k, tis[:, k], prev=p) for m, st in enumerate(steps))
+                x, p = y, x
+                out.append(x)
+            return torch.stack(out, 1)
+        name = f"seq_{combo}"
+        fns[name] = seq_fn
+        res[name] = metrics(rollout(seq_fn, tez, ics))
+        res[name]["seq_weights"] = W
+        print("scored", name, flush=True)
     run_cascades()
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
@@ -582,6 +635,10 @@ def main(argv=None):
     p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
     p.add_argument("--blend-multi", nargs="*", default=[],
                    help="A+B: three-way blend of the base KAI with two kept forecasts (e.g. a short- and a long-range core)")
+    p.add_argument("--seq-mix", nargs="*", default=[],
+                   help="A+B[+C]: one-day forecasts of scored position tags / cores mixed every step with weights per "
+                        "lead and channel (fitted step by step on the validation year) and fed back; seq_A+B[+C]")
+    p.add_argument("--seq-cores", nargs="*", default=[], help="core tags that --seq-mix may use")
     p.add_argument("--cascade", nargs="*", default=[],
                    help="A>B@n: forecast function A up to day n, then B from A's day-n state; scored as cas_A>B@n "
                         "(A, B: core tags, position tags, loop_<core>)")
