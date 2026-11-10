@@ -565,6 +565,23 @@ def score(a, tags):
             res[name]["other_weights"] = best
             print("scored", name, flush=True)
         del vk
+    # --blend-loop LOOP+OTHER: the coupled loop as the base of a lead-wise blend with another scored core (the RMSE
+    # readout of the final model: the loop keeps the strong trajectory, the blend adds the long-rollout core's
+    # damped field per lead and channel). Name: blend_<other>@<loop>.
+    for combo in a.blend_loop:
+        lp, other = combo.split("+", 1)
+        if lp not in fns or other not in keep or not bases:
+            continue
+        vk, vc = rollout(fns[lp], vaz, vics), rollout(fns[other], vaz, vics)
+        num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
+        den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
+        wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of the loop
+        del vk, vc
+        wb = wk[None, :, :, None, None]
+        name = f"blend_{other}@{lp}"
+        res[name] = metrics(wb * rollout(fns[lp], tez, ics) + (1 - wb) * keep[other])
+        res[name]["kai_weight"] = wk
+        print("scored", name, flush=True)
     # --seq-mix A+B[+C]: the members' one-day forecasts mixed EVERY step with weights per lead and channel and fed
     # back (the step-wise coupling with lead-dependent weights). The weights are fitted on the validation year
     # step by step: given the mixed states of day k, the weights of day k + 1 minimize that day's error.
@@ -728,6 +745,9 @@ def parser():
                    help="scored KAI tags that are blended with the cores / --blend-with tags")
     p.add_argument("--loop-blend", nargs="*", default=[],
                    help="core tags: score the step-wise blend (KAI and core forecasts mixed every day and fed back)")
+    p.add_argument("--blend-loop", nargs="*", default=[],
+                   help="LOOP+OTHER: lead-wise blend of a scored coupled loop (loop_<core>) with another scored core, "
+                        "weights from the validation year (name blend_<other>@<loop>)")
     p.add_argument("--core-tag", default="core")
     p.add_argument("--stack-tag", default="res", help="arm stack: the trained res checkpoint used as first stage")
     p.add_argument("--blend-with", nargs="*", default=["res", "kai_s1"],
