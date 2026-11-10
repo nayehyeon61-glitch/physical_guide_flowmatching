@@ -1,0 +1,20 @@
+inference:
+  io:
+    # Path to test data — single .nc file or directory of .nc files
+    input_nc_path: "/path/to/test/2018.nc"
+    # Directory where output forecast.nc is saved
+    output_dir: "/path/to/output/"
+    field_variable: "fields"
+  model:
+    checkpoint_path: "/path/to/experiments/default_01/best_ckpt.tar"
+    global_means_path: "/path/to/stats/global_mean.npy"
+    global_stds_path: "/path/to/stats/global_std.npy"
+    # Optional: explicit channel subset. If omitted, all channels are used.
+    # in_channels: [0, 1, 2, ..., 66]
+    # out_channels: [0, 1, 2, ..., 66]
+  rollout:
+    forecast_steps: 10         # number of forecast days (Day 1..N)
+    n_initial_conditions: 5    # how many ICs to produce forecasts for
+    ic_stride: 1               # stride between ICs in the test file
+  runtime:
+    device: "cuda"

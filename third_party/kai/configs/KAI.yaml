@@ -1,0 +1,106 @@
+# configs/KAI.yaml
+
+default: &FULL_FIELD
+  # -------------------------
+  # Optimization / training
+  # -------------------------
+  # NOTE: the optimizer is currently fixed to AdamW in src/trainer.py.
+  lr: 1.0e-3
+  scheduler: 'CosineAnnealingLR'   # ['CosineAnnealingLR', 'ReduceLROnPlateau', 'none']
+  max_epochs: 150
+  batch_size: 32
+  num_data_workers: 8        # maps to DataConfig.num_workers
+
+  # -------------------------
+  # Temporal setup
+  # -------------------------
+  dt: 1                       # stride in timesteps between input and target
+  n_history: 0                # number of past steps (not counting current)
+
+  # Number of initial conditions to roll out during post-training evaluation
+  n_initial_conditions: 5
+
+  # -------------------------
+  # Model setup
+  # -------------------------
+  nettype: 'kai'              # we currently support 'kai'
+
+  # Input / output channels (indices into NetCDF "fields")
+  in_channels:  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+                 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
+  out_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+                 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+                 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66]
+
+  # -------------------------
+  # Normalization / grids
+  # -------------------------
+  normalization: 'zscore'     # we currently support 'zscore' in utils.py
+  add_grid: !!bool False
+  N_grid_channels: 0
+  gridtype: 'sinusoidal'      # ['sinusoidal', 'linear']
+
+  # -------------------------
+  # Data paths
+  # -------------------------
+  train_data_path: "/home/work/data/hklab-ahmed/era-data/train"        # <<< SET THIS (directory with .nc files)
+  valid_data_path: "/home/work/data/hklab-ahmed/era-data/valid"        # <<< SET THIS (directory with .nc files)
+  exp_dir: "./experiments"               # base directory; run subdir added by train.py
+
+  # Stats paths (for normalization)
+  global_means_path: "/home/work/data/hklab-ahmed/era-data/stats/global_mean.npy"   # <<< SET THIS
+  global_stds_path:  "/home/work/data/hklab-ahmed/era-data/stats/global_std.npy"    # <<< SET THIS
+
+  # -------------------------
+  # Logging / checkpointing
+  # -------------------------
+  log_to_screen:   !!bool True
+  log_to_wandb:    !!bool False   # master switch for W&B (training + evaluation)
+  save_checkpoint: !!bool True
+
+  # Weights & Biases (only used when log_to_wandb is true)
+  wandb_project: 'KAI'         # W&B project name
+  wandb_entity:                # null => your default W&B account/team
+  wandb_group:                 # null => auto (KAI_<config>)
+  wandb_tags: []               # optional list of run tags
+  wandb_mode: 'online'         # online | offline | disabled
+
+  # Early stopping on validation loss (0 disables it)
+  early_stopping_patience: 10
+
+  enable_nhwc: !!bool False   # channels_last; keep False unless you know you want it
+
+  # -------------------------
+  # Post-Training Evaluation
+  # -------------------------
+  # Set to true to run evaluation after training completes.
+  # The evaluator uses the flat keys below (no nested eval: block needed).
+  enable_evaluation: true
+
+  # Path to test dataset directory (same NetCDF format as training data)
+  test_dataset_path: '/hk-lab/hklab-ahmed/era_1p5_data/test/'  # <<< SET THIS
+
+  # Starting timestep index in the test file for initial conditions
+  eval_start_timestep: 1
+
+  # Number of forecast days to evaluate (Day 1 .. Day N)
+  eval_forecast_steps: 10
+
+  # Stride (in timesteps) between successive initial conditions
+  eval_ic_stride: 1
+
+  # Output-channel indices to report detailed per-variable metrics for, and to
+  # highlight in the aggregate W&B line plots (empty = summary only). Indices are
+  # 0-based positions into out_channels.
+  eval_variable_indices: []
+
+  # Checkpoint to evaluate (null = use best_ckpt.tar from experiment dir)
+  eval_checkpoint_path: null
+
+  # Climatology .nc file path for ACC computation
+  # NOTE: If null, the trainer auto-generates this from training data
+  #       and injects it at runtime. For standalone eval, set this explicitly.
+  climatology_path: null
