@@ -160,7 +160,10 @@ def train(a, arm):
     is_core = arm == "core"
     dyn = torch.tensor(DYN)
     st = a.core_stride if is_core else 1  # days per training step (long-scale core: > 1)
-    hist = is_core and a.core_hist  # the core also sees the state one step before (the observed trend)
+    core = None if is_core or not needs_core(arm) or arm == "stack" else build_core(a, mean, std, inc, lat)
+    # does the model see the state one step before (the observed trend)? a history core, alone or inside KAI,
+    # or arm kaih
+    hist = a.core_hist if is_core else (ARMS[arm][1] == "hist" or getattr(core, "hist", False))
     if is_core:
         if st > 1:  # the tendency unit of a long-scale core: std of the st-day increment
             inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
@@ -172,7 +175,7 @@ def train(a, arm):
         wl = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
         wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
     else:
-        m = build(a, arm, inc, build_core(a, mean, std, inc, lat) if needs_core(arm) and arm != "stack" else None)
+        m = build(a, arm, inc, core)
         if a.init:  # fine-tuning (e.g. --rollout 2 3 from a single-step checkpoint)
             miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu",
                                                 weights_only=False)["state"], strict=False)
@@ -195,7 +198,7 @@ def train(a, arm):
             d = int(rng.integers(st if hist else 0, len(trz[y]) - K * st))
             xs.append(trz[y][d])
             tg.append(trz[y][d + st:d + st * K + 1:st])
-            pv.append(trz[y][d - st][dyn] if hist else None)
+            pv.append(trz[y][d - st] if hist else None)
             doy.append(d)
         prev.clear()
         prev.append(torch.stack(pv) if hist else None)
@@ -203,10 +206,13 @@ def train(a, arm):
 
     prev = [None]  # history cores: the dynamic channels one step before the batch's start
 
+    def pdyn(pv):
+        return None if pv is None else pv[:, dyn]
+
     def one_step(x, doy, t, pv=None):
         if is_core:
-            return x.index_copy(1, dyn, core_rollout(m, x[:, dyn], doy, 1, t[:, None, TISR], prev=pv)[:, 0])
-        return m(x, doy, t[:, TISR])
+            return x.index_copy(1, dyn, core_rollout(m, x[:, dyn], doy, 1, t[:, None, TISR], prev=pdyn(pv))[:, 0])
+        return m(x, doy, t[:, TISR], prev=pv)
 
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
@@ -215,7 +221,7 @@ def train(a, arm):
             tot = 0.0
             for i in range(0, len(idx), 16):
                 j = idx[i:i + 16]
-                pv = vaz[j - st][:, dyn] if hist else None
+                pv = vaz[j - st] if hist else None
                 tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + st], pv), vaz[j + st])) * len(j)
         m.train()
         return tot / len(idx)
@@ -224,15 +230,15 @@ def train(a, arm):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         x, tg, doy = batch(K)
         if is_core:
-            y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=prev[0])
+            y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
             loss = ((err ** 2) * wl).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
         elif K == 1:
-            loss = lp(m(x, doy, tg[:, 0, TISR]), tg[:, 0])
+            loss = lp(m(x, doy, tg[:, 0, TISR], prev=prev[0]), tg[:, 0])
         else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
-            y = m.rollout(x, doy, K, tg[:, :, TISR])
+            y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
             loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
         opt.zero_grad()
         loss.backward()
@@ -330,7 +336,7 @@ def score(a, tags):
     for tag in tags:
         m, ck = load(tag)
         models[tag] = m
-        fns[tag] = lambda x, d, t, pv=None, m=m: m.rollout(x, d, L, t)
+        fns[tag] = lambda x, d, t, pv=None, m=m: m.rollout(x, d, L, t, prev=pv)
         pred = rollout(fns[tag], tez, ics)
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
@@ -340,10 +346,12 @@ def score(a, tags):
             keep[tag] = pred
         if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
-            res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t, pv=None: m.rollout(x, d, L, t), tez, ics), spectra=False)
+            res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t, pv=None: m.rollout(x, d, L, t, prev=pv), tez, ics),
+                                          spectra=False)
             m.ablate = False
-            if m.cfg.form == "full":  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
-                res[f"{tag}~open"] = metrics(rollout(lambda x, d, t, pv=None: m.rollout(x, d, L, t, open_loop=True), tez, ics))
+            if m.cfg.form == "full" and m.uses_core:  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
+                res[f"{tag}~open"] = metrics(rollout(
+                    lambda x, d, t, pv=None: m.rollout(x, d, L, t, open_loop=True, prev=pv), tez, ics))
         del pred
         print("scored", tag, flush=True)
 
@@ -362,7 +370,8 @@ def score(a, tags):
                     if rem >= st:
                         rem, last = rem % st, (st, step)
                 st, step = last
-                state[lead] = step(state[lead - st], doy + lead - st, tis[:, lead - 1])
+                before = pv if lead == st else state.get(lead - st - 1)  # one day before the step's start
+                state[lead] = step(state[lead - st], doy + lead - st, tis[:, lead - 1], prev=before)
             return torch.stack([state[k] for k in range(1, L + 1)], 1)
         return fn
 
@@ -403,9 +412,10 @@ def score(a, tags):
                 base = CoreBase(get_core(other))
 
                 def loop_fn(x0, doy, tis, pv=None, w1=w1, base=base, kai_m=kai_m):
-                    x, out = x0, []
+                    x, p, out = x0, pv, []
                     for k in range(L):
-                        x = w1 * kai_m(x, doy + k, tis[:, k]) + (1 - w1) * base(x, doy + k, tis[:, k])
+                        y = w1 * kai_m(x, doy + k, tis[:, k], prev=p) + (1 - w1) * base(x, doy + k, tis[:, k], prev=p)
+                        x, p = y, x
                         out.append(x)
                     return torch.stack(out, 1)
                 lname = ("loop" if other == "core" else f"loop_{other}") + sfx

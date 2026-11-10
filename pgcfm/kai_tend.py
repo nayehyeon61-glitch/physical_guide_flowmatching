@@ -49,13 +49,15 @@ TISR_DYN = DYN.index(TISR)
 ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2": ("full", "s2"),
         "s3": ("full", "s3"), "s4": ("full", "s4"), "res": ("res", "none"), "inres": ("res", "in"),
         "out": ("core", "none"), "inout": ("core", "in"), "gate": ("gate", "none"), "ingate": ("gate", "in"),
+        # control of a history core: KAI itself gets the observed trend (x - x_prev) / s as input, no core
+        "kaih": ("full", "hist"),
         # control of ``out``: the frozen first stage is not the tendency core but a trained KAI (arm res)
         "stack": ("core", "none")}
 
 
 def needs_core(arm: str) -> bool:
     form, inject = ARMS[arm]
-    return form in ("core", "gate") or inject != "none"
+    return form in ("core", "gate") or inject not in ("none", "hist")
 
 
 # ------------------------------------------------------------------------------------- the tendency core
@@ -144,14 +146,15 @@ def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
 
 
 class CoreBase:
-    """The frozen tendency core as a map of the full 67-channel state: (x, doy, tisr_next) -> next-day state."""
+    """The frozen tendency core as a map of the full 67-channel state: (x, doy, tisr_next) -> next-day state.
+    ``prev`` (history cores): the full state one day before x; None = no trend."""
 
     def __init__(self, core):
-        if getattr(core, "hist", False):
-            raise NotImplementedError("a history core inside KAI / a step-wise coupling needs the previous state")
-        self.core, self.dyn = core, torch.tensor(DYN)
+        self.core, self.dyn, self.hist = core, torch.tensor(DYN), getattr(core, "hist", False)
 
-    def __call__(self, x, doy, tisr_next=None):
+    def __call__(self, x, doy, tisr_next=None, prev=None):
+        if self.hist:
+            self.core.prev = None if prev is None else prev[:, self.dyn]
         return x.index_copy(1, self.dyn, core_step(self.core, x[:, self.dyn], doy, tisr_next))  # orog copied
 
 
@@ -179,7 +182,7 @@ class KAIPos(nn.Module):
         super().__init__()
         self.cfg = cfg
         n = contract.N_CHANNELS
-        self.kai = KAI(in_chans=n * (2 if cfg.inject == "in" else 1), out_chans=n,
+        self.kai = KAI(in_chans=n * (2 if cfg.inject in ("in", "hist") else 1), out_chans=n,
                        depths=list(cfg.depths), dims=list(cfg.dims))
         if cfg.form in ("res", "core"):
             last = self.kai.core_model.head[-1]
@@ -203,25 +206,28 @@ class KAIPos(nn.Module):
         # rollout training: the gradient of a later day's loss has to pass through the frozen core's input
         # (c(x) = x + ...: without it the main path of forms "core" / "gate" is cut). Off = single-step training.
         self.core_grad = False
-        self.uses_core = cfg.form in ("core", "gate") or cfg.inject != "none"
+        self.uses_core = cfg.form in ("core", "gate") or cfg.inject not in ("none", "hist")
         if self.uses_core and core is None:
             raise ValueError("this arm needs the frozen tendency core")
 
-    def core_next(self, x, doy, tisr_next):
+    def core_next(self, x, doy, tisr_next, prev=None):
         with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
-            return self._core[0](x, doy, tisr_next)
+            return self._core[0](x, doy, tisr_next, prev=prev)
 
-    def forward(self, x, doy, tisr_next=None, core_state=None):
-        """``core_state``: evaluate the core on this state instead of x (the open-loop diagnostic of ``rollout``)."""
+    def forward(self, x, doy, tisr_next=None, core_state=None, prev=None):
+        """``core_state``: evaluate the core on this state instead of x (the open-loop diagnostic of ``rollout``).
+        ``prev``: the state one day before (a history core's trend, or arm kaih's own input); None = no trend."""
         cfg, c, tau = self.cfg, None, None
         if self.uses_core:
             xc = x if core_state is None else core_state
-            c = self.core_next(xc, doy, tisr_next)
+            c = self.core_next(xc, doy, tisr_next, prev)
             tau = (c - xc) / self.s
-            if self.ablate:
-                tau = torch.zeros_like(tau)
+        elif cfg.inject == "hist":
+            tau = torch.zeros_like(x) if prev is None else (x - prev) / self.s * self.keep
+        if self.ablate and tau is not None:
+            tau = torch.zeros_like(tau)
         m = self.kai.core_model
-        h = torch.cat([x, tau], 1) if cfg.inject == "in" else x
+        h = torch.cat([x, tau], 1) if cfg.inject in ("in", "hist") else x
         for i in range(4):
             h = m.stages[i](m.downsample_layers[i](h))
             if cfg.inject.startswith("s") and i == self.stage:
@@ -234,16 +240,19 @@ class KAIPos(nn.Module):
             return o + self.gate * self.keep * (c - o)
         return (x if cfg.form == "res" else c) + o * self.s * self.keep
 
-    def rollout(self, x0, doy0, steps, tisr=None, open_loop=False):
+    def rollout(self, x0, doy0, steps, tisr=None, open_loop=False, prev=None):
         """(B, steps, 67, H, W); tisr (B, steps, H, W) = the core's forcing on day 1..steps.
 
         ``open_loop`` (diagnostic, inject arms): the core runs on its OWN trajectory from x0 and only its tau
-        enters KAI, so KAI's output never feeds the core (closed loop = the trained coupling, the default)."""
-        x, xc, out = x0, x0, []
+        enters KAI, so KAI's output never feeds the core (closed loop = the trained coupling, the default).
+        ``prev``: the state one day before x0; later steps use the trajectory's own previous state."""
+        x, xc, p, out = x0, x0, prev, []
         for k in range(steps):
-            x = self(x, doy0 + k, None if tisr is None else tisr[:, k], xc if open_loop else None)
+            y = self(x, doy0 + k, None if tisr is None else tisr[:, k], xc if open_loop else None, prev=p)
+            p = xc if open_loop else x  # the state the next step's trend starts from
             if open_loop:
                 xc = self.last_core
+            x = y
             out.append(x)
         return torch.stack(out, 1)
 
