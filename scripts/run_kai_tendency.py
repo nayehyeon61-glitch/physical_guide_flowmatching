@@ -124,6 +124,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["mz"] = True
         if a.core_nomem:
             opts["nomem"] = True
+        if a.core_acc:
+            opts.update(acc=list(a.core_acc), acc_ch=a.core_acc_ch)
     if a.core_gfeat:
         opts["gfeat"] = True
     ck = None
@@ -193,7 +195,7 @@ def train(a, arm):
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR])  # the 65 scored channels among the 66
         keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1)
-        orth_log = None
+        orth_log, acc_log = None, None
         wl = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
         wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
     else:
@@ -274,6 +276,23 @@ def train(a, arm):
                 orth_log = [float(o.detach()[scd].mean()) for o in orth]
                 if a.mz_orth > 0:
                     loss = loss + a.mz_orth * sum((o[scd] ** 2).mean() for o in orth)
+                # the accumulated memory (--core-acc): the same condition on its time scales. The residual of a day
+                # must not be correlated with the residuals ACCUMULATED over the days before it with the kernel of
+                # tau days, R_tau(t) = exp(-1/tau) R_tau(t-1) + (1 - exp(-1/tau)) r_(t-1) (the effect of the long
+                # memory as a loss: what is left after it is not predictable from the past 3 to 5 days)
+                acc_log = []
+                for tau in getattr(m, "acc", ()):
+                    lam, R, cs = float(np.exp(-1.0 / tau)), None, []
+                    for t in range(1, r.shape[1]):
+                        R = (1 - lam) * r[:, t - 1] if R is None else lam * R + (1 - lam) * r[:, t - 1]
+                        if t >= 2:  # at least two days in the accumulated residual
+                            u = r[:, t]
+                            cs.append((u * R * wl[0]).sum((-2, -1)) / torch.sqrt(
+                                (u ** 2 * wl[0]).sum((-2, -1)) * (R ** 2 * wl[0]).sum((-2, -1)) + 1e-12))
+                    c = torch.stack(cs, 1).mean((0, 1))  # (66,)
+                    acc_log.append(round(float(c.detach()[scd].mean()), 4))
+                    if a.mz_acc_orth > 0:
+                        loss = loss + a.mz_acc_orth * (c[scd] ** 2).mean()
             else:
                 loss = ((err ** 2) * wl).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
@@ -292,6 +311,8 @@ def train(a, arm):
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
             if is_core and orth_log is not None:  # residual correlation at lag 1, 2 in the last batch's sequences
                 log[-1]["res_corr"] = [round(o, 4) for o in orth_log]
+                if acc_log:  # correlation of the residual with the residuals accumulated over tau days
+                    log[-1]["res_corr_acc"] = acc_log
             print(json.dumps(log[-1]), flush=True)
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
                     core_opts=getattr(m, "opts", None),
@@ -349,20 +370,21 @@ def score(a, tags):
                 out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis, pv).numpy())
         return (np.concatenate(out) * sd + mn).astype(np.float32)
 
-    def core_fn(tag, warm=None, freeze=False):
+    def core_fn(tag, warm=None, freeze=False, noacc=False):
         """``warm`` (memory cores, diagnostic): only the last ``warm`` days before the IC enter the memory
-        (0 = it starts empty); ``freeze``: the memory is not updated after the IC."""
+        (0 = it starts empty); ``freeze``: the memory is not updated after the IC; ``noacc``: the long-memory
+        term of the accumulated memory (--core-acc) is switched off."""
         core = get_core(tag)
         W = getattr(core, "mem", 0)
         W = W if warm is None else min(W, warm)
 
         def fn(x0, doy, tis, pv=None):
             if getattr(core, "mem", 0):
-                core.freeze_mem = freeze
+                core.freeze_mem, core.acc_off = freeze, noacc
                 pv = pv if W else None
             y = core_rollout(core, x0[:, dyn], doy, L, tis, prev=None if pv is None else pv.index_select(-3, dyn))
             if getattr(core, "mem", 0):
-                core.freeze_mem = False
+                core.freeze_mem, core.acc_off = False, False
             return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
         fn.mem = W
         return fn
@@ -426,6 +448,8 @@ def score(a, tags):
                 res[f"{ct}~w{wm}"] = metrics(rollout(core_fn(ct, warm=wm), tez, ics))
             if a.mem_freeze:
                 res[f"{ct}~frozen"] = metrics(rollout(core_fn(ct, freeze=True), tez, ics))
+            if getattr(get_core(ct), "acc", ()):  # the effect of the long-memory term: the same rollout without it
+                res[f"{ct}~noacc"] = metrics(rollout(core_fn(ct, noacc=True), tez, ics))
             print("scored", ct, "memory diagnostics", flush=True)
     for tag in tags:
         m, ck = load(tag)
@@ -785,6 +809,15 @@ def parser():
     p.add_argument("--mz-orth", type=float, default=1.0,
                    help="--core-mz: weight of the orthogonality term (squared lag-1 and lag-2 correlation of the "
                         "sequence's one-step residuals); 0 = off")
+    p.add_argument("--core-acc", type=float, nargs="*", default=[],
+                   help="--core-mem: the accumulated memory, time constants in days (e.g. 3 5). The memory's inputs "
+                        "are also accumulated with fixed exponential kernels of these e-folding times and enter the "
+                        "tendency as their own long-memory term; with --core-mz the residuals accumulated over the "
+                        "same time scales enter the orthogonality loss (--mz-acc-orth)")
+    p.add_argument("--core-acc-ch", type=int, default=12, help="channels of each accumulator of --core-acc")
+    p.add_argument("--mz-acc-orth", type=float, default=1.0,
+                   help="--core-acc with --core-mz: weight of the squared correlation of a day's one-step residual "
+                        "with the residuals accumulated over the days before it; 0 = off")
     p.add_argument("--mem-warm", type=int, nargs="*", default=[],
                    help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
     p.add_argument("--mem-freeze", action="store_true",

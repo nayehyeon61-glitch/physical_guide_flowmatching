@@ -137,6 +137,20 @@ class ConvGRUCell(nn.Module):
         return (1 - z) * m + z * n
 
 
+class LongTerm(nn.Module):
+    """The long-memory term of the accumulated memory: two 3x3 convolutions of the accumulators z (padding as in
+    the trunk), zero-initialized output, so a new core starts without it."""
+
+    def __init__(self, cin: int, hid: int, cout: int):
+        super().__init__()
+        self.c1, self.c2 = nn.Conv2d(cin, hid, 3), nn.Conv2d(hid, cout, 3)
+        nn.init.zeros_(self.c2.weight)
+        nn.init.zeros_(self.c2.bias)
+
+    def forward(self, z):
+        return self.c2(ConvGRUCell.pad(F.silu(self.c1(ConvGRUCell.pad(z)))))
+
+
 def _mem_core_class():
     """DynCore with a memory term in the Mori-Zwanzig sense: dx/dt = f(x, m), m = ConvGRU state.
 
@@ -157,14 +171,25 @@ def _mem_core_class():
 
     With ``cfg.gfeat`` (owner, 2026-11-10: the physical terms need memory terms next to them) the trunk also
     gets the operator's tendency G(x) (48 physical terms, step 18) and the memory integrates the physical terms:
-    m_t = GRU(m_{t-1}, [x_t, trend_t, (e_t,) G(x_t), G(x_{t-1})]), dx/dt = f(x, G(x), m)."""
+    m_t = GRU(m_{t-1}, [x_t, trend_t, (e_t,) G(x_t), G(x_{t-1})]), dx/dt = f(x, G(x), m).
+
+    ``acc`` = time constants in days, e.g. (3, 5) (owner, 2026-11-11: the memory has to hold the past of 3 to 5
+    days for certain, as an accumulation structure with its own term and loss). The trained GRU uses one day of
+    past, so next to it the same inputs are accumulated with FIXED exponential kernels,
+    z_k(t) = exp(-1/tau_k) z_k(t-1) + (1 - exp(-1/tau_k)) tanh(enc_k([x_t, trend_t, e_t, G_t, G_{t-1}])),
+    the Markovian embedding of a memory kernel that is a sum of exponentials: z_k is the time integral of the past
+    with an e-folding time of tau_k days whatever the training does. The accumulators enter as their own term,
+    dx/dt = f(x, G(x), m) + g(z_3, z_5), the long-memory term (LongTerm; ``acc_off`` switches it off, a diagnostic).
+    The accumulators start empty with the sequence and are filled over the W days before the IC (W >= 8 for
+    tau = 5 d), in the rollout they go on with the states the core is stepped along."""
     from .dyncore import DynCore, Net, _NetCfg, N_DYN, N_GFEAT
     from .core import time_features
 
     class MemCore(DynCore):
         hist = True  # the caller has to hand over the past
 
-        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False, nomem=False):
+        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False, nomem=False,
+                     acc=(), acc_ch=12):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
             self.nomem = bool(nomem)  # control: the same sequence training, the memory state stays zero
@@ -172,6 +197,14 @@ def _mem_core_class():
             self.net = Net(N_DYN + mem_ch + static.shape[0] + 4 + ng, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
             self.enc = nn.Conv2d((3 if mz else 2) * N_DYN + 2 * ng, mem_ch, 1)
             self.gru = ConvGRUCell(mem_ch, mem_ch)
+            self.acc, self.z, self.acc_off = tuple(float(t) for t in acc), None, False
+            if self.acc:  # the accumulated memory: fixed exponential kernels of tau days, their own term
+                if nomem:
+                    raise ValueError("the no-memory control has no accumulated memory")
+                self.enc_acc = nn.Conv2d(self.enc.in_channels, int(acc_ch) * len(self.acc), 1)
+                lam = torch.exp(-1.0 / torch.tensor(self.acc)).repeat_interleave(int(acc_ch))
+                self.register_buffer("lam", lam.view(1, -1, 1, 1))
+                self.long = LongTerm(int(acc_ch) * len(self.acc), cfg.hidden, N_DYN)
             self.m, self.prev, self.gprev, self.started = None, None, None, False
             self.fc, self.seq = None, None  # mz: the forecast of the next state; the forecasts of the sequence
             self.freeze_mem = False  # diagnostic: no update of the memory after the IC (the rollout's own states)
@@ -180,6 +213,7 @@ def _mem_core_class():
             """history (B, W, 66, H, W): the states before the IC, oldest first; None = an empty memory.
             mz: ``hours0`` (B,) = the IC's time, ``x0`` = the IC (its tisr is the forcing of the last forecast)."""
             self.m, self.prev, self.gprev, self.started, self.fc, self.seq = None, None, None, False, None, None
+            self.z = None
             if history is None:
                 return
             W = history.shape[1]
@@ -212,7 +246,11 @@ def _mem_core_class():
                 g = self.features(x)
                 parts += [g, torch.zeros_like(g) if self.gprev is None else self.gprev]
                 self.gprev = g
-            self.m = self.gru(self.enc(torch.cat(parts, 1)), self.m)
+            v = torch.cat(parts, 1)
+            self.m = self.gru(self.enc(v), self.m)
+            if self.acc:  # the time integral of the past with the fixed kernels (an empty accumulator = no past)
+                u = (1 - self.lam) * torch.tanh(self.enc_acc(v))
+                self.z = u if self.z is None else self.lam * self.z + u
             self.prev = x
 
         def _trunk(self, x, hours, g=None):
@@ -221,6 +259,12 @@ def _mem_core_class():
             if self.cfg.gfeat:
                 parts.append(self.features(x) if g is None else g)
             return self.net.trunk(torch.cat(parts, 1))
+
+        def tendency(self, x, hours, g=None):
+            f = super().tendency(x, hours, g)
+            if self.acc and self.z is not None and not self.acc_off:
+                f = f + self.long(self.z) * self.t6 * self.keep  # the long-memory term, the same in both stages
+            return f
 
         def step(self, x, hours, tisr_next):
             if not (self.freeze_mem and self.started):
@@ -234,7 +278,7 @@ def _mem_core_class():
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
-              nomem: bool = False):
+              nomem: bool = False, acc=(), acc_ch: int = 12):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -244,16 +288,20 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     ``mem`` = W > 0: the memory core (_mem_core_class), a ConvGRU state of ``mem_ch`` channels warmed up on the
     W days before the IC; ``mz`` = its Mori-Zwanzig sequence form (innovation input, forecasts of the sequence).
     ``nomem`` (with mem and mz) = the control of the memory term: the same sequence training with a zero memory.
+    ``acc`` (with mem) = the accumulated memory: time constants in days of fixed exponential accumulators of the
+    memory's inputs (``acc_ch`` channels each) and their own long-memory term in the tendency.
     ``gfeat`` = the physical terms: the operator's tendency G(x) as 48 input channels (step 18); the caller attaches
     ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well."""
     from .dyncore import DynCore, DynCoreConfig
     if gfeat and hist and not mem:
         raise ValueError("the history core has no G(x) input; use mem for a memory of the physical terms")
+    if len(acc) and not mem:
+        raise ValueError("the accumulated memory belongs to the memory core (mem > 0)")
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
                         gfeat=gfeat)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
-        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem)
+        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch)
     else:
         core = (_hist_core_class() if hist else DynCore)(*args)
     if norm == "gn":
