@@ -77,16 +77,47 @@ def stateless_norm(module: nn.Module) -> nn.Module:
     return module
 
 
+def _hist_core_class():
+    """DynCore with the observed trend as input: f(x, x - x_prev). ``prev`` = the state one step before the
+    step's start (data at the IC, the model's own previous state afterwards); None = no trend (zeros)."""
+    from .dyncore import DynCore, Net, _NetCfg, N_DYN
+
+    class HistCore(DynCore):
+        hist = True
+
+        def __init__(self, cfg, static, t6, mean, std, lat_deg):
+            super().__init__(cfg, static, t6, mean, std, lat_deg)
+            self.net = Net(2 * N_DYN + static.shape[0] + 4, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
+            self.prev, self.trend = None, None
+
+        def _trunk(self, x, hours, g=None):
+            from .dyncore import time_features
+            B, _, H, W = x.shape
+            return self.net.trunk(torch.cat([x, self.trend, self.static.expand(B, -1, -1, -1),
+                                             time_features(hours, H, W)], 1))
+
+        def step(self, x, hours, tisr_next):
+            # the trend of the step's start, in units of the increment std; the same for both Heun evaluations
+            self.trend = torch.zeros_like(x) if self.prev is None else (x - self.prev) / self.t6 * self.keep
+            y = super().step(x, hours, tisr_next)
+            self.prev = x
+            return y
+    return HistCore
+
+
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
-              hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1):
+              hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
+              hist: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
     per day (DynCore's dt_hours, in units of its nominal 6 h step). ``stride`` > 1 = the long-scale core: one
-    solver step = ``stride`` days (``inc_std`` is then the std of the stride-day increment)."""
+    solver step = ``stride`` days (``inc_std`` is then the std of the stride-day increment). ``hist`` = the
+    field extended to its history: the previous state enters as the observed trend (_hist_core_class)."""
     from .dyncore import DynCore, DynCoreConfig
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True)
-    core = DynCore(cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
+    cls = _hist_core_class() if hist else DynCore
+    core = cls(cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if norm == "gn":
         stateless_norm(core.net)
     elif norm != "bn":
@@ -100,9 +131,12 @@ def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[tor
     return core.step(xd, doy.float() * 24.0, tisr_next)
 
 
-def core_rollout(core, xd, doy, steps, tisr=None):
-    """``steps`` solver steps of core.stride days each; tisr (B, steps, H, W) = the forcing at the end of each."""
+def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
+    """``steps`` solver steps of core.stride days each; tisr (B, steps, H, W) = the forcing at the end of each.
+    ``prev`` (history cores): the dynamic channels one step before xd."""
     x, out, st = xd, [], getattr(core, "stride", 1)
+    if getattr(core, "hist", False):
+        core.prev = prev
     for k in range(steps):
         x = core_step(core, x, doy + k * st, None if tisr is None else tisr[:, k])
         out.append(x)
@@ -113,6 +147,8 @@ class CoreBase:
     """The frozen tendency core as a map of the full 67-channel state: (x, doy, tisr_next) -> next-day state."""
 
     def __init__(self, core):
+        if getattr(core, "hist", False):
+            raise NotImplementedError("a history core inside KAI / a step-wise coupling needs the previous state")
         self.core, self.dyn = core, torch.tensor(DYN)
 
     def __call__(self, x, doy, tisr_next=None):

@@ -116,6 +116,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
     contract.register_latitudes(lat)
     opts = dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm=a.core_norm, substeps=a.core_substeps,
                 stride=a.core_stride)
+    if a.core_hist:
+        opts["hist"] = True
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -158,6 +160,7 @@ def train(a, arm):
     is_core = arm == "core"
     dyn = torch.tensor(DYN)
     st = a.core_stride if is_core else 1  # days per training step (long-scale core: > 1)
+    hist = is_core and a.core_hist  # the core also sees the state one step before (the observed trend)
     if is_core:
         if st > 1:  # the tendency unit of a long-scale core: std of the st-day increment
             inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
@@ -187,27 +190,33 @@ def train(a, arm):
 
     def batch(K):
         ys = rng.choice(years, a.batch)
-        xs, tg, doy = [], [], []
+        xs, tg, doy, pv = [], [], [], []
         for y in ys:
-            d = int(rng.integers(0, len(trz[y]) - K * st))
+            d = int(rng.integers(st if hist else 0, len(trz[y]) - K * st))
             xs.append(trz[y][d])
             tg.append(trz[y][d + st:d + st * K + 1:st])
+            pv.append(trz[y][d - st][dyn] if hist else None)
             doy.append(d)
+        prev.clear()
+        prev.append(torch.stack(pv) if hist else None)
         return torch.stack(xs), torch.stack(tg), torch.tensor(doy)
 
-    def one_step(x, doy, t):
+    prev = [None]  # history cores: the dynamic channels one step before the batch's start
+
+    def one_step(x, doy, t, pv=None):
         if is_core:
-            return x.index_copy(1, dyn, core_rollout(m, x[:, dyn], doy, 1, t[:, None, TISR])[:, 0])
+            return x.index_copy(1, dyn, core_rollout(m, x[:, dyn], doy, 1, t[:, None, TISR], prev=pv)[:, 0])
         return m(x, doy, t[:, TISR])
 
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
         with torch.no_grad():
-            idx = np.arange(0, len(vaz) - st, max(1, (len(vaz) - st) // 64))[:64]
+            idx = np.arange(st if hist else 0, len(vaz) - st, max(1, (len(vaz) - st) // 64))[:64]
             tot = 0.0
             for i in range(0, len(idx), 16):
                 j = idx[i:i + 16]
-                tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + st]), vaz[j + st])) * len(j)
+                pv = vaz[j - st][:, dyn] if hist else None
+                tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + st], pv), vaz[j + st])) * len(j)
         m.train()
         return tot / len(idx)
 
@@ -215,7 +224,7 @@ def train(a, arm):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         x, tg, doy = batch(K)
         if is_core:
-            y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR])
+            y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=prev[0])
             err = (y - tg[:, :, dyn]) / s_dyn
             loss = ((err ** 2) * wl).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
@@ -266,12 +275,13 @@ def score(a, tags):
             for i in range(0, len(ics), 16):
                 j = ics[i:i + 16]
                 tis = torch.from_numpy(np.stack([xz[k + 1:k + 1 + L, TISR] for k in j]))
-                out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis).numpy())
+                pv = torch.from_numpy(xz[np.maximum(j - 1, 0)])  # the day before the IC (first day of the year: itself)
+                out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis, pv).numpy())
         return (np.concatenate(out) * sd + mn).astype(np.float32)
 
     def core_fn(tag):
-        def fn(x0, doy, tis):
-            y = core_rollout(get_core(tag), x0[:, dyn], doy, L, tis)
+        def fn(x0, doy, tis, pv=None):
+            y = core_rollout(get_core(tag), x0[:, dyn], doy, L, tis, prev=None if pv is None else pv[:, dyn])
             return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
         return fn
 
@@ -320,7 +330,7 @@ def score(a, tags):
     for tag in tags:
         m, ck = load(tag)
         models[tag] = m
-        fns[tag] = lambda x, d, t, m=m: m.rollout(x, d, L, t)
+        fns[tag] = lambda x, d, t, pv=None, m=m: m.rollout(x, d, L, t)
         pred = rollout(fns[tag], tez, ics)
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
@@ -330,10 +340,10 @@ def score(a, tags):
             keep[tag] = pred
         if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
-            res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics), spectra=False)
+            res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t, pv=None: m.rollout(x, d, L, t), tez, ics), spectra=False)
             m.ablate = False
             if m.cfg.form == "full":  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
-                res[f"{tag}~open"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t, open_loop=True), tez, ics))
+                res[f"{tag}~open"] = metrics(rollout(lambda x, d, t, pv=None: m.rollout(x, d, L, t, open_loop=True), tez, ics))
         del pred
         print("scored", tag, flush=True)
 
@@ -344,7 +354,7 @@ def score(a, tags):
         strides = sorted({get_core(j).stride: CoreBase(get_core(j)) for j in jumps}.items(), reverse=True)
         strides.append((1, models[daily] if daily in models else CoreBase(get_core(daily))))
 
-        def fn(x0, doy, tis):
+        def fn(x0, doy, tis, pv=None):
             state = {0: x0}
             for lead in range(1, L + 1):
                 rem, last = lead, None
@@ -392,7 +402,7 @@ def score(a, tags):
                 w1 = torch.from_numpy(wk[0]).view(1, -1, 1, 1)
                 base = CoreBase(get_core(other))
 
-                def loop_fn(x0, doy, tis, w1=w1, base=base, kai_m=kai_m):
+                def loop_fn(x0, doy, tis, pv=None, w1=w1, base=base, kai_m=kai_m):
                     x, out = x0, []
                     for k in range(L):
                         x = w1 * kai_m(x, doy + k, tis[:, k]) + (1 - w1) * base(x, doy + k, tis[:, k])
@@ -531,6 +541,8 @@ def main(argv=None):
     p.add_argument("--core-norm", default="bn", choices=["bn", "gn"],
                    help="bn = ClimODE's block as it is; gn = GroupNorm, no dropout (no train / inference mismatch)")
     p.add_argument("--core-substeps", type=int, default=1, help="Heun steps per day")
+    p.add_argument("--core-hist", action="store_true",
+                   help="the core also gets the state one step before (the observed trend) as input")
     p.add_argument("--core-stride", type=int, default=1,
                    help="days per solver step of the core (long-scale core; --curriculum then counts these steps)")
     p.add_argument("--hier", nargs="*", default=[],
