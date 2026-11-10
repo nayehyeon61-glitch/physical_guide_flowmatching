@@ -118,6 +118,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
                 stride=a.core_stride)
     if a.core_hist:
         opts["hist"] = True
+    if a.core_mem:
+        opts.update(mem=a.core_mem, mem_ch=a.core_mem_ch)
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -163,7 +165,8 @@ def train(a, arm):
     core = None if is_core or not needs_core(arm) or arm == "stack" else build_core(a, mean, std, inc, lat)
     # does the model see the state one step before (the observed trend)? a history core, alone or inside KAI,
     # or arm kaih
-    hist = a.core_hist if is_core else (ARMS[arm][1] == "hist" or getattr(core, "hist", False))
+    hist = (a.core_hist or a.core_mem > 0) if is_core else (ARMS[arm][1] == "hist" or getattr(core, "hist", False))
+    W = a.core_mem if is_core else 0  # memory core: the W steps before the batch's start warm the memory up
     if is_core:
         if st > 1:  # the tendency unit of a long-scale core: std of the st-day increment
             inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
@@ -195,19 +198,19 @@ def train(a, arm):
         ys = rng.choice(years, a.batch)
         xs, tg, doy, pv = [], [], [], []
         for y in ys:
-            d = int(rng.integers(st if hist else 0, len(trz[y]) - K * st))
+            d = int(rng.integers(W * st if W else st if hist else 0, len(trz[y]) - K * st))
             xs.append(trz[y][d])
             tg.append(trz[y][d + st:d + st * K + 1:st])
-            pv.append(trz[y][d - st] if hist else None)
+            pv.append(trz[y][d - W * st:d:st] if W else trz[y][d - st] if hist else None)
             doy.append(d)
         prev.clear()
         prev.append(torch.stack(pv) if hist else None)
         return torch.stack(xs), torch.stack(tg), torch.tensor(doy)
 
-    prev = [None]  # history cores: the dynamic channels one step before the batch's start
+    prev = [None]  # history cores: the state one step before the batch's start (memory cores: W steps, oldest first)
 
     def pdyn(pv):
-        return None if pv is None else pv[:, dyn]
+        return None if pv is None else pv.index_select(-3, dyn)
 
     def one_step(x, doy, t, pv=None):
         if is_core:
@@ -222,6 +225,8 @@ def train(a, arm):
             for i in range(0, len(idx), 16):
                 j = idx[i:i + 16]
                 pv = vaz[j - st] if hist else None
+                if W:  # the same days as a history core; before the first day of the year: that day itself
+                    pv = torch.stack([vaz[np.maximum(j - k * st, 0)] for k in range(W, 0, -1)], 1)
                 tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + st], pv), vaz[j + st])) * len(j)
         m.train()
         return tot / len(idx)
@@ -298,13 +303,27 @@ def score(a, tags):
                 j = ics[i:i + 16]
                 tis = torch.from_numpy(np.stack([xz[k + 1:k + 1 + L, TISR] for k in j]))
                 pv = torch.from_numpy(xz[np.maximum(j - 1, 0)])  # the day before the IC (first day of the year: itself)
+                if getattr(fn, "mem", 0):  # a memory core: the fn.mem days before the IC, oldest first
+                    pv = torch.from_numpy(np.stack([xz[np.maximum(j - k, 0)] for k in range(fn.mem, 0, -1)], 1))
                 out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis, pv).numpy())
         return (np.concatenate(out) * sd + mn).astype(np.float32)
 
-    def core_fn(tag):
+    def core_fn(tag, warm=None, freeze=False):
+        """``warm`` (memory cores, diagnostic): only the last ``warm`` days before the IC enter the memory
+        (0 = it starts empty); ``freeze``: the memory is not updated after the IC."""
+        core = get_core(tag)
+        W = getattr(core, "mem", 0)
+        W = W if warm is None else min(W, warm)
+
         def fn(x0, doy, tis, pv=None):
-            y = core_rollout(get_core(tag), x0[:, dyn], doy, L, tis, prev=None if pv is None else pv[:, dyn])
+            if getattr(core, "mem", 0):
+                core.freeze_mem = freeze
+                pv = pv if W else None
+            y = core_rollout(core, x0[:, dyn], doy, L, tis, prev=None if pv is None else pv.index_select(-3, dyn))
+            if getattr(core, "mem", 0):
+                core.freeze_mem = False
             return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
+        fn.mem = W
         return fn
 
     def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with
@@ -349,6 +368,12 @@ def score(a, tags):
         ckc = torch.load(os.path.join(a.out, f"{ct}.pt"), map_location="cpu", weights_only=False)
         res[ct].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
         print("scored", ct, flush=True)
+        if getattr(get_core(ct), "mem", 0):  # how much of the past does the trained memory use?
+            for wm in a.mem_warm:
+                res[f"{ct}~w{wm}"] = metrics(rollout(core_fn(ct, warm=wm), tez, ics))
+            if a.mem_freeze:
+                res[f"{ct}~frozen"] = metrics(rollout(core_fn(ct, freeze=True), tez, ics))
+            print("scored", ct, "memory diagnostics", flush=True)
     for tag in tags:
         m, ck = load(tag)
         models[tag] = m
@@ -669,6 +694,14 @@ def main(argv=None):
     p.add_argument("--core-norm", default="bn", choices=["bn", "gn"],
                    help="bn = ClimODE's block as it is; gn = GroupNorm, no dropout (no train / inference mismatch)")
     p.add_argument("--core-substeps", type=int, default=1, help="Heun steps per day")
+    p.add_argument("--core-mem", type=int, default=0,
+                   help="memory core (Mori-Zwanzig memory term as a ConvGRU state): days before the IC that warm "
+                        "the memory up; 0 = off")
+    p.add_argument("--core-mem-ch", type=int, default=24, help="channels of the memory state")
+    p.add_argument("--mem-warm", type=int, nargs="*", default=[],
+                   help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
+    p.add_argument("--mem-freeze", action="store_true",
+                   help="score: memory cores again without updating the memory after the IC")
     p.add_argument("--core-hist", action="store_true",
                    help="the core also gets the state one step before (the observed trend) as input")
     p.add_argument("--core-stride", type=int, default=1,

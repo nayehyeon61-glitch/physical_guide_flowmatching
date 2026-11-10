@@ -21,6 +21,12 @@ The core is trained first and frozen. Its one-day forecast c(x) and tendency tau
 
 A further position needs no training: a lead-wise blend of the two finished forecasts
 (scripts/run_kai_tendency.py, ``blend``; ``loop`` = the same weights applied every step and fed back).
+
+Memory (the owner's Mori-Zwanzig reading, 2026-11-10): the daily 5.625 deg state is a projection of the
+atmosphere, so its exact equation is  dx/dt = Markov term f(x) + memory integral over the past + noise.
+DynCore is the Markov term alone. ``make_core(hist=True)`` adds one lag (the observed trend),
+``make_core(mem=W)`` a ConvGRU state m that integrates the past (W days before the IC, then the rollout's own
+states) and enters the tendency as input before every step: dx/dt = f(x, m).
 """
 
 import os
@@ -31,6 +37,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from . import contract
 
@@ -107,19 +114,95 @@ def _hist_core_class():
     return HistCore
 
 
+class ConvGRUCell(nn.Module):
+    """The standard convolutional GRU cell (Ballas et al. 2016): gates and candidate are 3x3 convolutions of
+    [input, state]; padding as in the core's trunk (longitude circular, latitude reflect). The state is a leaky
+    time integral of its inputs with a learned, state-dependent kernel: m <- (1 - z) m + z n."""
+
+    def __init__(self, cin: int, hid: int):
+        super().__init__()
+        self.hid = hid
+        self.gates = nn.Conv2d(cin + hid, 2 * hid, 3)
+        self.cand = nn.Conv2d(cin + hid, hid, 3)
+
+    @staticmethod
+    def pad(x):
+        return F.pad(F.pad(x, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect")
+
+    def forward(self, u, m=None):
+        if m is None:
+            m = u.new_zeros(u.shape[0], self.hid, *u.shape[-2:])
+        z, r = torch.sigmoid(self.gates(self.pad(torch.cat([u, m], 1)))).chunk(2, 1)
+        n = torch.tanh(self.cand(self.pad(torch.cat([u, r * m], 1))))
+        return (1 - z) * m + z * n
+
+
+def _mem_core_class():
+    """DynCore with a memory term in the Mori-Zwanzig sense: dx/dt = f(x, m), m = ConvGRU state.
+
+    The memory is updated BEFORE every time step with the state the step starts from and its observed trend,
+    m_t = GRU(m_{t-1}, [x_t, (x_t - x_{t-1}) / s]), and enters both Heun evaluations of the step as input.
+    ``reset(history)`` runs the GRU over the W days before the IC (data); in the rollout it goes on with the
+    core's own states. The Markov core is the case m = const, the history core (one lag) the case W = 1
+    without recurrence (cf. the LSTM memory closures of Ma, Wang & E 2018 and Wang, Ripamonti & Hesthaven 2020)."""
+    from .dyncore import DynCore, Net, _NetCfg, N_DYN
+    from .core import time_features
+
+    class MemCore(DynCore):
+        hist = True  # the caller has to hand over the past
+
+        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24):
+            super().__init__(cfg, static, t6, mean, std, lat_deg)
+            self.mem, self.mem_ch = int(mem), int(mem_ch)
+            self.net = Net(N_DYN + mem_ch + static.shape[0] + 4, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
+            self.enc = nn.Conv2d(2 * N_DYN, mem_ch, 1)
+            self.gru = ConvGRUCell(mem_ch, mem_ch)
+            self.m, self.prev, self.started = None, None, False
+            self.freeze_mem = False  # diagnostic: no update of the memory after the IC (the rollout's own states)
+
+        def reset(self, history=None):
+            """history (B, W, 66, H, W): the states before the IC, oldest first; None = an empty memory."""
+            self.m, self.prev, self.started = None, None, False
+            if history is not None:
+                for k in range(history.shape[1]):
+                    self.remember(history[:, k])
+
+        def remember(self, x):
+            trend = torch.zeros_like(x) if self.prev is None else (x - self.prev) / self.t6 * self.keep
+            self.m = self.gru(self.enc(torch.cat([x, trend], 1)), self.m)
+            self.prev = x
+
+        def _trunk(self, x, hours, g=None):
+            B, _, H, W = x.shape
+            return self.net.trunk(torch.cat([x, self.m, self.static.expand(B, -1, -1, -1),
+                                             time_features(hours, H, W)], 1))
+
+        def step(self, x, hours, tisr_next):
+            if not (self.freeze_mem and self.started):
+                self.remember(x)  # the time integral of the past first, then the prediction in time
+            self.started = True
+            return super().step(x, hours, tisr_next)
+    return MemCore
+
+
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
-              hist: bool = False):
+              hist: bool = False, mem: int = 0, mem_ch: int = 24):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
     per day (DynCore's dt_hours, in units of its nominal 6 h step). ``stride`` > 1 = the long-scale core: one
     solver step = ``stride`` days (``inc_std`` is then the std of the stride-day increment). ``hist`` = the
-    field extended to its history: the previous state enters as the observed trend (_hist_core_class)."""
+    field extended to its history: the previous state enters as the observed trend (_hist_core_class).
+    ``mem`` = W > 0: the memory core (_mem_core_class), a ConvGRU state of ``mem_ch`` channels warmed up on the
+    W days before the IC."""
     from .dyncore import DynCore, DynCoreConfig
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True)
-    cls = _hist_core_class() if hist else DynCore
-    core = cls(cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
+    args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
+    if mem:
+        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch)
+    else:
+        core = (_hist_core_class() if hist else DynCore)(*args)
     if norm == "gn":
         stateless_norm(core.net)
     elif norm != "bn":
@@ -135,9 +218,12 @@ def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[tor
 
 def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
     """``steps`` solver steps of core.stride days each; tisr (B, steps, H, W) = the forcing at the end of each.
-    ``prev`` (history cores): the dynamic channels one step before xd."""
+    ``prev`` (history cores): the dynamic channels one step before xd; memory cores: the W steps before xd
+    (B, W, 66, H, W), oldest first (None = an empty memory)."""
     x, out, st = xd, [], getattr(core, "stride", 1)
-    if getattr(core, "hist", False):
+    if getattr(core, "mem", 0):
+        core.reset(prev)
+    elif getattr(core, "hist", False):
         core.prev = prev
     for k in range(steps):
         x = core_step(core, x, doy + k * st, None if tisr is None else tisr[:, k])
@@ -150,6 +236,8 @@ class CoreBase:
     ``prev`` (history cores): the full state one day before x; None = no trend."""
 
     def __init__(self, core):
+        if getattr(core, "mem", 0):  # its state lives across steps: only whole rollouts (core_rollout) so far
+            raise NotImplementedError("a memory core cannot be called step by step yet (use core_rollout)")
         self.core, self.dyn, self.hist = core, torch.tensor(DYN), getattr(core, "hist", False)
 
     def __call__(self, x, doy, tisr_next=None, prev=None):
@@ -261,5 +349,5 @@ def config_dict(cfg) -> dict:
     return asdict(cfg)
 
 
-__all__ = ["ARMS", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "stateless_norm", "core_step", "core_rollout", "needs_core",
+__all__ = ["ARMS", "ConvGRUCell", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "stateless_norm", "core_step", "core_rollout", "needs_core",
            "config_dict", "TISR", "OROG", "DYN", "TISR_DYN"]
