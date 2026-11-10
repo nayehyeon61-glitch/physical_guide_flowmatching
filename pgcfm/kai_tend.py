@@ -45,7 +45,9 @@ TISR_DYN = DYN.index(TISR)
 # arm -> (form, inject)
 ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2": ("full", "s2"),
         "s3": ("full", "s3"), "s4": ("full", "s4"), "res": ("res", "none"), "inres": ("res", "in"),
-        "out": ("core", "none"), "inout": ("core", "in")}
+        "out": ("core", "none"), "inout": ("core", "in"),
+        # control of ``out``: the frozen first stage is not the tendency core but a trained KAI (arm res)
+        "stack": ("core", "none")}
 
 
 def needs_core(arm: str) -> bool:
@@ -75,6 +77,16 @@ def core_rollout(core, xd, doy, steps, tisr=None):
     return torch.stack(out, 1)
 
 
+class CoreBase:
+    """The frozen tendency core as a map of the full 67-channel state: (x, doy, tisr_next) -> next-day state."""
+
+    def __init__(self, core):
+        self.core, self.dyn = core, torch.tensor(DYN)
+
+    def __call__(self, x, doy, tisr_next=None):
+        return x.index_copy(1, self.dyn, core_step(self.core, x[:, self.dyn], doy, tisr_next))  # orog copied
+
+
 # ------------------------------------------------------------------------------- KAI with the core inside
 @dataclass
 class KAIPosConfig:
@@ -92,7 +104,8 @@ class KAIPosConfig:
 class KAIPos(nn.Module):
     """x (B, 67, H, W) z-scored, doy (B,), tisr_next (B, H, W) -> next-day state (B, 67, H, W).
 
-    ``core`` is the frozen tendency core (not a submodule: it is neither trained nor saved with KAI)."""
+    ``core`` is the frozen first stage, a callable (x, doy, tisr_next) -> next state: CoreBase(tendency core),
+    or a trained KAI for the control arm ``stack`` (not a submodule: neither trained nor saved with KAI)."""
 
     def __init__(self, cfg: KAIPosConfig, inc_std: np.ndarray, core=None):
         super().__init__()
@@ -115,20 +128,22 @@ class KAIPos(nn.Module):
         self.register_buffer("keep", keep.view(1, -1, 1, 1))
         self.register_buffer("dyn", torch.tensor(DYN))
         self._core = [core]
+        self.last_core = None
         self.ablate = False  # diagnostic: zero the injected tau (the output anchor of form "core" is kept)
         if (cfg.form == "core" or cfg.inject != "none") and core is None:
             raise ValueError("this arm needs the frozen tendency core")
 
     def core_next(self, x, doy, tisr_next):
         with torch.no_grad():
-            yd = core_step(self._core[0], x[:, self.dyn], doy, tisr_next)
-        return x.index_copy(1, self.dyn, yd)  # orog copied
+            return self._core[0](x, doy, tisr_next)
 
-    def forward(self, x, doy, tisr_next=None):
+    def forward(self, x, doy, tisr_next=None, core_state=None):
+        """``core_state``: evaluate the core on this state instead of x (the open-loop diagnostic of ``rollout``)."""
         cfg, c, tau = self.cfg, None, None
         if cfg.form == "core" or cfg.inject != "none":
-            c = self.core_next(x, doy, tisr_next)
-            tau = (c - x) / self.s
+            xc = x if core_state is None else core_state
+            c = self.core_next(xc, doy, tisr_next)
+            tau = (c - xc) / self.s
             if self.ablate:
                 tau = torch.zeros_like(tau)
         m = self.kai.core_model
@@ -138,15 +153,21 @@ class KAIPos(nn.Module):
             if cfg.inject.startswith("s") and i == self.stage:
                 h = h + self.proj(tau)
         o = m.head(h)
+        self.last_core = c
         if cfg.form == "full":
             return o
         return (x if cfg.form == "res" else c) + o * self.s * self.keep
 
-    def rollout(self, x0, doy0, steps, tisr=None):
-        """(B, steps, 67, H, W); tisr (B, steps, H, W) = the core's forcing on day 1..steps."""
-        x, out = x0, []
+    def rollout(self, x0, doy0, steps, tisr=None, open_loop=False):
+        """(B, steps, 67, H, W); tisr (B, steps, H, W) = the core's forcing on day 1..steps.
+
+        ``open_loop`` (diagnostic, inject arms): the core runs on its OWN trajectory from x0 and only its tau
+        enters KAI, so KAI's output never feeds the core (closed loop = the trained coupling, the default)."""
+        x, xc, out = x0, x0, []
         for k in range(steps):
-            x = self(x, doy0 + k, None if tisr is None else tisr[:, k])
+            x = self(x, doy0 + k, None if tisr is None else tisr[:, k], xc if open_loop else None)
+            if open_loop:
+                xc = self.last_core
             out.append(x)
         return torch.stack(out, 1)
 
@@ -155,5 +176,5 @@ def config_dict(cfg) -> dict:
     return asdict(cfg)
 
 
-__all__ = ["ARMS", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "core_step", "core_rollout", "needs_core",
+__all__ = ["ARMS", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "core_step", "core_rollout", "needs_core",
            "config_dict", "TISR", "OROG", "DYN", "TISR_DYN"]

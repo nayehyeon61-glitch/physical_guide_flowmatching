@@ -14,7 +14,8 @@ pairs), made from our 6-hourly WB2 files (scripts/wb2_to_kai.py --all-hours) at 
 3. ``--score <tags>``: paired rollouts on the test year: RMSE / ACC per channel and lead, zonal spectra,
    bootstrap vs ``kai``; plus ``core`` alone, ``blend`` (lead-wise blend of the kai and core forecasts, weights
    from the validation year) and, for every arm with an injected tau, the same rollout with tau = 0
-   (``<arm>~notau``: how much the trained KAI relies on the core at that position).
+   (``<arm>~notau``: how much the trained KAI relies on the core at that position) and with the core running
+   open loop on its own trajectory (``<arm>~open``: is a diverging rollout the KAI <-> core feedback?).
 
     python scripts/run_kai_tendency.py --arm core --iters 3000
     python scripts/run_kai_tendency.py --arm s2
@@ -33,7 +34,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
-from pgcfm.kai_tend import (ARMS, DYN, KAIPos, KAIPosConfig, LpLoss, OROG, TISR, config_dict,  # noqa: E402
+from pgcfm.kai_tend import (ARMS, DYN, CoreBase, KAIPos, KAIPosConfig, LpLoss, OROG, TISR, config_dict,  # noqa: E402
                             core_rollout, make_core, needs_core)
 
 EPS = contract.KAI_STD_EPS
@@ -119,7 +120,19 @@ def build_core(a, mean, std, inc, lat, load=True):
 
 
 def build(a, arm, inc, core):
-    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, core if needs_core(arm) else None)
+    """``core``: the frozen DynCore (or None for arms without one). Arm ``stack`` loads the trained arm ``res``
+    as its frozen first stage instead (the control: is the gain of ``out`` specific to the tendency core?)."""
+    base = None
+    if arm == "stack":
+        base = build(a, "res", inc, None)
+        base.load_state_dict(torch.load(os.path.join(a.out, f"{a.stack_tag}.pt"), map_location="cpu",
+                                        weights_only=False)["state"])
+        base.eval()
+        for p in base.parameters():
+            p.requires_grad_(False)
+    elif needs_core(arm):
+        base = CoreBase(core)
+    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, base)
 
 
 def train(a, arm):
@@ -141,7 +154,7 @@ def train(a, arm):
         wl = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
         wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
     else:
-        m = build(a, arm, inc, build_core(a, mean, std, inc, lat) if needs_core(arm) else None)
+        m = build(a, arm, inc, build_core(a, mean, std, inc, lat) if needs_core(arm) and arm != "stack" else None)
         opt = torch.optim.AdamW(m.parameters(), lr=a.lr)  # KAI's trainer
         cur = [1]
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
@@ -255,31 +268,43 @@ def score(a, tags):
     res["core"] = metrics(p_core)
     ckc = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
     res["core"].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
-    p_kai = None
+    keep = {"core": p_core}  # test forecasts kept for the blends
     for tag in tags:
         m, ck = load(tag)
         pred = rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics)
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
-        if tag == "kai":
-            p_kai = pred
+        if tag == "kai" or tag in a.blend_with:
+            keep[tag] = pred
         if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
             res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics), spectra=False)
+            m.ablate = False
+            if m.cfg.form == "full":  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
+                res[f"{tag}~open"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t, open_loop=True), tez, ics))
         del pred
         print("scored", tag, flush=True)
-    if p_kai is not None:  # output-level position without training: lead-wise blend, weights from the validation year
+    if "kai" in keep:  # output-level position without training: lead-wise blend, weights from the validation year
         va = load_years(a, [a.val_year])[a.val_year]
         vics, vaz, vtruth = setup(va)
         kai_m, _ = load("kai")
         vk = rollout(lambda x, d, t: kai_m.rollout(x, d, L, t), vaz, vics)
-        vc = rollout(core_fn, vaz, vics)
-        num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
-        den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
-        wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
-        del vk, vc, vtruth
-        res["blend"] = metrics(wk[None, :, :, None, None] * p_kai + (1 - wk[None, :, :, None, None]) * p_core)
-        res["blend"]["kai_weight"] = wk
+        for other in ["core"] + [t for t in a.blend_with if t in keep]:
+            if other == "core":
+                vc = rollout(core_fn, vaz, vics)
+            else:
+                om, _ = load(other)
+                vc = rollout(lambda x, d, t: om.rollout(x, d, L, t), vaz, vics)
+            num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
+            den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
+            wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
+            del vc
+            name = "blend" if other == "core" else f"blend_{other}"
+            wb = wk[None, :, :, None, None]
+            res[name] = metrics(wb * keep["kai"] + (1 - wb) * keep[other])
+            res[name]["kai_weight"] = wk
+            print("scored", name, flush=True)
+        del vk, vtruth
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
     summarize(a, res, std, ics)
@@ -317,8 +342,35 @@ def summarize(a, res, std, ics):
                 "rel": (np.sqrt(mm.mean(0)) / np.sqrt(base.mean(0)) - 1).tolist(), "lo": lo.tolist(), "hi": hi.tolist(),
                 "nrmse_rel": (nr(mm) / nr(base) - 1).tolist(),
                 "nrmse_lo": np.percentile(bn, 2.5, 0).tolist(), "nrmse_hi": np.percentile(bn, 97.5, 0).tolist()}
+    # further paired comparisons a:b (same bootstrap): the effect of the core against its controls
+    out["pairs"] = {}
+    for pair in a.pairs:
+        x, y = pair.split(":")
+        if x not in res or y not in res:
+            continue
+        mx, my = res[x]["mse"], res[y]["mse"]
+        idx = rng.integers(0, len(ics), (500, len(ics)))
+        nr = lambda m: (np.sqrt(m.mean(0))[:, scored] / std[scored]).mean(1)  # noqa: E731
+        bn = np.stack([nr(mx[i]) / nr(my[i]) - 1 for i in idx])
+        bs = np.stack([np.sqrt(mx[i].mean(0)) / np.sqrt(my[i].mean(0)) - 1 for i in idx[:300]])
+        lo, hi = np.percentile(bs, [2.5, 97.5], axis=0)
+        px = (np.sqrt(mx)[:, :, scored] / std[scored]).mean(2)
+        py = (np.sqrt(my)[:, :, scored] / std[scored]).mean(2)
+        out["pairs"][f"{x}/{y}"] = {
+            "rel": (np.sqrt(mx.mean(0)) / np.sqrt(my.mean(0)) - 1).tolist(), "lo": lo.tolist(), "hi": hi.tolist(),
+            "nrmse_rel": (nr(mx) / nr(my) - 1).tolist(),
+            "nrmse_lo": np.percentile(bn, 2.5, 0).tolist(), "nrmse_hi": np.percentile(bn, 97.5, 0).tolist(),
+            "ic_win_frac": (px < py).mean(0).tolist(),
+            "better_cells": int((hi < 0)[:, scored].sum()), "worse_cells": int((lo > 0)[:, scored].sum())}
+    for k in list(res):
+        if k.startswith("blend") and "kai_weight" in res[k]:
+            out.setdefault("blend_weights", {})[k] = res[k]["kai_weight"].tolist()
     with open(os.path.join(a.out, "score.json"), "w") as f:
         json.dump(out, f)
+    print("pairs (normalized RMSE of a relative to b, %, lead 1/3/5/10 [95 % CI]; cells better/worse of 650)")
+    for k, e in out["pairs"].items():
+        print(f"  {k:22s}", " ".join(f"{100 * e['nrmse_rel'][q]:+.1f}[{100 * e['nrmse_lo'][q]:+.1f},{100 * e['nrmse_hi'][q]:+.1f}]"
+                                    for q in (0, 2, 4, a.leads - 1) if q < a.leads), e["better_cells"], e["worse_cells"])
     print("ICs", len(ics))
     ls = [q for q in (0, 2, 4, 9) if q < a.leads]
     for k, e in out["arms"].items():
@@ -346,6 +398,14 @@ def main(argv=None):
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--core-tag", default="core")
+    p.add_argument("--stack-tag", default="res", help="arm stack: the trained res checkpoint used as first stage")
+    p.add_argument("--blend-with", nargs="*", default=["res", "kai_s1"],
+                   help="extra blends of kai with these scored tags (controls of the kai + core blend)")
+    p.add_argument("--pairs", nargs="*", default=["out:res", "out_s1:res_s1", "out:res_s1", "out_s1:res", "out:stack",
+                                                  "out:kai_long", "out:core", "res:kai", "kai_s1:kai", "out_s1:out",
+                                                  "res_s1:res", "blend:blend_res", "blend:blend_kai_s1", "inout:out",
+                                                  "inres:res", "stack:res"],
+                   help="extra paired comparisons a:b (RMSE of a relative to b)")
     p.add_argument("--core-hidden", type=int, default=48)
     p.add_argument("--core-blocks", type=int, nargs="+", default=[2, 2])
     p.add_argument("--core-lr", type=float, default=4e-4)
