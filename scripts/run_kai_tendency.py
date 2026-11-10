@@ -1,22 +1,28 @@
-"""KAI-alpha original vs KAI-alpha + the step 16 tendency core, on KAI-format daily ERA5 (docs/kai_tendency.md).
+"""Where does the separately trained tendency core go in KAI-alpha? (docs/kai_tendency.md)
 
 Data: KAI's contract (67 channels, daily mean of 00/06/12/18 UTC, z-score with std + 1e-8, no cross-year
 pairs), made from our 6-hourly WB2 files (scripts/wb2_to_kai.py --all-hours) at 5.625 deg (32 x 64).
 
-Arms (pgcfm/kai_tend.py), same backbone size, optimizer (AdamW, cosine, clip 1.0 as KAI's trainer), loss
-(KAI's LpLoss, relative L2), batch and iterations:
-    kai    original KAI: full next-day state, single-step training
-    res    + residual output x + s * net(x), zero head
-    tend1  + Heun, season input, tisr forcing, PositiveMass (single-step training)
-    tend   + rollout training (curriculum K = 1 -> --kmax days)
+1. ``--arm core``: the tendency core alone (pgcfm.dyncore.DynCore, step 16 recipe: Heun, tisr forcing,
+   PositiveMass, rollout curriculum, latitude-weighted MSE in units of the increment std). Saved, then frozen.
+2. ``--arm <position>``: KAI-alpha with KAI's own recipe (single step, LpLoss, AdamW 1e-3, cosine, clip 1.0)
+   and the frozen core at one position (pgcfm/kai_tend.py ARMS):
+       kai    original, no core                      res    x + s net(x), no core (control of ``out``)
+       in     tau as extra input channels            inres  res with tau at the input
+       s1-s4  tau added after stage 1..4             out    core forecast + s net(x)
+                                                     inout  out with tau at the input
+3. ``--score <tags>``: paired rollouts on the test year: RMSE / ACC per channel and lead, zonal spectra,
+   bootstrap vs ``kai``; plus ``core`` alone, ``blend`` (lead-wise blend of the kai and core forecasts, weights
+   from the validation year) and, for every arm with an injected tau, the same rollout with tau = 0
+   (``<arm>~notau``: how much the trained KAI relies on the core at that position).
 
-    python scripts/run_kai_tendency.py --data data/era5_5p625/kai6h --out runs/kaitend --arm kai
-    python scripts/run_kai_tendency.py ... --score kai res tend1 tend     # paired scores + figures
+    python scripts/run_kai_tendency.py --arm core --iters 3000
+    python scripts/run_kai_tendency.py --arm s2
+    python scripts/run_kai_tendency.py --score kai in s1 s2 s3 s4 res inres out inout
 """
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -27,9 +33,10 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
-from pgcfm.kai_tend import KAITend, KAITendConfig, LpLoss, TISR, OROG, config_dict  # noqa: E402
+from pgcfm.kai_tend import (ARMS, DYN, KAIPos, KAIPosConfig, LpLoss, OROG, TISR, config_dict,  # noqa: E402
+                            core_rollout, make_core, needs_core)
 
-EPS = 1e-8  # KAI: std + 1e-8
+EPS = contract.KAI_STD_EPS
 
 
 def daily(path6h: str, cache: str) -> np.ndarray:
@@ -64,7 +71,7 @@ def load_years(a, years):
     return {y: np.asarray(daily(os.path.join(a.data, f"{y}.nc"), os.path.join(a.cache, f"{y}.npy"))) for y in years}
 
 
-def stats(a, train):
+def stats(a, train=None):
     p = os.path.join(a.out, "stats.npz")
     if os.path.exists(p):
         s = np.load(p)
@@ -90,9 +97,29 @@ def stats(a, train):
     return mean, std, inc, clim
 
 
-def build(a, arm, mean, std, inc, lat):
-    cfg = KAITendConfig.arm(arm, a.depths, a.dims)
-    return KAITend(cfg, inc, mean, std, lat)
+def zscore(x, mean, std):
+    return ((x - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)).astype(np.float32)
+
+
+def build_core(a, mean, std, inc, lat, load=True):
+    import xarray as xr
+    from pgcfm.core import static_features
+    with xr.open_dataset(os.path.join(a.era5, "constants", "constants_5.625deg.nc")) as d:
+        oro, lsm, lon = d["orography"].values.astype(np.float32), d["lsm"].values.astype(np.float32), d["lon"].values
+        assert np.allclose(d["lat"].values, lat)
+    contract.register_latitudes(lat)
+    core = make_core(static_features(lat, lon, oro, lsm), inc, mean, std, lat, a.core_hidden, a.core_blocks)
+    if load:
+        ck = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
+        core.load_state_dict(ck["state"])
+        core.eval()
+        for p in core.parameters():
+            p.requires_grad_(False)
+    return core
+
+
+def build(a, arm, inc, core):
+    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, core if needs_core(arm) else None)
 
 
 def train(a, arm):
@@ -102,15 +129,23 @@ def train(a, arm):
     va = load_years(a, [a.val_year])[a.val_year]
     mean, std, inc, _ = stats(a, tr)
     lat = lat_of(os.path.join(a.data, f"{a.val_year}.nc"))
-    m = build(a, arm, mean, std, inc, lat)
-    zs = lambda x: torch.from_numpy(((x - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)).astype(np.float32))  # noqa
-    trz = {y: zs(tr[y]) for y in tr}
-    vaz = zs(va)
-    opt = torch.optim.AdamW(m.parameters(), lr=a.lr)
+    trz = {y: torch.from_numpy(zscore(tr[y], mean, std)) for y in tr}
+    vaz = torch.from_numpy(zscore(va, mean, std))
+    is_core = arm == "core"
+    dyn = torch.tensor(DYN)
+    if is_core:
+        m = build_core(a, mean, std, inc, lat, load=False)
+        opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
+        cur = a.curriculum
+        s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1)
+        wl = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
+        wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
+    else:
+        m = build(a, arm, inc, build_core(a, mean, std, inc, lat) if needs_core(arm) else None)
+        opt = torch.optim.AdamW(m.parameters(), lr=a.lr)  # KAI's trainer
+        cur = [1]
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
-    loss_fn = LpLoss(d=2, p=2, size_average=True, reduction=True)
-    kmax = a.kmax if arm == "tend" else 1
-    stage = max(1, a.iters // kmax)
+    lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     years = sorted(trz)
     log, t0 = [], time.time()
 
@@ -124,32 +159,37 @@ def train(a, arm):
             doy.append(d)
         return torch.stack(xs), torch.stack(tg), torch.tensor(doy)
 
-    def val():
+    def one_step(x, doy, t):
+        if is_core:
+            return x.index_copy(1, dyn, core_rollout(m, x[:, dyn], doy, 1, t[:, None, TISR])[:, 0])
+        return m(x, doy, t[:, TISR])
+
+    def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
         with torch.no_grad():
             idx = np.arange(0, len(vaz) - 1, max(1, (len(vaz) - 1) // 64))[:64]
-            l = 0.0
+            tot = 0.0
             for i in range(0, len(idx), 16):
                 j = idx[i:i + 16]
-                x, t = vaz[j], vaz[j + 1]
-                y = m(x, torch.tensor(j), t[:, TISR])
-                l += float(loss_fn(y, t)) * len(j)
+                tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + 1]), vaz[j + 1])) * len(j)
         m.train()
-        return l / len(idx)
+        return tot / len(idx)
 
     for it in range(1, a.iters + 1):
-        K = min(kmax, 1 + (it - 1) // stage)
+        K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         x, tg, doy = batch(K)
-        y = m.rollout(x, doy, K, tg[:, :, TISR])
-        loss = sum(loss_fn(y[:, k], tg[:, k]) for k in range(K)) / K
+        if is_core:
+            y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR])
+            loss = ((((y - tg[:, :, dyn]) / s_dyn) ** 2) * wl).mean()
+        else:
+            loss = lp(m(x, doy, tg[:, 0, TISR]), tg[:, 0])
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step()
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
-            v = val()
-            log.append(dict(it=it, K=K, loss=float(loss), val=v, sec=time.time() - t0))
+            log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
             print(json.dumps(log[-1]), flush=True)
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
                     params=sum(p.numel() for p in m.parameters()), train_seconds=time.time() - t0),
@@ -157,53 +197,89 @@ def train(a, arm):
 
 
 # ---------------------------------------------------------------------------------------------- scoring
-BANDS = [(0, 3), (4, 9), (10, 20), (21, 32)]
-
-
-def score(a, arms):
-    tr = load_years(a, a.train_years)
+def score(a, tags):
+    mean, std, inc, clim = stats(a)
     te = load_years(a, [a.test_year])[a.test_year]
-    mean, std, inc, clim = stats(a, tr)
     lat = lat_of(os.path.join(a.data, f"{a.test_year}.nc"))
     w = np.cos(np.deg2rad(lat))
     w = (w / w.mean())[:, None].astype(np.float32)
     L = a.leads
-    ics = np.arange(0, len(te) - L, a.ic_stride)
-    tez = ((te - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)).astype(np.float32)
-    truth = np.stack([te[i + 1:i + 1 + L] for i in ics])  # (N, L, 67, H, W) physical
-    cl = np.stack([clim[[min(i + k, 365) for k in range(1, L + 1)]] for i in ics])
-    res = {}
+    sd = (std + EPS).astype(np.float32)[None, None, :, None, None]
+    mn = mean.astype(np.float32)[None, None, :, None, None]
+    core = build_core(a, mean, std, inc, lat)
+    dyn = torch.tensor(DYN)
 
-    def metrics(pred):
-        err = pred - truth
-        mse = (err ** 2 * w).mean((-2, -1))  # (N, L, 67)
-        pa, ta = pred - cl, truth - cl
-        acc = (pa * ta * w).sum((-2, -1)) / np.sqrt((pa ** 2 * w).sum((-2, -1)) * (ta ** 2 * w).sum((-2, -1)) + 1e-30)
-        # zonal spectra (cos-lat weighted over rows): power of prediction, truth and error per wavenumber
-        P = lambda f: (np.abs(np.fft.rfft(f, axis=-1)) ** 2 * w).mean(-2)  # noqa: E731
-        return dict(mse=mse.astype(np.float32), acc=acc.astype(np.float32),
-                    sp_pred=P(pred).mean(0).astype(np.float32), sp_true=P(truth).mean(0).astype(np.float32),
-                    sp_err=P(err).mean(0).astype(np.float32))
+    def setup(year_x):
+        ics = np.arange(0, len(year_x) - L, a.ic_stride)
+        return ics, zscore(year_x, mean, std), np.stack([year_x[i + 1:i + 1 + L] for i in ics])
 
-    res["persistence"] = metrics(np.repeat(te[ics][:, None], L, 1))
-    res["climatology"] = metrics(cl.astype(np.float32))
-    for arm in arms:
-        ck = torch.load(os.path.join(a.out, f"{arm}.pt"), map_location="cpu", weights_only=False)
-        m = build(a, arm.split("_")[0], mean, std, inc, lat)
-        m.load_state_dict(ck["state"])
-        m.eval()
+    def rollout(fn, xz, ics):
         out = []
         with torch.no_grad():
             for i in range(0, len(ics), 16):
                 j = ics[i:i + 16]
-                x0 = torch.from_numpy(tez[j])
-                tis = torch.from_numpy(np.stack([tez[k + 1:k + 1 + L, TISR] for k in j]))
-                out.append(m.rollout(x0, torch.tensor(j), L, tis).numpy())
-        pred = np.concatenate(out) * (std[None, None, :, None, None] + EPS) + mean[None, None, :, None, None]
-        res[arm] = metrics(pred.astype(np.float32))
-        res[arm]["train_seconds"] = ck["train_seconds"]
-        res[arm]["params"] = ck["params"]
+                tis = torch.from_numpy(np.stack([xz[k + 1:k + 1 + L, TISR] for k in j]))
+                out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis).numpy())
+        return (np.concatenate(out) * sd + mn).astype(np.float32)
+
+    def core_fn(x0, doy, tis):
+        y = core_rollout(core, x0[:, dyn], doy, L, tis)
+        return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
+
+    def load(tag):
+        ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location="cpu", weights_only=False)
+        m = build(a, tag.split("_")[0], inc, core)
+        missing = m.load_state_dict(ck["state"], strict=False)
+        assert set(missing.missing_keys) <= {"dyn"} and not missing.unexpected_keys, missing
+        m.eval()
+        return m, ck
+
+    ics, tez, truth = setup(te)
+    cl = np.stack([clim[[min(i + k, 365) for k in range(1, L + 1)]] for i in ics])
+    res = {}
+
+    def metrics(pred, spectra=True):
+        err = pred - truth
+        out = dict(mse=(err ** 2 * w).mean((-2, -1)).astype(np.float32))  # (N, L, 67)
+        pa, ta = pred - cl, truth - cl
+        out["acc"] = ((pa * ta * w).sum((-2, -1))
+                      / np.sqrt((pa ** 2 * w).sum((-2, -1)) * (ta ** 2 * w).sum((-2, -1)) + 1e-30)).astype(np.float32)
+        if spectra:  # zonal power (cos-lat weighted over rows) of prediction, truth and error per wavenumber
+            P = lambda f: (np.abs(np.fft.rfft(f, axis=-1)) ** 2 * w).mean(-2).mean(0).astype(np.float32)  # noqa: E731
+            out.update(sp_pred=P(pred), sp_true=P(truth), sp_err=P(err))
+        return out
+
+    res["persistence"] = metrics(np.repeat(te[ics][:, None], L, 1))
+    res["climatology"] = metrics(cl.astype(np.float32))
+    p_core = rollout(core_fn, tez, ics)
+    res["core"] = metrics(p_core)
+    ckc = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
+    res["core"].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
+    p_kai = None
+    for tag in tags:
+        m, ck = load(tag)
+        pred = rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics)
+        res[tag] = metrics(pred)
+        res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
+        if tag == "kai":
+            p_kai = pred
+        if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
+            m.ablate = True
+            res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics), spectra=False)
         del pred
+        print("scored", tag, flush=True)
+    if p_kai is not None:  # output-level position without training: lead-wise blend, weights from the validation year
+        va = load_years(a, [a.val_year])[a.val_year]
+        vics, vaz, vtruth = setup(va)
+        kai_m, _ = load("kai")
+        vk = rollout(lambda x, d, t: kai_m.rollout(x, d, L, t), vaz, vics)
+        vc = rollout(core_fn, vaz, vics)
+        num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
+        den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
+        wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
+        del vk, vc, vtruth
+        res["blend"] = metrics(wk[None, :, :, None, None] * p_kai + (1 - wk[None, :, :, None, None]) * p_core)
+        res["blend"]["kai_weight"] = wk
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
     summarize(a, res, std, ics)
@@ -216,60 +292,64 @@ def summarize(a, res, std, ics):
     out = {"ics": int(len(ics)), "leads": a.leads, "channels": names, "arms": {}}
     for k, d in res.items():
         rmse = np.sqrt(d["mse"].mean(0))  # (L, 67)
-        nrmse = (rmse[:, scored] / std[scored]).mean(1)
-        e = {"rmse": rmse.tolist(), "acc": d["acc"].mean(0).tolist(), "nrmse": nrmse.tolist()}
-        st, se, sp = d["sp_true"], d["sp_err"], d["sp_pred"]  # (L, 67, nk)
-        e["band_err_frac"], e["band_power_ratio"] = {}, {}
-        for lo, hi in BANDS:
-            b = f"k{lo}-{hi}"
-            e["band_err_frac"][b] = (se[..., lo:hi + 1].sum(-1) / st.sum(-1)).tolist()  # error power / total truth power
-            e["band_power_ratio"][b] = (sp[..., lo:hi + 1].sum(-1) / st[..., lo:hi + 1].sum(-1)).tolist()
+        e = {"rmse": rmse.tolist(), "acc": d["acc"].mean(0).tolist(),
+             "nrmse": (rmse[:, scored] / std[scored]).mean(1).tolist()}
         for x in ("train_seconds", "params"):
             if x in d:
                 e[x] = float(d[x])
         out["arms"][k] = e
-    # paired bootstrap of the RMSE change vs kai, per channel and lead (ICs resampled)
+    if "blend" in res:
+        out["blend_kai_weight"] = res["blend"]["kai_weight"].tolist()
+    # paired bootstrap over ICs of the RMSE change vs kai: per channel and lead, and for the 65-channel mean
     if "kai" in res:
         base = res["kai"]["mse"]
+        idx = rng.integers(0, len(ics), (500, len(ics)))
+        nr = lambda m: (np.sqrt(m.mean(0))[:, scored] / std[scored]).mean(1)  # noqa: E731
         out["paired_vs_kai"] = {}
-        B = 500
-        idx = rng.integers(0, len(ics), (B, len(ics)))
         for k in res:
             if k in ("kai", "climatology"):
                 continue
             mm = res[k]["mse"]
-            d = np.sqrt(mm.mean(0)) / np.sqrt(base.mean(0)) - 1
             bs = np.stack([np.sqrt(mm[i].mean(0)) / np.sqrt(base[i].mean(0)) - 1 for i in idx])
             lo, hi = np.percentile(bs, [2.5, 97.5], axis=0)
-            out["paired_vs_kai"][k] = {"rel": d.tolist(), "lo": lo.tolist(), "hi": hi.tolist(),
-                                       "win_frac": (mm < base).mean(0).tolist()}
+            bn = np.stack([nr(mm[i]) / nr(base[i]) - 1 for i in idx])
+            out["paired_vs_kai"][k] = {
+                "rel": (np.sqrt(mm.mean(0)) / np.sqrt(base.mean(0)) - 1).tolist(), "lo": lo.tolist(), "hi": hi.tolist(),
+                "nrmse_rel": (nr(mm) / nr(base) - 1).tolist(),
+                "nrmse_lo": np.percentile(bn, 2.5, 0).tolist(), "nrmse_hi": np.percentile(bn, 97.5, 0).tolist()}
     with open(os.path.join(a.out, "score.json"), "w") as f:
         json.dump(out, f)
-    show = ["z500", "t850", "u850", "v850", "q700", "t2m", "msl", "u200", "z50"]
     print("ICs", len(ics))
+    ls = [q for q in (0, 2, 4, 9) if q < a.leads]
     for k, e in out["arms"].items():
         r = np.array(e["rmse"])
-        print(f"{k:12s}", " ".join(f"{n}:" + "/".join(f"{r[l, names.index(n)]:.3g}" for l in (0, 2, 4, 9) if l < a.leads)
-                                    for n in show[:4]), " nrmse", "/".join(f"{e['nrmse'][l]:.3f}" for l in (0, 2, 4, 9) if l < a.leads))
+        print(f"{k:12s}", " ".join(f"{n}:" + "/".join(f"{r[q, names.index(n)]:.3g}" for q in ls)
+                                    for n in ("z500", "t850", "t2m", "u850")),
+              " nrmse", "/".join(f"{e['nrmse'][q]:.3f}" for q in ls))
 
 
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/era5_5p625/kai6h")
+    p.add_argument("--era5", default="data/era5_5p625/era5_data", help="constants (orography, lsm) for the core")
     p.add_argument("--cache", default="data/era5_5p625/kaiday")
     p.add_argument("--out", default="runs/kaitend")
-    p.add_argument("--arm", choices=["kai", "res", "tend1", "tend"])
-    p.add_argument("--tag", default=None, help="checkpoint name (default: the arm); scored as <tag>")
-    p.add_argument("--score", nargs="*", help="tags to score; a tag 'kai_long' uses the arm before '_'")
+    p.add_argument("--arm", choices=["core"] + list(ARMS))
+    p.add_argument("--tag", default=None, help="checkpoint name (default: the arm); 'kai_long' scores as arm kai")
+    p.add_argument("--score", nargs="*", help="tags to score (the arm is the part before '_')")
     p.add_argument("--train-years", type=int, nargs="+", default=[2012, 2013, 2014, 2015])
     p.add_argument("--val-year", type=int, default=2016)
     p.add_argument("--test-year", type=int, default=2017)
-    p.add_argument("--depths", type=int, nargs=4, default=[2, 2, 4, 2])
-    p.add_argument("--dims", type=int, nargs=4, default=[24, 48, 64, 96])
-    p.add_argument("--iters", type=int, default=1200)
+    p.add_argument("--depths", type=int, nargs=4, default=[2, 2, 4, 2], help="KAI default: 3 3 15 3")
+    p.add_argument("--dims", type=int, nargs=4, default=[24, 48, 64, 96], help="KAI default: 48 96 192 288")
+    p.add_argument("--iters", type=int, default=2000)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--kmax", type=int, default=3)
+    p.add_argument("--core-tag", default="core")
+    p.add_argument("--core-hidden", type=int, default=48)
+    p.add_argument("--core-blocks", type=int, nargs="+", default=[2, 2])
+    p.add_argument("--core-lr", type=float, default=4e-4)
+    p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 3, 4], help="core rollout days")
     p.add_argument("--leads", type=int, default=10)
     p.add_argument("--ic-stride", type=int, default=3)
     p.add_argument("--log-every", type=int, default=100)
@@ -280,7 +360,7 @@ def main(argv=None):
     os.makedirs(a.out, exist_ok=True)
     if a.arm:
         train(a, a.arm)
-    if a.score:
+    if a.score is not None:
         score(a, a.score)
 
 
