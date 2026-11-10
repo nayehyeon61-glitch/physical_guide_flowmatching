@@ -10,7 +10,10 @@ pairs), made from our 6-hourly WB2 files (scripts/wb2_to_kai.py --all-hours) at 
        kai    original, no core                      res    x + s net(x), no core (control of ``out``)
        in     tau as extra input channels            inres  res with tau at the input
        s1-s4  tau added after stage 1..4             out    core forecast + s net(x)
-                                                     inout  out with tau at the input
+       gate   KAI's own output mixed with the core   inout  out with tau at the input
+              forecast, one weight per channel (--init kai: the trained KAI is kept, g starts at 0)
+   ``--init <tag> --rollout 2 3``: fine-tuning in the model's own rollout (the gradient passes through the
+   frozen core's input).
 3. ``--score <tags>``: paired rollouts on the test year: RMSE / ACC per channel and lead, zonal spectra,
    bootstrap vs ``kai``; plus ``core`` alone, ``blend`` (lead-wise blend of the kai and core forecasts, weights
    from the validation year) and, for every arm with an injected tau, the same rollout with tau = 0
@@ -165,9 +168,13 @@ def train(a, arm):
         if a.init:  # fine-tuning (e.g. --rollout 2 3 from a single-step checkpoint)
             miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu",
                                                 weights_only=False)["state"], strict=False)
-            assert set(miss.missing_keys) <= {"dyn"} and not miss.unexpected_keys, miss
-        opt = torch.optim.AdamW(m.parameters(), lr=a.lr)  # KAI's trainer
+            assert set(miss.missing_keys) <= {"dyn", "gate"} and not miss.unexpected_keys, miss
         cur = a.rollout  # [1] = KAI's single-step training
+        m.core_grad = max(cur) > 1
+        gate = [q for k, q in m.named_parameters() if k == "gate"]
+        rest = [q for k, q in m.named_parameters() if k != "gate"]
+        opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else []),
+                                lr=a.lr)  # KAI's trainer; the 67 gate weights move on their own scale
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     years = sorted(trz)
@@ -305,7 +312,9 @@ def score(a, tags):
         pred = rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics)
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
-        if tag == "kai" or tag in a.blend_with:
+        if hasattr(m, "gate"):
+            res[tag]["gate"] = m.gate.detach().view(-1).numpy().copy()
+        if tag in a.blend_bases or tag in a.blend_with:
             keep[tag] = pred
         if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
@@ -315,12 +324,17 @@ def score(a, tags):
                 res[f"{tag}~open"] = metrics(rollout(lambda x, d, t: m.rollout(x, d, L, t, open_loop=True), tez, ics))
         del pred
         print("scored", tag, flush=True)
-    if "kai" in keep:  # output-level position without training: lead-wise blend, weights from the validation year
+    # output-level position without training: lead-wise blend of a KAI (``--blend-bases``) with a core or another
+    # scored tag, weights from the validation year. Names: blend / blend_<other>, with @<base> if base != kai.
+    bases = [b for b in a.blend_bases if b in keep]
+    if bases:
         va = load_years(a, [a.val_year])[a.val_year]
         vics, vaz, vtruth = setup(va)
-        kai_m, _ = load("kai")
+    for bt in bases:
+        kai_m, _ = load(bt)
+        sfx = "" if bt == "kai" else f"@{bt}"
         vk = rollout(lambda x, d, t: kai_m.rollout(x, d, L, t), vaz, vics)
-        for other in core_tags + [t for t in a.blend_with if t in keep and t not in core_tags]:
+        for other in core_tags + [t for t in a.blend_with if t in keep and t not in core_tags and t != bt]:
             if other in core_tags:
                 vc = rollout(core_fn(other), vaz, vics)
             else:
@@ -330,26 +344,26 @@ def score(a, tags):
             den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
             wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
             del vc
-            name = "blend" if other == "core" else f"blend_{other}"
+            name = ("blend" if other == "core" else f"blend_{other}") + sfx
             wb = wk[None, :, :, None, None]
-            res[name] = metrics(wb * keep["kai"] + (1 - wb) * keep[other])
+            res[name] = metrics(wb * keep[bt] + (1 - wb) * keep[other])
             res[name]["kai_weight"] = wk
             print("scored", name, flush=True)
             if other in a.loop_blend:  # the same two models coupled every step: the day-1 weights, fed back
                 w1 = torch.from_numpy(wk[0]).view(1, -1, 1, 1)
                 base = CoreBase(get_core(other))
 
-                def loop_fn(x0, doy, tis, w1=w1, base=base):
+                def loop_fn(x0, doy, tis, w1=w1, base=base, kai_m=kai_m):
                     x, out = x0, []
                     for k in range(L):
                         x = w1 * kai_m(x, doy + k, tis[:, k]) + (1 - w1) * base(x, doy + k, tis[:, k])
                         out.append(x)
                     return torch.stack(out, 1)
-                lname = "loop" if other == "core" else f"loop_{other}"
+                lname = ("loop" if other == "core" else f"loop_{other}") + sfx
                 res[lname] = metrics(rollout(loop_fn, tez, ics))
                 res[lname]["kai_weight"] = np.repeat(wk[:1], L, 0)
                 print("scored", lname, flush=True)
-        del vk, vtruth
+        del vk
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
     summarize(a, res, std, ics)
@@ -371,6 +385,7 @@ def summarize(a, res, std, ics):
     if "blend" in res:
         out["blend_kai_weight"] = res["blend"]["kai_weight"].tolist()
     out["global_bias"] = {k: d["gbias"].tolist() for k, d in res.items() if "gbias" in d}
+    out["gates"] = {k: d["gate"].tolist() for k, d in res.items() if "gate" in d}
     # paired bootstrap over ICs of the RMSE change vs kai: per channel and lead, and for the 65-channel mean
     if "kai" in res:
         base = res["kai"]["mse"]
@@ -446,6 +461,9 @@ def main(argv=None):
     p.add_argument("--rollout", type=int, nargs="+", default=[1],
                    help="position arms: rollout days of the training loss, a curriculum over the iterations")
     p.add_argument("--init", default=None, help="position arms: start from this checkpoint tag (fine-tuning)")
+    p.add_argument("--gate-lr", type=float, default=1e-2, help="arm gate: learning rate of the 67 mixing weights")
+    p.add_argument("--blend-bases", nargs="*", default=["kai"],
+                   help="scored KAI tags that are blended with the cores / --blend-with tags")
     p.add_argument("--loop-blend", nargs="*", default=[],
                    help="core tags: score the step-wise blend (KAI and core forecasts mixed every day and fed back)")
     p.add_argument("--core-tag", default="core")

@@ -15,9 +15,12 @@ The core is trained first and frozen. Its one-day forecast c(x) and tendency tau
     form    full      KAI's own output: the full next state                       (original KAI)
             res       x + s * net(.)        zero head = persistence               (control, no core)
             core      c(x) + s * net(.)     zero head = the core's forecast       (the core at the output)
+            gate      k(x) + g * (c(x) - k(x))   k = KAI's full next state, g = one weight per channel,
+                      zero g = the original KAI: KAI keeps its own form and its trained weights (--init kai),
+                      the core is mixed in at the output every step (the trained version of the blend)
 
-A fourth position needs no training: a lead-wise blend of the two finished forecasts
-(scripts/run_kai_tendency.py, arm ``blend``).
+A further position needs no training: a lead-wise blend of the two finished forecasts
+(scripts/run_kai_tendency.py, ``blend``; ``loop`` = the same weights applied every step and fed back).
 """
 
 import os
@@ -45,14 +48,14 @@ TISR_DYN = DYN.index(TISR)
 # arm -> (form, inject)
 ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2": ("full", "s2"),
         "s3": ("full", "s3"), "s4": ("full", "s4"), "res": ("res", "none"), "inres": ("res", "in"),
-        "out": ("core", "none"), "inout": ("core", "in"),
+        "out": ("core", "none"), "inout": ("core", "in"), "gate": ("gate", "none"), "ingate": ("gate", "in"),
         # control of ``out``: the frozen first stage is not the tendency core but a trained KAI (arm res)
         "stack": ("core", "none")}
 
 
 def needs_core(arm: str) -> bool:
     form, inject = ARMS[arm]
-    return form == "core" or inject != "none"
+    return form in ("core", "gate") or inject != "none"
 
 
 # ------------------------------------------------------------------------------------- the tendency core
@@ -139,10 +142,12 @@ class KAIPos(nn.Module):
         n = contract.N_CHANNELS
         self.kai = KAI(in_chans=n * (2 if cfg.inject == "in" else 1), out_chans=n,
                        depths=list(cfg.depths), dims=list(cfg.dims))
-        if cfg.form != "full":
+        if cfg.form in ("res", "core"):
             last = self.kai.core_model.head[-1]
             nn.init.zeros_(last.weight)
             nn.init.zeros_(last.bias)
+        if cfg.form == "gate":
+            self.gate = nn.Parameter(torch.zeros(1, n, 1, 1))
         if cfg.inject.startswith("s"):
             self.stage = int(cfg.inject[1]) - 1
             self.proj = nn.Conv2d(n, cfg.dims[self.stage], 1)
@@ -156,17 +161,21 @@ class KAIPos(nn.Module):
         self._core = [core]
         self.last_core = None
         self.ablate = False  # diagnostic: zero the injected tau (the output anchor of form "core" is kept)
-        if (cfg.form == "core" or cfg.inject != "none") and core is None:
+        # rollout training: the gradient of a later day's loss has to pass through the frozen core's input
+        # (c(x) = x + ...: without it the main path of forms "core" / "gate" is cut). Off = single-step training.
+        self.core_grad = False
+        self.uses_core = cfg.form in ("core", "gate") or cfg.inject != "none"
+        if self.uses_core and core is None:
             raise ValueError("this arm needs the frozen tendency core")
 
     def core_next(self, x, doy, tisr_next):
-        with torch.no_grad():
+        with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
             return self._core[0](x, doy, tisr_next)
 
     def forward(self, x, doy, tisr_next=None, core_state=None):
         """``core_state``: evaluate the core on this state instead of x (the open-loop diagnostic of ``rollout``)."""
         cfg, c, tau = self.cfg, None, None
-        if cfg.form == "core" or cfg.inject != "none":
+        if self.uses_core:
             xc = x if core_state is None else core_state
             c = self.core_next(xc, doy, tisr_next)
             tau = (c - xc) / self.s
@@ -182,6 +191,8 @@ class KAIPos(nn.Module):
         self.last_core = c
         if cfg.form == "full":
             return o
+        if cfg.form == "gate":
+            return o + self.gate * self.keep * (c - o)
         return (x if cfg.form == "res" else c) + o * self.s * self.keep
 
     def rollout(self, x0, doy0, steps, tisr=None, open_loop=False):

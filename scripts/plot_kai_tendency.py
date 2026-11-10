@@ -1,10 +1,11 @@
 """Figures of "where does the tendency core go in KAI" (scripts/run_kai_tendency.py --score).
 
-    python scripts/plot_kai_tendency.py runs/kaitend docs/kai_tendency
+    python scripts/plot_kai_tendency.py runs/kaitend docs/kai_tendency [tags to draw ...]
 fig_kai_lead.png      lead-time lines (normalized RMSE, z500, t850, t2m, q700 RMSE, z500 ACC), persistence dotted
 fig_kai_where.png     relative RMSE change vs KAI per channel x lead, one panel per position (x = not significant)
 fig_kai_scale.png     error power relative to KAI by zonal wavenumber band, and prediction / truth power
 fig_kai_effect.png    the core against its controls (out vs res / stack / seeds, blend controls), out vs res per channel
+fig_kai_bias.png      global-mean bias per lead (the core's drift)
 fig_kai_reliance.png  normalized RMSE of each position with tau, with tau = 0 and with the core open loop;
                       z500 small-scale power; the blend's KAI weight
 where_summary.json    the numbers behind the figures
@@ -35,21 +36,47 @@ STYLE = {"persistence": dict(color="k", ls=":", label="persistence"),
          "inout": dict(color="#ff7f0e", label="inout: out + tau at the input"),
          "stack": dict(color="#8c564b", label="stack: KAI(res) forecast + net (control of out)"),
          "blend": dict(color="#9467bd", lw=2, label="blend of KAI and core (no training)")}
+STYLE.update({
+    "core_gn": dict(color="#17becf", lw=2, label="core, no BatchNorm (gn)"),
+    "core_gn2": dict(color="#17becf", ls="--", label="core gn + 2 Heun steps per day"),
+    "core_gnk2": dict(color="#17becf", ls=":", label="core gn, rollout curriculum 1-2 days"),
+    "out_gn": dict(color="#e377c2", lw=2, label="out with core gn"),
+    "out_gn2": dict(color="#e377c2", ls="--", label="out with core gn2"),
+    "out_gnk2": dict(color="#e377c2", ls=":", label="out with core gnk2"),
+    "in_gn": dict(color="#1f77b4", ls=":", label="in with core gn"),
+    "kai_s1": dict(color="k", ls=":", lw=1, label="KAI original, seed 1"),
+    "kai_ro": dict(color="k", ls="-.", lw=1.5, label="KAI original + rollout fine-tuning"),
+    "blend_core_gn": dict(color="#9467bd", ls="--", label="blend of KAI and core gn"),
+    "blend_kai_s1": dict(color="#c5b0d5", lw=1.5, label="blend of two KAI seeds (control)"),
+    "loop_core_gn": dict(color="#bcbd22", lw=2, label="KAI and core gn mixed every step"),
+})
 BANDS = [(0, 0), (1, 3), (4, 9), (10, 20), (21, 32)]
+FALLBACK = ["#7f7f7f", "#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c49c94", "#f7b6d2", "#dbdb8d", "#9edae5"]
+
+
+def style(k, used={}):
+    """A style for any scored tag: the table above, else a fallback colour with the tag as label."""
+    if k in STYLE:
+        return dict(STYLE[k])
+    if k not in used:
+        used[k] = FALLBACK[len(used) % len(FALLBACK)]
+    return dict(color=used[k], lw=1, label=k)
 
 
 def bname(lo, hi):
     return f"k{lo}" if lo == hi else f"k{lo}-{hi}"
 
 
-def main(run, out):
+def main(run, out, only=None):
     os.makedirs(out, exist_ok=True)
     S = json.load(open(os.path.join(run, "score.json")))
     raw = np.load(os.path.join(run, "score_raw.npz"))
     names = S["channels"]
     L = S["leads"]
     days = np.arange(1, L + 1)
-    arms = [k for k in STYLE if k in S["arms"]]
+    arms = [k for k in STYLE if k in S["arms"]] + [k for k in S["arms"] if k not in STYLE and "~" not in k]
+    if only:
+        arms = [k for k in arms if k in only or k in ("persistence", "climatology")]
     summary = {"ics": S["ics"]}
 
     # ---- 1. lead lines
@@ -60,7 +87,7 @@ def main(run, out):
     for p, (key, ch, title) in zip(ax.flat, panels):
         for k in arms:
             v = np.array(S["arms"][k][key])
-            p.plot(days, v if ch is None else v[:, names.index(ch)], **STYLE[k])
+            p.plot(days, v if ch is None else v[:, names.index(ch)], **style(k))
         if key != "acc":  # a diverging rollout leaves the panel instead of flattening every other line
             v = np.array(S["arms"]["persistence"][key])
             p.set_ylim(0, 1.25 * float((v if ch is None else v[:, names.index(ch)]).max()))
@@ -77,8 +104,7 @@ def main(run, out):
     # ---- 2. where: each position vs KAI, relative RMSE change per channel x lead (paired bootstrap in score.json)
     rows = [i for i, n in enumerate(names) if n not in ("orog", "tisr")]
     P = S["paired_vs_kai"]
-    show = [k for k in ("core", "in", "s1", "s2", "s3", "s4", "res", "inres", "out", "inout", "stack", "blend",
-                        "kai_long") if k in P]
+    show = [k for k in arms if k in P and k != "persistence"]
     fig, ax = plt.subplots(1, len(show), figsize=(2.3 * len(show) + 1.5, 12), sharey=True)
     ax = np.atleast_1d(ax)
     for p, k in zip(ax, show):
@@ -117,7 +143,8 @@ def main(run, out):
 
     # ---- 3. scales: band error power relative to KAI (rows = variable, columns = band), prediction / truth power
     chans = ["z500", "t850", "u850", "q700"]
-    comp = [k for k in ("core", "in", "s2", "s4", "out", "inout", "blend", "kai_long") if f"{k}__sp_err" in raw]
+    comp = [k for k in arms if f"{k}__sp_err" in raw and k not in ("kai", "persistence", "climatology", "s1", "s3",
+                                                                    "s4", "res", "inres", "stack")][:9]
     fig, ax = plt.subplots(len(chans), len(BANDS), figsize=(3.3 * len(BANDS), 2.9 * len(chans)), sharex=True)
     sc = {}
     for i, ch in enumerate(chans):
@@ -126,7 +153,7 @@ def main(run, out):
             base = raw["kai__sp_err"][:, c, lo:hi + 1].sum(-1)
             for k in comp:
                 r = raw[f"{k}__sp_err"][:, c, lo:hi + 1].sum(-1) / base
-                ax[i, j].plot(days, r, **STYLE[k])
+                ax[i, j].plot(days, r, **style(k))
                 sc[f"{k}/{ch}/{bname(lo, hi)}"] = [round(float(r[q]), 3) for q in (0, 2, 4, L - 1)]
             ax[i, j].axhline(1, color="k", lw=0.6)
             ax[i, j].set_yscale("log")
@@ -153,7 +180,7 @@ def main(run, out):
     inj = [k for k in S["arms"] if f"{k}~notau" in S["arms"]]
     fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
     for k in inj:
-        st = dict(STYLE[k.split("_")[0]])
+        st = style(k)
         ax[0].plot(days, S["arms"][k]["nrmse"], **st)
         st.update(ls=":", label=None)
         ax[0].plot(days, S["arms"][f"{k}~notau"]["nrmse"], **st)
@@ -162,7 +189,7 @@ def main(run, out):
         if f"{k}~open" in S["arms"]:
             st.update(ls="--")
             ax[0].plot(days, S["arms"][f"{k}~open"]["nrmse"], **st)
-    ax[0].plot(days, S["arms"]["kai"]["nrmse"], **STYLE["kai"])
+    ax[0].plot(days, S["arms"]["kai"]["nrmse"], **style("kai"))
     ax[0].set_title("solid = trained coupling, dotted = tau zeroed, dashed = core open loop", fontsize=9)
     ax[0].set_ylabel("normalized RMSE")
     ax[0].set_ylim(0, 1.25 * max(S["arms"]["persistence"]["nrmse"]))
@@ -170,7 +197,7 @@ def main(run, out):
     c = names.index("z500")
     for k in ["kai"] + comp:
         r = raw[f"{k}__sp_pred"][:, c, 10:21].sum(-1) / raw[f"{k}__sp_true"][:, c, 10:21].sum(-1)
-        ax[1].plot(days, r, **STYLE[k])
+        ax[1].plot(days, r, **style(k))
     ax[1].axhline(1, color="k", lw=0.6)
     ax[1].set_title("z500 prediction / truth power, k10-20 (below 1 = smoothed)")
     if "blend_kai_weight" in S:
@@ -249,6 +276,29 @@ def main(run, out):
         fig.savefig(os.path.join(out, "fig_kai_effect.png"), dpi=140)
         plt.close(fig)
 
+    # ---- 6. the systematic part: IC-mean of the global-mean error per lead (units of the channel's std)
+    GB = S.get("global_bias", {})
+    if GB:
+        chs = ["z500", "z1000", "z50", "t850", "q700", "t2m"]
+        fig, ax = plt.subplots(1, len(chs), figsize=(3.4 * len(chs), 3.8))
+        for p, ch in zip(ax, chs):
+            c = names.index(ch)
+            for k in arms:
+                if k in GB and k not in ("persistence", "climatology"):
+                    p.plot(days, np.array(GB[k])[:, c], **style(k))
+            p.axhline(0, color="k", lw=0.6)
+            p.set_title(f"{ch}: global-mean bias (sigma)", fontsize=9)
+            p.set_xlabel("lead (days)")
+            p.grid(alpha=0.3)
+        ax[0].legend(fontsize=5.5)
+        fig.suptitle("Systematic drift: mean over ICs of the global-mean error")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out, "fig_kai_bias.png"), dpi=130)
+        plt.close(fig)
+        summary["global_bias_sigma_lead_1_3_5_10"] = {
+            k: {ch: [round(float(np.array(GB[k])[q, names.index(ch)]), 3) for q in (0, 2, 4, L - 1)] for ch in chs}
+            for k in GB if "~" not in k}
+
     summary["nrmse_lead_1_3_5_10"] = {k: [round(S["arms"][k]["nrmse"][q], 4) for q in (0, 2, 4, L - 1)] for k in S["arms"]}
     for n in ("z500", "t850", "t2m", "u850", "q700"):
         c = names.index(n)
@@ -261,4 +311,4 @@ def main(run, out):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main(sys.argv[1], sys.argv[2], sys.argv[3:] or None)  # optional: the tags to draw
