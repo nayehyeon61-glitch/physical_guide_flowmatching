@@ -1,12 +1,13 @@
 """Lead-time figure of the long-range arms (scripts/run_kai_tendency.py --score).
 
     python scripts/plot_kai_longrange.py runs/kaitend/score_La.json runs/kaitend/score_La_raw.npz out.png \
-        [--title "..."] tag[=label] tag[=label] ...
+        [--title "..."] tag[=label[=colour[=linestyle]]] ...
 
 Panels: normalized RMSE (65 channels), its change against KAI, anomaly correlation (65 channels), z500 ACC,
 z500 / t850 / t2m RMSE, z500 prediction / truth power at k1-9. Persistence and climatology are dotted.
 A tag that starts with ``blend`` is drawn dashed in the colour of the model that is blended with KAI, ``loop``
-(the two models mixed every step) dash-dotted.
+(the two models mixed every step) dash-dotted. Other combinations (seq_, cas_, three-way blends) take their
+label, colour and line style from the command line.
 """
 
 import json
@@ -22,14 +23,16 @@ INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
 COLOR = {"core_gn": "#2a78d6", "core_gn2": "#2a78d6",
          "hier_core_gn3+core_gn": "#eb6834",
          "hier_core_gn5+core_gn3+core_gn": "#1baf7a",
-         "core_gnk8": "#eda100", "core_gnh": "#1baf7a",
+         "core_gnk8": "#eda100", "core_gnh": "#1baf7a", "core_gnm": "#6250d6", "core_gnmk8": "#e87ba4",
          "hier_core_gn5+core_gn3+kai": "#e87ba4", "hier_core_gn3+kai": "#e87ba4",
          "hier_core_gn5+core_gn3+core_gnk8": "#6250d6", "hier_core_gn5w+core_gn3+core_gn": "#6250d6"}
 LABEL = {"kai": "KAI original", "kai_ro": "KAI + rollout fine-tuning",
          "core_gn": "daily core (1-day field, rollout 1-4 d)",
          "core_gn2": "daily core, 2 Heun steps per day",
          "core_gnk8": "daily core, rollout 1-8 d (learning extended)",
-         "core_gnh": "daily core + previous day as input (history)",
+         "core_gnh": "daily core + previous day as input (memory of 1 day)",
+         "core_gnm": "daily core + GRU memory (8 days before the IC)",
+         "core_gnmk8": "daily core + GRU memory, rollout 1-8 d",
          "hier_core_gn3+core_gn": "3-day field + daily core",
          "hier_core_gn5+core_gn3+core_gn": "5-day + 3-day field + daily core",
          "hier_core_gn3+kai": "3-day field + KAI for single days",
@@ -38,7 +41,16 @@ LABEL = {"kai": "KAI original", "kai_ro": "KAI + rollout fine-tuning",
          "hier_core_gn5w+core_gn3+core_gn": "wide 5-day + 3-day field + daily core"}
 
 
-def style(tag, label=None):
+def style(tag, label=None, color=None, ls=None):
+    st = _style(tag, label)
+    if color:
+        st["color"] = color
+    if ls:
+        st["ls"] = ls
+    return st
+
+
+def _style(tag, label=None):
     if tag == "persistence":
         return dict(color=MUTED, ls=":", lw=1.4, label="persistence")
     if tag == "climatology":
@@ -63,7 +75,7 @@ def main(argv):
     S = json.load(open(argv[0]))
     raw = np.load(argv[1])
     out = argv[2]
-    tags = [(t.split("=", 1) + [None])[:2] for t in argv[3:]]
+    tags = [(t.split("=") + [None] * 3)[:4] for t in argv[3:]]
     names, L, A = S["channels"], S["leads"], S["arms"]
     days = np.arange(1, L + 1)
     sc = [i for i, n in enumerate(names) if n not in ("orog", "tisr")]
@@ -98,10 +110,10 @@ def main(argv):
                     continue
                 st = style(k)
                 handles[st["label"]] = p.plot(days, fn(k), **st)[0]
-        for tag, lab in tags:
+        for tag, lab, col, ls in tags:
             if tag not in A or (tag == "kai" and "against KAI" in ttl):
                 continue
-            st = style(tag, lab)
+            st = style(tag, lab, col, ls)
             handles[st["label"]] = p.plot(days, fn(tag), **st)[0]
         if hline is not None:
             p.axhline(hline, color=INK, lw=0.8)
@@ -121,7 +133,7 @@ def main(argv):
     fig.tight_layout(rect=(0, 0.035 + 0.028 * ((len(handles) + 2) // 3), 1, 0.96))
     fig.savefig(out, dpi=150, facecolor=SURFACE)
     print("wrote", out)
-    for tag, _ in tags:  # the table behind the figure
+    for tag, *_ in tags:  # the table behind the figure
         if tag in A:
             print(f"{tag:42s} nrmse", "/".join(f"{A[tag]['nrmse'][q]:.3f}" for q in (0, 2, 4, 6, L - 1)),
                   " acc", "/".join(f"{acc_mean(tag)[q]:.3f}" for q in (0, 2, 4, 6, L - 1)),
