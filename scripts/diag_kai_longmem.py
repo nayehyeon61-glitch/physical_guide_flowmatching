@@ -8,17 +8,21 @@ Owner (2026-11-11): the memory should hold the past of 3 to 5 days for certain. 
 used. For a trained core and every IC day d of the year:
 
   target      E_L(d) = (x_{d+L} - forecast of day d + L started from d) / s      L = the leads (free rollout)
-  known at d  r_{d-1}  = the one-step residual of the forecast valid at d (yesterday's innovation)
+  known at d  a_d      = (x_d - climatology of the day) / s                    (the present state's anomaly)
+              r_{d-1}  = the one-step residual of the forecast valid at d (yesterday's innovation)
               b_{d-1}  = (x_d - x_{d-1}) / s                                   (yesterday's trend)
-              A_tau, B_tau = the same two ACCUMULATED over the past with the kernel exp(-age / tau):
+              A_tau, B_tau = the last two ACCUMULATED over the past with the kernel exp(-age / tau):
                              A_tau(d) = lam A_tau(d-1) + (1 - lam) r_{d-1}, lam = exp(-1 / tau)
 
 and the fraction of the variance of E_L that a linear combination of the predictors explains, per channel
-(pooled over the points and the ICs, cos-lat weighted, same grid point and channel, in sample), for the nested
-sets  [yesterday]  ->  [+ accumulated over tau_1]  ->  [+ accumulated over tau_2] ...
-The increase from the first set to the last is the (linear, pointwise) information of the accumulated past that a
-one-day memory cannot have. A conv net can use more than this (other channels, neighbours, nonlinear), so it is
-a lower bound of what is there, not of what a structure will find.
+(pooled over the points and the ICs, cos-lat weighted, same grid point and channel, in sample), for nested sets:
+  by time scale  [state + yesterday]  ->  [+ accumulated over tau_1]  ->  [+ accumulated over tau_2] ...
+  by kind        [state + yesterday]  ->  [+ accumulated innovations]  ->  [+ accumulated trends]
+The increase from the first set to the last is the (linear, pointwise) information of the accumulated past that
+neither the present state nor a one-day memory has. The present state's anomaly is in the first set because the
+accumulated trend is the state minus its recent mean: without it a damping error (error proportional to the
+anomaly) would be counted as memory. A conv net can use more than this (other channels, neighbours, nonlinear),
+so it is a lower bound of what is there, not of what a structure will find.
 """
 
 import argparse
@@ -47,7 +51,7 @@ def main(argv=None):
     a0, rest = p.parse_known_args(argv)
     a = R.parser().parse_args(rest)
     torch.set_num_threads(a0.threads)
-    mean, std, inc, _ = R.stats(a)
+    mean, std, inc, clim = R.stats(a)
     x = R.load_years(a, [a0.year])[a0.year]
     lat = R.lat_of(os.path.join(a.data, f"{a0.year}.nc"))
     contract.register_latitudes(lat)
@@ -64,6 +68,7 @@ def main(argv=None):
     T, Lmax = len(xz), max(a0.leads)
     xs = xz[:, dyn][:, sc]
     trend = (xs[1:] - xs[:-1]) / s  # trend[t] = x_{t+1} - x_t
+    anom = (xs - torch.from_numpy(R.zscore(clim[:T], mean, std))[:, dyn][:, sc]) / s  # from the training climatology
     out = dict(leads=a0.leads, taus=a0.taus, year=a0.year, cores={})
 
     def hist(core, j):
@@ -106,21 +111,25 @@ def main(argv=None):
                 tru = torch.stack([xz[j + k + 1][:, dyn] for k in range(Lmax)], 1)
                 err.append((tru - y)[:, :, sc] / s.unsqueeze(1))
         err = torch.cat(err)  # (N, Lmax, 65, H, W)
-        Z = [r[ics - 1 - i0], trend[ics - 1]]  # yesterday's innovation and trend
-        for tau in a0.taus:
-            Z += [Ar[tau][ics], Bt[tau][ics]]
+        base = [anom[ics], r[ics - 1 - i0], trend[ics - 1]]  # the present state, yesterday's innovation and trend
+        orders = {"time scale": (sum(([Ar[t][ics], Bt[t][ics]] for t in a0.taus), []), 2,
+                                 [f"+ {t:g} d acc." for t in a0.taus]),
+                  "kind": ([Ar[t][ics] for t in a0.taus] + [Bt[t][ics] for t in a0.taus], len(a0.taus),
+                           ["+ acc. innov.", "+ acc. trend"])}
         ww = w.expand(len(ics), 1, -1, 1)
         rows = {}
         print(f"\n{tag}: {len(ics)} ICs of {a0.year}; explained % of the lead-L forecast error by the past known at the IC")
-        head = ["yesterday"] + [f"+ {t:g} d acc." for t in a0.taus]
-        print("    lead  group    " + " ".join(f"{h:>12s}" for h in head) + "   gain of the accumulated past")
-        for L in a0.leads:
-            r2 = explained(err[:, L - 1], Z, ww)  # (len(Z), 65): the first m predictors
-            sets = r2[1::2]  # after [yesterday], [+ tau_1], [+ tau_2] ...
-            rows[L] = sets.tolist()
-            for g, c in [("all", list(range(len(nm))))] + list(groups.items()):
-                v = 100 * sets[:, c].mean(1)
-                print(f"    {L:4d}  {g:8s} " + " ".join(f"{q:12.2f}" for q in v) + f"   {v[-1] - v[0]:+.2f}")
+        for name, (extra, step, cols) in orders.items():
+            head = ["state + yday"] + cols
+            print(f"  nested by {name}")
+            print("    lead  group    " + " ".join(f"{h:>13s}" for h in head) + "   gain of the accumulated past")
+            for L in a0.leads:
+                r2 = explained(err[:, L - 1], base + extra, ww)  # (n predictors, 65): the first m predictors
+                sets = r2[len(base) - 1::step]  # after the base set, then after every group of ``step`` predictors
+                rows[f"{name}/{L}"] = sets.tolist()
+                for g, c in [("all", list(range(len(nm))))] + list(groups.items()):
+                    v = 100 * sets[:, c].mean(1)
+                    print(f"    {L:4d}  {g:8s} " + " ".join(f"{q:13.2f}" for q in v) + f"   {v[-1] - v[0]:+.2f}")
         out["cores"][tag] = dict(ics=int(len(ics)), r2=rows, names=nm)
     with open(os.path.join(a.out, "diag_longmem.json"), "w") as fh:
         json.dump(out, fh)
