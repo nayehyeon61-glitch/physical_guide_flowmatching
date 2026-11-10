@@ -164,9 +164,10 @@ def _mem_core_class():
     class MemCore(DynCore):
         hist = True  # the caller has to hand over the past
 
-        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False):
+        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False, nomem=False):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
+            self.nomem = bool(nomem)  # control: the same sequence training, the memory state stays zero
             ng = N_GFEAT if cfg.gfeat else 0
             self.net = Net(N_DYN + mem_ch + static.shape[0] + 4 + ng, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
             self.enc = nn.Conv2d((3 if mz else 2) * N_DYN + 2 * ng, mem_ch, 1)
@@ -196,6 +197,9 @@ def _mem_core_class():
             self.seq = torch.stack(out, 1)
 
         def remember(self, x):
+            if self.nomem:
+                self.m, self.prev = x.new_zeros(x.shape[0], self.mem_ch, *x.shape[-2:]), x
+                return
             trend = torch.zeros_like(x) if self.prev is None else (x - self.prev) / self.t6 * self.keep
             parts = [x, trend]
             if self.mz:  # the innovation: zero at the start of a sequence and on the core's own states
@@ -229,7 +233,8 @@ def _mem_core_class():
 
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
-              hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False):
+              hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
+              nomem: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -238,6 +243,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     field extended to its history: the previous state enters as the observed trend (_hist_core_class).
     ``mem`` = W > 0: the memory core (_mem_core_class), a ConvGRU state of ``mem_ch`` channels warmed up on the
     W days before the IC; ``mz`` = its Mori-Zwanzig sequence form (innovation input, forecasts of the sequence).
+    ``nomem`` (with mem and mz) = the control of the memory term: the same sequence training with a zero memory.
     ``gfeat`` = the physical terms: the operator's tendency G(x) as 48 input channels (step 18); the caller attaches
     ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well."""
     from .dyncore import DynCore, DynCoreConfig
@@ -247,7 +253,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
                         gfeat=gfeat)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
-        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz)
+        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem)
     else:
         core = (_hist_core_class() if hist else DynCore)(*args)
     if norm == "gn":

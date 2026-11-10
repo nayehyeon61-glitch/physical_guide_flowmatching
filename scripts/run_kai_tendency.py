@@ -122,6 +122,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         opts.update(mem=a.core_mem, mem_ch=a.core_mem_ch)
         if a.core_mz:
             opts["mz"] = True
+        if a.core_nomem:
+            opts["nomem"] = True
     if a.core_gfeat:
         opts["gfeat"] = True
     ck = None
@@ -757,6 +759,9 @@ def parser():
                    help="memory core in the Mori-Zwanzig sequence form: the --core-mem days are forecast one by one "
                         "from an empty memory (sequence loss on all of them + the rollout), the forecast errors "
                         "(innovations) feed the memory")
+    p.add_argument("--core-nomem", action="store_true",
+                   help="control of the memory term: the sequence training of --core-mz with the memory state held at "
+                        "zero (a Markov core that gets the same forecasts of the sequence in its loss)")
     p.add_argument("--mz-orth", type=float, default=1.0,
                    help="--core-mz: weight of the orthogonality term (squared lag-1 and lag-2 correlation of the "
                         "sequence's one-step residuals); 0 = off")
