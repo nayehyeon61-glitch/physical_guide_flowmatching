@@ -385,6 +385,32 @@ def score(a, tags):
             keep[name] = pred
         del pred
         print("scored", name, flush=True)
+    done = set()
+
+    def run_cascades():
+        """--cascade A>B@n: A's forecast up to day n, then B started from A's day-n state (a position in time)."""
+        for spec in a.cascade:
+            ab, n = spec.rsplit("@", 1)
+            ta, tb = ab.split(">")
+            if spec in done or ta not in fns or tb not in fns:
+                continue
+            done.add(spec)
+
+            def cas_fn(x0, doy, tis, pv=None, fa=fns[ta], fb=fns[tb], n=int(n)):
+                ya = fa(x0, doy, tis, pv)
+                ts = torch.cat([tis[:, n:], tis[:, -1:].expand(-1, n, -1, -1)], 1)  # padded: only L - n days are used
+                yb = fb(ya[:, n - 1], doy + n, ts, ya[:, n - 2] if n >= 2 else x0)
+                return torch.cat([ya[:, :n], yb[:, :L - n]], 1)
+            name = f"cas_{spec}"
+            fns[name] = cas_fn
+            pred = rollout(cas_fn, tez, ics)
+            res[name] = metrics(pred)
+            if name in a.blend_with:
+                keep[name] = pred
+            del pred
+            print("scored", name, flush=True)
+
+    run_cascades()
     # output-level position without training: lead-wise blend of a KAI (``--blend-bases``) with a core or another
     # scored tag, weights from the validation year. Names: blend / blend_<other>, with @<base> if base != kai.
     bases = [b for b in a.blend_bases if b in keep]
@@ -419,10 +445,40 @@ def score(a, tags):
                         out.append(x)
                     return torch.stack(out, 1)
                 lname = ("loop" if other == "core" else f"loop_{other}") + sfx
+                fns[lname] = loop_fn
                 res[lname] = metrics(rollout(loop_fn, tez, ics))
                 res[lname]["kai_weight"] = np.repeat(wk[:1], L, 0)
                 print("scored", lname, flush=True)
+        for combo in a.blend_multi:  # KAI with two others: weights >= 0, sum 1, per lead and channel
+            oth = combo.split("+")
+            if len(oth) != 2 or not all(o in keep for o in oth):
+                continue
+            avg = lambda f: (f * w).mean((0, -2, -1)).astype(np.float64)  # noqa: E731  (L, 67)
+            r = vtruth - vk
+            d1 = rollout(fns[oth[0]], vaz, vics) - vk
+            d2 = rollout(fns[oth[1]], vaz, vics) - vk
+            b1, b2, g11, g22, g12 = avg(d1 * r), avg(d2 * r), avg(d1 * d1), avg(d2 * d2), avg(d1 * d2)
+            del r, d1, d2
+            eps = 1e-30
+            det = g11 * g22 - g12 ** 2
+            full = np.stack([(b1 * g22 - b2 * g12) / np.maximum(det, eps), (b2 * g11 - b1 * g12) / np.maximum(det, eps)])
+            ok = (full >= 0).all(0) & (full.sum(0) <= 1) & (det > eps)
+            t = np.clip((b1 - b2 - g12 + g22) / np.maximum(g11 - 2 * g12 + g22, eps), 0, 1)
+            z = np.zeros_like(b1)
+            cands = [np.stack([z, z]), np.stack([np.clip(b1 / np.maximum(g11, eps), 0, 1), z]),
+                     np.stack([z, np.clip(b2 / np.maximum(g22, eps), 0, 1)]), np.stack([t, 1 - t]),
+                     np.where(ok, full, 0.0)]  # the optimum of a convex problem on a triangle: inside or on an edge
+            cost = np.stack([-2 * (c[0] * b1 + c[1] * b2) + c[0] ** 2 * g11 + c[1] ** 2 * g22 + 2 * c[0] * c[1] * g12
+                             for c in cands])
+            best = np.take_along_axis(np.stack(cands), cost.argmin(0)[None, None], 0)[0].astype(np.float32)  # (2, L, 67)
+            w1, w2 = (x[None, :, :, None, None] for x in best)
+            name = f"blend_{combo}" + sfx
+            res[name] = metrics(keep[bt] + w1 * (keep[oth[0]] - keep[bt]) + w2 * (keep[oth[1]] - keep[bt]))
+            res[name]["kai_weight"] = 1 - best.sum(0)
+            res[name]["other_weights"] = best
+            print("scored", name, flush=True)
         del vk
+    run_cascades()
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
     summarize(a, res, std, ics)
@@ -524,6 +580,11 @@ def main(argv=None):
     p.add_argument("--init", default=None, help="position arms: start from this checkpoint tag (fine-tuning)")
     p.add_argument("--gate-lr", type=float, default=1e-2, help="arm gate: learning rate of the 67 mixing weights")
     p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
+    p.add_argument("--blend-multi", nargs="*", default=[],
+                   help="A+B: three-way blend of the base KAI with two kept forecasts (e.g. a short- and a long-range core)")
+    p.add_argument("--cascade", nargs="*", default=[],
+                   help="A>B@n: forecast function A up to day n, then B from A's day-n state; scored as cas_A>B@n "
+                        "(A, B: core tags, position tags, loop_<core>)")
     p.add_argument("--blend-bases", nargs="*", default=["kai"],
                    help="scored KAI tags that are blended with the cores / --blend-with tags")
     p.add_argument("--loop-blend", nargs="*", default=[],

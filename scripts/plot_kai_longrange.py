@@ -5,7 +5,8 @@
 
 Panels: normalized RMSE (65 channels), its change against KAI, anomaly correlation (65 channels), z500 ACC,
 z500 / t850 / t2m RMSE, z500 prediction / truth power at k1-9. Persistence and climatology are dotted.
-A tag that starts with ``blend`` is drawn dashed in the colour of the model that is blended with KAI.
+A tag that starts with ``blend`` is drawn dashed in the colour of the model that is blended with KAI, ``loop``
+(the two models mixed every step) dash-dotted.
 """
 
 import json
@@ -21,13 +22,14 @@ INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
 COLOR = {"core_gn": "#2a78d6", "core_gn2": "#2a78d6",
          "hier_core_gn3+core_gn": "#eb6834",
          "hier_core_gn5+core_gn3+core_gn": "#1baf7a",
-         "core_gnk8": "#eda100",
+         "core_gnk8": "#eda100", "core_gnh": "#1baf7a",
          "hier_core_gn5+core_gn3+kai": "#e87ba4", "hier_core_gn3+kai": "#e87ba4",
          "hier_core_gn5+core_gn3+core_gnk8": "#6250d6", "hier_core_gn5w+core_gn3+core_gn": "#6250d6"}
 LABEL = {"kai": "KAI original", "kai_ro": "KAI + rollout fine-tuning",
          "core_gn": "daily core (1-day field, rollout 1-4 d)",
          "core_gn2": "daily core, 2 Heun steps per day",
          "core_gnk8": "daily core, rollout 1-8 d (learning extended)",
+         "core_gnh": "daily core + previous day as input (history)",
          "hier_core_gn3+core_gn": "3-day field + daily core",
          "hier_core_gn5+core_gn3+core_gn": "5-day + 3-day field + daily core",
          "hier_core_gn3+kai": "3-day field + KAI for single days",
@@ -48,7 +50,8 @@ def style(tag, label=None):
     model = base.split("_", 1)[1] if blend else base
     lab = label or (("KAI blended with: " if base.startswith("blend_") else "KAI mixed every step with: ")
                     + LABEL.get(model, model) if blend else LABEL.get(model, model))
-    return dict(color=COLOR.get(model, "#e34948"), lw=2, ls="--" if blend else "-", label=lab)
+    ls = "--" if base.startswith("blend_") else "-." if blend else "-"
+    return dict(color=COLOR.get(model, "#e34948"), lw=2, ls=ls, label=lab)
 
 
 def main(argv):
