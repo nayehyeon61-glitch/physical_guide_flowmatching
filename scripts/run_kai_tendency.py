@@ -102,16 +102,23 @@ def zscore(x, mean, std):
     return ((x - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)).astype(np.float32)
 
 
-def build_core(a, mean, std, inc, lat, load=True):
+def build_core(a, mean, std, inc, lat, load=True, tag=None):
+    """The tendency core ``tag`` (default --core-tag): built from the options saved in its checkpoint, frozen.
+    ``load=False``: a new core from the command line options (training)."""
     import xarray as xr
     from pgcfm.core import static_features
     with xr.open_dataset(os.path.join(a.era5, "constants", "constants_5.625deg.nc")) as d:
         oro, lsm, lon = d["orography"].values.astype(np.float32), d["lsm"].values.astype(np.float32), d["lon"].values
         assert np.allclose(d["lat"].values, lat)
     contract.register_latitudes(lat)
-    core = make_core(static_features(lat, lon, oro, lsm), inc, mean, std, lat, a.core_hidden, a.core_blocks)
+    opts = dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm=a.core_norm, substeps=a.core_substeps)
+    ck = None
     if load:
-        ck = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
+        ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
+        opts = ck.get("core_opts", dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm="bn", substeps=1))
+    core = make_core(static_features(lat, lon, oro, lsm), inc, mean, std, lat, **opts)
+    core.opts = opts
+    if load:
         core.load_state_dict(ck["state"])
         core.eval()
         for p in core.parameters():
@@ -193,7 +200,10 @@ def train(a, arm):
         x, tg, doy = batch(K)
         if is_core:
             y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR])
-            loss = ((((y - tg[:, :, dyn]) / s_dyn) ** 2) * wl).mean()
+            err = (y - tg[:, :, dyn]) / s_dyn
+            loss = ((err ** 2) * wl).mean()
+            if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
+                loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
         else:
             loss = lp(m(x, doy, tg[:, 0, TISR]), tg[:, 0])
         opt.zero_grad()
@@ -205,6 +215,7 @@ def train(a, arm):
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
             print(json.dumps(log[-1]), flush=True)
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
+                    core_opts=getattr(m, "opts", None),
                     params=sum(p.numel() for p in m.parameters()), train_seconds=time.time() - t0),
                os.path.join(a.out, f"{a.tag or arm}.pt"))
 
@@ -219,8 +230,12 @@ def score(a, tags):
     L = a.leads
     sd = (std + EPS).astype(np.float32)[None, None, :, None, None]
     mn = mean.astype(np.float32)[None, None, :, None, None]
-    core = build_core(a, mean, std, inc, lat)
-    dyn = torch.tensor(DYN)
+    cores, dyn = {}, torch.tensor(DYN)
+
+    def get_core(tag):
+        if tag not in cores:
+            cores[tag] = build_core(a, mean, std, inc, lat, tag=tag)
+        return cores[tag]
 
     def setup(year_x):
         ics = np.arange(0, len(year_x) - L, a.ic_stride)
@@ -235,13 +250,17 @@ def score(a, tags):
                 out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis).numpy())
         return (np.concatenate(out) * sd + mn).astype(np.float32)
 
-    def core_fn(x0, doy, tis):
-        y = core_rollout(core, x0[:, dyn], doy, L, tis)
-        return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
+    def core_fn(tag):
+        def fn(x0, doy, tis):
+            y = core_rollout(get_core(tag), x0[:, dyn], doy, L, tis)
+            return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
+        return fn
 
-    def load(tag):
+    def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with
         ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location="cpu", weights_only=False)
-        m = build(a, tag.split("_")[0], inc, core)
+        arm = tag.split("_")[0]
+        core = get_core(ck["args"].get("core_tag", "core")) if needs_core(arm) and arm != "stack" else None
+        m = build(a, arm, inc, core)
         missing = m.load_state_dict(ck["state"], strict=False)
         assert set(missing.missing_keys) <= {"dyn"} and not missing.unexpected_keys, missing
         m.eval()
@@ -254,6 +273,8 @@ def score(a, tags):
     def metrics(pred, spectra=True):
         err = pred - truth
         out = dict(mse=(err ** 2 * w).mean((-2, -1)).astype(np.float32))  # (N, L, 67)
+        # systematic part: the IC-mean of the global-mean error, in units of the channel's std (L, 67)
+        out["gbias"] = ((err * w).mean((-2, -1)).mean(0) / (std + EPS)).astype(np.float32)
         pa, ta = pred - cl, truth - cl
         out["acc"] = ((pa * ta * w).sum((-2, -1))
                       / np.sqrt((pa ** 2 * w).sum((-2, -1)) * (ta ** 2 * w).sum((-2, -1)) + 1e-30)).astype(np.float32)
@@ -264,11 +285,14 @@ def score(a, tags):
 
     res["persistence"] = metrics(np.repeat(te[ics][:, None], L, 1))
     res["climatology"] = metrics(cl.astype(np.float32))
-    p_core = rollout(core_fn, tez, ics)
-    res["core"] = metrics(p_core)
-    ckc = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
-    res["core"].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
-    keep = {"core": p_core}  # test forecasts kept for the blends
+    keep = {}  # test forecasts kept for the blends
+    core_tags = a.score_cores if a.score_cores is not None else [a.core_tag]
+    for ct in core_tags:
+        keep[ct] = rollout(core_fn(ct), tez, ics)
+        res[ct] = metrics(keep[ct])
+        ckc = torch.load(os.path.join(a.out, f"{ct}.pt"), map_location="cpu", weights_only=False)
+        res[ct].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
+        print("scored", ct, flush=True)
     for tag in tags:
         m, ck = load(tag)
         pred = rollout(lambda x, d, t: m.rollout(x, d, L, t), tez, ics)
@@ -289,9 +313,9 @@ def score(a, tags):
         vics, vaz, vtruth = setup(va)
         kai_m, _ = load("kai")
         vk = rollout(lambda x, d, t: kai_m.rollout(x, d, L, t), vaz, vics)
-        for other in ["core"] + [t for t in a.blend_with if t in keep]:
-            if other == "core":
-                vc = rollout(core_fn, vaz, vics)
+        for other in core_tags + [t for t in a.blend_with if t in keep and t not in core_tags]:
+            if other in core_tags:
+                vc = rollout(core_fn(other), vaz, vics)
             else:
                 om, _ = load(other)
                 vc = rollout(lambda x, d, t: om.rollout(x, d, L, t), vaz, vics)
@@ -325,6 +349,7 @@ def summarize(a, res, std, ics):
         out["arms"][k] = e
     if "blend" in res:
         out["blend_kai_weight"] = res["blend"]["kai_weight"].tolist()
+    out["global_bias"] = {k: d["gbias"].tolist() for k, d in res.items() if "gbias" in d}
     # paired bootstrap over ICs of the RMSE change vs kai: per channel and lead, and for the 65-channel mean
     if "kai" in res:
         base = res["kai"]["mse"]
@@ -402,13 +427,21 @@ def main(argv=None):
     p.add_argument("--blend-with", nargs="*", default=["res", "kai_s1"],
                    help="extra blends of kai with these scored tags (controls of the kai + core blend)")
     p.add_argument("--pairs", nargs="*", default=["out:res", "out_s1:res_s1", "out:res_s1", "out_s1:res", "out:stack",
-                                                  "out:kai_long", "out:core", "res:kai", "kai_s1:kai", "out_s1:out",
+                                                  "out:kai_long", "out:core", "res:kai", "core_gn:core", "core_gn2:core_gn",
+                                                  "core_gnzm:core_gn", "core_gn:kai", "core_gn2:kai", "out_gn:out",
+                                                  "out_gn:res", "out_gn:kai", "out_gn2:out_gn", "out_gn2:kai",
+                                                  "out_gn:kai_long", "out_gn2:kai_long", "in_gn:kai", "in_gn:in", "kai_s1:kai", "out_s1:out",
                                                   "res_s1:res", "blend:blend_res", "blend:blend_kai_s1", "inout:out",
                                                   "inres:res", "stack:res"],
                    help="extra paired comparisons a:b (RMSE of a relative to b)")
     p.add_argument("--core-hidden", type=int, default=48)
     p.add_argument("--core-blocks", type=int, nargs="+", default=[2, 2])
     p.add_argument("--core-lr", type=float, default=4e-4)
+    p.add_argument("--core-norm", default="bn", choices=["bn", "gn"],
+                   help="bn = ClimODE's block as it is; gn = GroupNorm, no dropout (no train / inference mismatch)")
+    p.add_argument("--core-substeps", type=int, default=1, help="Heun steps per day")
+    p.add_argument("--core-zm", type=float, default=0.0, help="weight of a zonal-mean error term in the core loss")
+    p.add_argument("--score-cores", nargs="*", default=None, help="core tags to score alone (default: --core-tag)")
     p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 3, 4], help="core rollout days")
     p.add_argument("--leads", type=int, default=10)
     p.add_argument("--ic-stride", type=int, default=3)

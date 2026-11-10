@@ -56,12 +56,38 @@ def needs_core(arm: str) -> bool:
 
 
 # ------------------------------------------------------------------------------------- the tendency core
+def stateless_norm(module: nn.Module) -> nn.Module:
+    """Replace every BatchNorm2d by GroupNorm(1, C) and switch Dropout off, in place.
+
+    ClimODE's ResidualBlock (the core's trunk) has BatchNorm + Dropout(0.1). Trained with batch statistics
+    and run with running statistics, the core's tendency gets a systematic offset that a rollout integrates:
+    on 2017 the global mean of z500 drifts by -0.14 sigma in 10 days (z1000 -0.47, q700 +0.29) with running
+    statistics and by +0.004 with batch statistics, same weights (docs/kai_tendency.md). GroupNorm has no
+    batch statistics, so the trained and the deployed function are the same."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            setattr(module, name, nn.GroupNorm(1, child.num_features))
+        elif isinstance(child, nn.Dropout):
+            setattr(module, name, nn.Identity())
+        else:
+            stateless_norm(child)
+    return module
+
+
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
-              hidden: int = 48, blocks=(2, 2)):
-    """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day."""
+              hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1):
+    """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
+
+    ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
+    per day (DynCore's dt_hours, in units of its nominal 6 h step)."""
     from .dyncore import DynCore, DynCoreConfig
-    cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0, solver="heun", positive=True)
-    return DynCore(cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
+    cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True)
+    core = DynCore(cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
+    if norm == "gn":
+        stateless_norm(core.net)
+    elif norm != "bn":
+        raise ValueError(norm)
+    return core
 
 
 def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:
@@ -176,5 +202,5 @@ def config_dict(cfg) -> dict:
     return asdict(cfg)
 
 
-__all__ = ["ARMS", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "core_step", "core_rollout", "needs_core",
+__all__ = ["ARMS", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "stateless_norm", "core_step", "core_rollout", "needs_core",
            "config_dict", "TISR", "OROG", "DYN", "TISR_DYN"]
