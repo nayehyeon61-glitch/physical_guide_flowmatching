@@ -120,6 +120,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         opts["hist"] = True
     if a.core_mem:
         opts.update(mem=a.core_mem, mem_ch=a.core_mem_ch)
+        if a.core_mz:
+            opts["mz"] = True
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -175,6 +177,9 @@ def train(a, arm):
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1)
+        scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR])  # the 65 scored channels among the 66
+        keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1)
+        orth_log = None
         wl = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
         wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
     else:
@@ -237,7 +242,26 @@ def train(a, arm):
         if is_core:
             y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
-            loss = ((err ** 2) * wl).mean()
+            if getattr(m, "mz", False):
+                # Mori-Zwanzig form on the sequence: the W days before the batch's start are forecast one by one
+                # (first from an empty memory = the Markov term, then with the memory integral up to that day)
+                # and enter the loss with the rollout; W + K supervised positions
+                seq_true = torch.cat([pdyn(prev[0])[:, 1:], x[:, None, dyn]], 1)
+                es = (m.seq - seq_true) / s_dyn
+                loss = ((torch.cat([es, err], 1) ** 2) * wl).mean()
+                # the noise term is orthogonal to the past: consecutive one-step residuals of the sequence (the W
+                # forecasts and the first rollout day, all started from data) must not be correlated at lag 1, 2
+                r = torch.cat([es, err[:, :1]], 1) * keep_dyn
+                orth = []
+                for lag in (1, 2):
+                    u, v = r[:, lag:], r[:, :-lag]
+                    c = (u * v * wl).sum((-2, -1)) / torch.sqrt((u ** 2 * wl).sum((-2, -1)) * (v ** 2 * wl).sum((-2, -1)) + 1e-12)
+                    orth.append(c.mean((0, 1)))  # (66,): mean over the batch and the pairs of the sequence
+                orth_log = [float(o.detach()[scd].mean()) for o in orth]
+                if a.mz_orth > 0:
+                    loss = loss + a.mz_orth * sum((o[scd] ** 2).mean() for o in orth)
+            else:
+                loss = ((err ** 2) * wl).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
         elif K == 1:
@@ -252,6 +276,8 @@ def train(a, arm):
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
+            if is_core and orth_log is not None:  # residual correlation at lag 1, 2 in the last batch's sequences
+                log[-1]["res_corr"] = [round(o, 4) for o in orth_log]
             print(json.dumps(log[-1]), flush=True)
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
                     core_opts=getattr(m, "opts", None),
@@ -649,7 +675,7 @@ def summarize(a, res, std, ics):
               " acc", "/".join(f"{e['acc_mean'][q]:.3f}" for q in ls))
 
 
-def main(argv=None):
+def parser():
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/era5_5p625/kai6h")
     p.add_argument("--era5", default="data/era5_5p625/era5_data", help="constants (orography, lsm) for the core")
@@ -711,6 +737,13 @@ def main(argv=None):
                    help="memory core (Mori-Zwanzig memory term as a ConvGRU state): days before the IC that warm "
                         "the memory up; 0 = off")
     p.add_argument("--core-mem-ch", type=int, default=24, help="channels of the memory state")
+    p.add_argument("--core-mz", action="store_true",
+                   help="memory core in the Mori-Zwanzig sequence form: the --core-mem days are forecast one by one "
+                        "from an empty memory (sequence loss on all of them + the rollout), the forecast errors "
+                        "(innovations) feed the memory")
+    p.add_argument("--mz-orth", type=float, default=1.0,
+                   help="--core-mz: weight of the orthogonality term (squared lag-1 and lag-2 correlation of the "
+                        "sequence's one-step residuals); 0 = off")
     p.add_argument("--mem-warm", type=int, nargs="*", default=[],
                    help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
     p.add_argument("--mem-freeze", action="store_true",
@@ -731,7 +764,11 @@ def main(argv=None):
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
-    a = p.parse_args(argv)
+    return p
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
     torch.set_num_threads(a.threads)
     os.makedirs(a.out, exist_ok=True)
     if a.arm:

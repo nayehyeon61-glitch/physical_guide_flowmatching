@@ -144,32 +144,58 @@ def _mem_core_class():
     m_t = GRU(m_{t-1}, [x_t, (x_t - x_{t-1}) / s]), and enters both Heun evaluations of the step as input.
     ``reset(history)`` runs the GRU over the W days before the IC (data); in the rollout it goes on with the
     core's own states. The Markov core is the case m = const, the history core (one lag) the case W = 1
-    without recurrence (cf. the LSTM memory closures of Ma, Wang & E 2018 and Wang, Ripamonti & Hesthaven 2020)."""
+    without recurrence (cf. the LSTM memory closures of Ma, Wang & E 2018 and Wang, Ripamonti & Hesthaven 2020).
+
+    ``mz`` = the Mori-Zwanzig form on a sequence (owner, 2026-11-10: the loss has to be taken over a sequence in the
+    form of the equation, not on single terms). The W days before the IC are not only read: the memory starts
+    EMPTY at the first day of the sequence (the memory integral runs from 0 to t), every day of the sequence is
+    forecast from the day before with the memory of the days up to it (the first forecast is the Markov term
+    alone), and the error of each forecast, the innovation e_t = (x_t - forecast of x_t) / s, is the third input
+    of the memory: m_t = GRU(m_{t-1}, [x_t, trend_t, e_t]) (the memory term is what the past forecasts missed).
+    ``reset`` keeps these W forecasts in ``seq`` for the sequence loss (scripts/run_kai_tendency.py); in the free
+    rollout the state is the core's own forecast, so e = 0."""
     from .dyncore import DynCore, Net, _NetCfg, N_DYN
     from .core import time_features
 
     class MemCore(DynCore):
         hist = True  # the caller has to hand over the past
 
-        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24):
+        def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
-            self.mem, self.mem_ch = int(mem), int(mem_ch)
+            self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
             self.net = Net(N_DYN + mem_ch + static.shape[0] + 4, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
-            self.enc = nn.Conv2d(2 * N_DYN, mem_ch, 1)
+            self.enc = nn.Conv2d((3 if mz else 2) * N_DYN, mem_ch, 1)
             self.gru = ConvGRUCell(mem_ch, mem_ch)
             self.m, self.prev, self.started = None, None, False
+            self.fc, self.seq = None, None  # mz: the forecast of the next state; the forecasts of the sequence
             self.freeze_mem = False  # diagnostic: no update of the memory after the IC (the rollout's own states)
 
-        def reset(self, history=None):
-            """history (B, W, 66, H, W): the states before the IC, oldest first; None = an empty memory."""
-            self.m, self.prev, self.started = None, None, False
-            if history is not None:
-                for k in range(history.shape[1]):
+        def reset(self, history=None, hours0=None, x0=None):
+            """history (B, W, 66, H, W): the states before the IC, oldest first; None = an empty memory.
+            mz: ``hours0`` (B,) = the IC's time, ``x0`` = the IC (its tisr is the forcing of the last forecast)."""
+            self.m, self.prev, self.started, self.fc, self.seq = None, None, False, None, None
+            if history is None:
+                return
+            W = history.shape[1]
+            if not self.mz:
+                for k in range(W):
                     self.remember(history[:, k])
+                return
+            out = []
+            for k in range(W):  # teacher forcing over the sequence: day k -> forecast of day k + 1
+                nxt = history[:, k + 1] if k + 1 < W else x0
+                self.remember(history[:, k])
+                self.fc = super().step(history[:, k], hours0 - (W - k) * 24.0, None if nxt is None else nxt[:, TISR_DYN])
+                out.append(self.fc)
+            self.seq = torch.stack(out, 1)
 
         def remember(self, x):
             trend = torch.zeros_like(x) if self.prev is None else (x - self.prev) / self.t6 * self.keep
-            self.m = self.gru(self.enc(torch.cat([x, trend], 1)), self.m)
+            parts = [x, trend]
+            if self.mz:  # the innovation: zero at the start of a sequence and on the core's own states
+                parts.append(torch.zeros_like(x) if self.fc is None
+                             else (x.detach() - self.fc.detach()) / self.t6 * self.keep)
+            self.m = self.gru(self.enc(torch.cat(parts, 1)), self.m)
             self.prev = x
 
         def _trunk(self, x, hours, g=None):
@@ -181,13 +207,14 @@ def _mem_core_class():
             if not (self.freeze_mem and self.started):
                 self.remember(x)  # the time integral of the past first, then the prediction in time
             self.started = True
-            return super().step(x, hours, tisr_next)
+            self.fc = super().step(x, hours, tisr_next)
+            return self.fc
     return MemCore
 
 
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
-              hist: bool = False, mem: int = 0, mem_ch: int = 24):
+              hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -195,12 +222,12 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     solver step = ``stride`` days (``inc_std`` is then the std of the stride-day increment). ``hist`` = the
     field extended to its history: the previous state enters as the observed trend (_hist_core_class).
     ``mem`` = W > 0: the memory core (_mem_core_class), a ConvGRU state of ``mem_ch`` channels warmed up on the
-    W days before the IC."""
+    W days before the IC; ``mz`` = its Mori-Zwanzig sequence form (innovation input, forecasts of the sequence)."""
     from .dyncore import DynCore, DynCoreConfig
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
-        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch)
+        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz)
     else:
         core = (_hist_core_class() if hist else DynCore)(*args)
     if norm == "gn":
@@ -222,7 +249,7 @@ def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
     (B, W, 66, H, W), oldest first (None = an empty memory)."""
     x, out, st = xd, [], getattr(core, "stride", 1)
     if getattr(core, "mem", 0):
-        core.reset(prev)
+        core.reset(prev, doy.float() * 24.0, xd)
     elif getattr(core, "hist", False):
         core.prev = prev
     for k in range(steps):
