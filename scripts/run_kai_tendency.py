@@ -162,8 +162,12 @@ def train(a, arm):
         wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
     else:
         m = build(a, arm, inc, build_core(a, mean, std, inc, lat) if needs_core(arm) and arm != "stack" else None)
+        if a.init:  # fine-tuning (e.g. --rollout 2 3 from a single-step checkpoint)
+            miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu",
+                                                weights_only=False)["state"], strict=False)
+            assert set(miss.missing_keys) <= {"dyn"} and not miss.unexpected_keys, miss
         opt = torch.optim.AdamW(m.parameters(), lr=a.lr)  # KAI's trainer
-        cur = [1]
+        cur = a.rollout  # [1] = KAI's single-step training
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     years = sorted(trz)
@@ -204,8 +208,11 @@ def train(a, arm):
             loss = ((err ** 2) * wl).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
-        else:
+        elif K == 1:
             loss = lp(m(x, doy, tg[:, 0, TISR]), tg[:, 0])
+        else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
+            y = m.rollout(x, doy, K, tg[:, :, TISR])
+            loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
@@ -328,6 +335,20 @@ def score(a, tags):
             res[name] = metrics(wb * keep["kai"] + (1 - wb) * keep[other])
             res[name]["kai_weight"] = wk
             print("scored", name, flush=True)
+            if other in a.loop_blend:  # the same two models coupled every step: the day-1 weights, fed back
+                w1 = torch.from_numpy(wk[0]).view(1, -1, 1, 1)
+                base = CoreBase(get_core(other))
+
+                def loop_fn(x0, doy, tis, w1=w1, base=base):
+                    x, out = x0, []
+                    for k in range(L):
+                        x = w1 * kai_m(x, doy + k, tis[:, k]) + (1 - w1) * base(x, doy + k, tis[:, k])
+                        out.append(x)
+                    return torch.stack(out, 1)
+                lname = "loop" if other == "core" else f"loop_{other}"
+                res[lname] = metrics(rollout(loop_fn, tez, ics))
+                res[lname]["kai_weight"] = np.repeat(wk[:1], L, 0)
+                print("scored", lname, flush=True)
         del vk, vtruth
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
@@ -422,6 +443,11 @@ def main(argv=None):
     p.add_argument("--iters", type=int, default=2000)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--rollout", type=int, nargs="+", default=[1],
+                   help="position arms: rollout days of the training loss, a curriculum over the iterations")
+    p.add_argument("--init", default=None, help="position arms: start from this checkpoint tag (fine-tuning)")
+    p.add_argument("--loop-blend", nargs="*", default=[],
+                   help="core tags: score the step-wise blend (KAI and core forecasts mixed every day and fed back)")
     p.add_argument("--core-tag", default="core")
     p.add_argument("--stack-tag", default="res", help="arm stack: the trained res checkpoint used as first stage")
     p.add_argument("--blend-with", nargs="*", default=["res", "kai_s1"],
@@ -430,7 +456,12 @@ def main(argv=None):
                                                   "out:kai_long", "out:core", "res:kai", "core_gn:core", "core_gn2:core_gn",
                                                   "core_gnzm:core_gn", "core_gn:kai", "core_gn2:kai", "out_gn:out",
                                                   "out_gn:res", "out_gn:kai", "out_gn2:out_gn", "out_gn2:kai",
-                                                  "out_gn:kai_long", "out_gn2:kai_long", "in_gn:kai", "in_gn:in", "kai_s1:kai", "out_s1:out",
+                                                  "out_gn:kai_long", "out_gn2:kai_long", "in_gn:kai", "in_gn:in",
+                                                  "loop:kai", "loop_core_gn:kai", "loop_core_gn:blend_core_gn",
+                                                  "blend_core_gn:kai", "blend_core_gn:blend", "blend_core_gn:blend_kai_s1",
+                                                  "loop_core_gn:blend_kai_s1", "blend_out_gn:kai", "blend_out_gn:blend_kai_s1",
+                                                  "out_gnro:kai_ro", "out_gnro:out_gn", "kai_ro:kai", "out_gnro:kai",
+                                                  "out_gnro:blend_core_gn", "inout_gn:out_gn", "inout_gn:kai", "kai_s1:kai", "out_s1:out",
                                                   "res_s1:res", "blend:blend_res", "blend:blend_kai_s1", "inout:out",
                                                   "inres:res", "stack:res"],
                    help="extra paired comparisons a:b (RMSE of a relative to b)")
