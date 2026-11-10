@@ -37,8 +37,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
-from pgcfm.kai_tend import (ARMS, DYN, CoreBase, KAIPos, KAIPosConfig, LpLoss, OROG, TISR, config_dict,  # noqa: E402
-                            core_rollout, make_core, needs_core)
+from pgcfm.kai_tend import (ARMS, DYN, CachedFeatures, CoreBase, KAIPos, KAIPosConfig, LpLoss, OROG, TISR,  # noqa: E402
+                            config_dict, core_rollout, make_core, needs_core, operator_features)
 
 EPS = contract.KAI_STD_EPS
 
@@ -122,6 +122,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         opts.update(mem=a.core_mem, mem_ch=a.core_mem_ch)
         if a.core_mz:
             opts["mz"] = True
+    if a.core_gfeat:
+        opts["gfeat"] = True
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -133,6 +135,16 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         core.eval()
         for p in core.parameters():
             p.requires_grad_(False)
+    if opts.get("gfeat"):
+        # the physical terms G(x) (step 18's operator features) on the daily means; their scale (RMS over the last
+        # training year, every 4th day) is a buffer of the core, so a loaded core brings its own
+        y = a.train_years[-1]
+        xz = torch.from_numpy(zscore(load_years(a, [y])[y][::4], mean, std))
+        feats = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN])
+        if not load:
+            core.gscale.copy_(feats.scale)
+        feats.scale = core.gscale
+        core.features = CachedFeatures(feats)
     return core
 
 
@@ -748,6 +760,10 @@ def parser():
                    help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
     p.add_argument("--mem-freeze", action="store_true",
                    help="score: memory cores again without updating the memory after the IC")
+    p.add_argument("--core-gfeat", action="store_true",
+                   help="the physical terms: the primitive-equation operator's tendency G(x) of u, v, T, q on the 12 "
+                        "levels as 48 input channels of the core (step 18); with --core-mem the memory integrates "
+                        "G(x) of the past days as well (memory terms of the physical terms)")
     p.add_argument("--core-hist", action="store_true",
                    help="the core also gets the state one step before (the observed trend) as input")
     p.add_argument("--core-stride", type=int, default=1,

@@ -153,8 +153,12 @@ def _mem_core_class():
     alone), and the error of each forecast, the innovation e_t = (x_t - forecast of x_t) / s, is the third input
     of the memory: m_t = GRU(m_{t-1}, [x_t, trend_t, e_t]) (the memory term is what the past forecasts missed).
     ``reset`` keeps these W forecasts in ``seq`` for the sequence loss (scripts/run_kai_tendency.py); in the free
-    rollout the state is the core's own forecast, so e = 0."""
-    from .dyncore import DynCore, Net, _NetCfg, N_DYN
+    rollout the state is the core's own forecast, so e = 0.
+
+    With ``cfg.gfeat`` (owner, 2026-11-10: the physical terms need memory terms next to them) the trunk also
+    gets the operator's tendency G(x) (48 physical terms, step 18) and the memory integrates the physical terms:
+    m_t = GRU(m_{t-1}, [x_t, trend_t, (e_t,) G(x_t), G(x_{t-1})]), dx/dt = f(x, G(x), m)."""
+    from .dyncore import DynCore, Net, _NetCfg, N_DYN, N_GFEAT
     from .core import time_features
 
     class MemCore(DynCore):
@@ -163,17 +167,18 @@ def _mem_core_class():
         def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
-            self.net = Net(N_DYN + mem_ch + static.shape[0] + 4, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
-            self.enc = nn.Conv2d((3 if mz else 2) * N_DYN, mem_ch, 1)
+            ng = N_GFEAT if cfg.gfeat else 0
+            self.net = Net(N_DYN + mem_ch + static.shape[0] + 4 + ng, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
+            self.enc = nn.Conv2d((3 if mz else 2) * N_DYN + 2 * ng, mem_ch, 1)
             self.gru = ConvGRUCell(mem_ch, mem_ch)
-            self.m, self.prev, self.started = None, None, False
+            self.m, self.prev, self.gprev, self.started = None, None, None, False
             self.fc, self.seq = None, None  # mz: the forecast of the next state; the forecasts of the sequence
             self.freeze_mem = False  # diagnostic: no update of the memory after the IC (the rollout's own states)
 
         def reset(self, history=None, hours0=None, x0=None):
             """history (B, W, 66, H, W): the states before the IC, oldest first; None = an empty memory.
             mz: ``hours0`` (B,) = the IC's time, ``x0`` = the IC (its tisr is the forcing of the last forecast)."""
-            self.m, self.prev, self.started, self.fc, self.seq = None, None, False, None, None
+            self.m, self.prev, self.gprev, self.started, self.fc, self.seq = None, None, None, False, None, None
             if history is None:
                 return
             W = history.shape[1]
@@ -184,8 +189,9 @@ def _mem_core_class():
             out = []
             for k in range(W):  # teacher forcing over the sequence: day k -> forecast of day k + 1
                 nxt = history[:, k + 1] if k + 1 < W else x0
-                self.remember(history[:, k])
-                self.fc = super().step(history[:, k], hours0 - (W - k) * 24.0, None if nxt is None else nxt[:, TISR_DYN])
+                xk = history[:, k]  # one tensor for the memory and the step (the operator's G is cached per tensor)
+                self.remember(xk)
+                self.fc = super().step(xk, hours0 - (W - k) * 24.0, None if nxt is None else nxt[:, TISR_DYN])
                 out.append(self.fc)
             self.seq = torch.stack(out, 1)
 
@@ -195,13 +201,22 @@ def _mem_core_class():
             if self.mz:  # the innovation: zero at the start of a sequence and on the core's own states
                 parts.append(torch.zeros_like(x) if self.fc is None
                              else (x.detach() - self.fc.detach()) / self.t6 * self.keep)
+            if self.cfg.gfeat:
+                # the memory terms of the physical terms: the memory integrates the operator's tendency G of the
+                # state now and of the day before (next to the observed trend, so what the physical terms missed
+                # over the last day, trend - G_prev, is a linear combination of its inputs)
+                g = self.features(x)
+                parts += [g, torch.zeros_like(g) if self.gprev is None else self.gprev]
+                self.gprev = g
             self.m = self.gru(self.enc(torch.cat(parts, 1)), self.m)
             self.prev = x
 
         def _trunk(self, x, hours, g=None):
             B, _, H, W = x.shape
-            return self.net.trunk(torch.cat([x, self.m, self.static.expand(B, -1, -1, -1),
-                                             time_features(hours, H, W)], 1))
+            parts = [x, self.m, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)]
+            if self.cfg.gfeat:
+                parts.append(self.features(x) if g is None else g)
+            return self.net.trunk(torch.cat(parts, 1))
 
         def step(self, x, hours, tisr_next):
             if not (self.freeze_mem and self.started):
@@ -214,7 +229,7 @@ def _mem_core_class():
 
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
-              hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False):
+              hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -222,9 +237,14 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     solver step = ``stride`` days (``inc_std`` is then the std of the stride-day increment). ``hist`` = the
     field extended to its history: the previous state enters as the observed trend (_hist_core_class).
     ``mem`` = W > 0: the memory core (_mem_core_class), a ConvGRU state of ``mem_ch`` channels warmed up on the
-    W days before the IC; ``mz`` = its Mori-Zwanzig sequence form (innovation input, forecasts of the sequence)."""
+    W days before the IC; ``mz`` = its Mori-Zwanzig sequence form (innovation input, forecasts of the sequence).
+    ``gfeat`` = the physical terms: the operator's tendency G(x) as 48 input channels (step 18); the caller attaches
+    ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well."""
     from .dyncore import DynCore, DynCoreConfig
-    cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True)
+    if gfeat and hist and not mem:
+        raise ValueError("the history core has no G(x) input; use mem for a memory of the physical terms")
+    cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
+                        gfeat=gfeat)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
         core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz)
@@ -236,6 +256,36 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
         raise ValueError(norm)
     core.stride = int(stride)
     return core
+
+
+class CachedFeatures:
+    """One-entry cache of the operator features: the memory update and the solver step of the same day ask for
+    G of the same state tensor."""
+
+    def __init__(self, feats):
+        self.feats, self.key, self.val = feats, None, None
+
+    def __call__(self, x):
+        if self.key is not x:
+            self.key, self.val = x, self.feats(x)
+        return self.val
+
+
+def operator_features(mean, std, x_full: torch.Tensor, states: Optional[torch.Tensor] = None, scale=None):
+    """Step 18's operator features on KAI's daily contract: G(x) = -R0(x), the discrete primitive-equation
+    operator's own tendency of (u, v, T, q) on the 12 levels (48 physical terms) at a normalized state of the 66
+    dynamic channels. ``x_full`` (>= 1, 67, H, W) normalized: its orography channel is the lower boundary.
+    ``states`` (N, 66, H, W): estimate the per-channel scale (RMS of G over the valid points) from them."""
+    from .coupling import PhysicsConfig, PhysicsGuide
+    from .dyncore import OperatorFeatures, StrongPhysics
+    H, W = x_full.shape[-2:]
+    guide = PhysicsGuide(H, W, mean, std, PhysicsConfig(dt_seconds=24 * 3600.0))
+    for q in guide.parameters():
+        q.requires_grad_(False)
+    feats = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC)), x_full[:1, [OROG]].float(), scale)
+    if states is not None:
+        feats.scale = feats.estimate_scale(states)
+    return feats
 
 
 def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:
@@ -377,4 +427,4 @@ def config_dict(cfg) -> dict:
 
 
 __all__ = ["ARMS", "ConvGRUCell", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "stateless_norm", "core_step", "core_rollout", "needs_core",
-           "config_dict", "TISR", "OROG", "DYN", "TISR_DYN"]
+           "config_dict", "TISR", "OROG", "DYN", "TISR_DYN", "operator_features", "CachedFeatures"]
