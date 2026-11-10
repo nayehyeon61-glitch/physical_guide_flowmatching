@@ -126,6 +126,10 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["nomem"] = True
         if a.core_acc:
             opts.update(acc=list(a.core_acc), acc_ch=a.core_acc_ch)
+        if a.core_kern:
+            opts.update(kern=a.core_kern, kern_ch=a.core_kern_ch)
+        if a.core_pacc:
+            opts["pacc"] = list(a.core_pacc)
     if a.core_gfeat:
         opts["gfeat"] = True
     ck = None
@@ -280,8 +284,11 @@ def train(a, arm):
                 # must not be correlated with the residuals ACCUMULATED over the days before it with the kernel of
                 # tau days, R_tau(t) = exp(-1/tau) R_tau(t-1) + (1 - exp(-1/tau)) r_(t-1) (the effect of the long
                 # memory as a loss: what is left after it is not predictable from the past 3 to 5 days)
+                # (--core-pacc: its starting time constants; the memory kernel network, --core-kern, has none of
+                # its own: --mz-acc-taus)
                 acc_log = []
-                for tau in getattr(m, "acc", ()):
+                for tau in (getattr(m, "acc", ()) or getattr(m, "pacc", ())
+                            or (a.mz_acc_taus if getattr(m, "kern", 0) else ())):
                     lam, R, cs = float(np.exp(-1.0 / tau)), None, []
                     for t in range(1, r.shape[1]):
                         R = (1 - lam) * r[:, t - 1] if R is None else lam * R + (1 - lam) * r[:, t - 1]
@@ -313,6 +320,12 @@ def train(a, arm):
                 log[-1]["res_corr"] = [round(o, 4) for o in orth_log]
                 if acc_log:  # correlation of the residual with the residuals accumulated over tau days
                     log[-1]["res_corr_acc"] = acc_log
+                if getattr(m, "pacc", ()):  # the learned kernel time (days): mean over the levels, per time scale
+                    tk = m.pacc_tau().detach().view(len(m.pacc), -1, 12).mean(-1)  # and equation (u, v, T, q)
+                    log[-1]["pacc_tau"] = [[round(float(v), 2) for v in row] for row in tk]
+                    if m.mz:  # ... of the innovations: mean over the scored channels
+                        te = m.pacc_tau(innov=True).detach()[:, scd].mean(-1)
+                        log[-1]["pacc_tau_innov"] = [round(float(v), 2) for v in te]
             print(json.dumps(log[-1]), flush=True)
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
                     core_opts=getattr(m, "opts", None),
@@ -370,21 +383,27 @@ def score(a, tags):
                 out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis, pv).numpy())
         return (np.concatenate(out) * sd + mn).astype(np.float32)
 
-    def core_fn(tag, warm=None, freeze=False, noacc=False):
+    def core_fn(tag, warm=None, freeze=False, noacc=False, k0=False, pacc_off=False):
         """``warm`` (memory cores, diagnostic): only the last ``warm`` days before the IC enter the memory
         (0 = it starts empty); ``freeze``: the memory is not updated after the IC; ``noacc``: the long-memory
-        term of the accumulated memory (--core-acc) is switched off."""
+        term (--core-acc, --core-kern) is switched off and the accumulated physical tendency (--core-pacc) is
+        held at zero; ``k0``: the memory kernel without its network; ``pacc_off`` = "phys" / "innov": only that
+        part of the accumulated physical tendency (P and D / the accumulated innovations) is held at zero."""
         core = get_core(tag)
         W = getattr(core, "mem", 0)
         W = W if warm is None else min(W, warm)
 
         def fn(x0, doy, tis, pv=None):
             if getattr(core, "mem", 0):
-                core.freeze_mem, core.acc_off = freeze, noacc
+                core.freeze_mem, core.acc_off, core.pacc_off = freeze, noacc, "all" if noacc else pacc_off
                 pv = pv if W else None
+            if getattr(core, "kern", 0):
+                core.kernel.static = k0
             y = core_rollout(core, x0[:, dyn], doy, L, tis, prev=None if pv is None else pv.index_select(-3, dyn))
             if getattr(core, "mem", 0):
-                core.freeze_mem, core.acc_off = False, False
+                core.freeze_mem, core.acc_off, core.pacc_off = False, False, False
+            if getattr(core, "kern", 0):
+                core.kernel.static = False
             return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, y)
         fn.mem = W
         return fn
@@ -448,8 +467,15 @@ def score(a, tags):
                 res[f"{ct}~w{wm}"] = metrics(rollout(core_fn(ct, warm=wm), tez, ics))
             if a.mem_freeze:
                 res[f"{ct}~frozen"] = metrics(rollout(core_fn(ct, freeze=True), tez, ics))
-            if getattr(get_core(ct), "acc", ()):  # the effect of the long-memory term: the same rollout without it
+            if any(getattr(get_core(ct), k, 0) for k in ("acc", "kern", "pacc")):
+                # the effect of the long-memory term: the same rollout without it
                 res[f"{ct}~noacc"] = metrics(rollout(core_fn(ct, noacc=True), tez, ics))
+            if getattr(get_core(ct), "pacc", ()):  # which accumulation? the physical tendency and trend / the
+                res[f"{ct}~nophys"] = metrics(rollout(core_fn(ct, pacc_off="phys"), tez, ics))  # innovations
+                if get_core(ct).mz:
+                    res[f"{ct}~noinn"] = metrics(rollout(core_fn(ct, pacc_off="innov"), tez, ics))
+            if getattr(get_core(ct), "kern", 0):  # the kernel network's part: the same rollout with the kernel k0
+                res[f"{ct}~k0"] = metrics(rollout(core_fn(ct, k0=True), tez, ics))
             print("scored", ct, "memory diagnostics", flush=True)
     for tag in tags:
         m, ck = load(tag)
@@ -818,6 +844,20 @@ def parser():
     p.add_argument("--mz-acc-orth", type=float, default=1.0,
                    help="--core-acc with --core-mz: weight of the squared correlation of a day's one-step residual "
                         "with the residuals accumulated over the days before it; 0 = off")
+    p.add_argument("--core-kern", type=int, default=0,
+                   help="--core-mem: the memory kernel network over the memory states of the last S days (e.g. 8): "
+                        "M = sum over the lags s of K_s(x, m) m(t - s), K_s = a learned kernel k0[s] times a "
+                        "state-dependent gain; M enters the tendency as the long-memory term")
+    p.add_argument("--core-kern-ch", type=int, default=24, help="hidden channels of the kernel network")
+    p.add_argument("--core-pacc", type=float, nargs="*", default=[],
+                   help="--core-mem with --core-gfeat: the kernel in the memory term. The physical tendency G(x) and "
+                        "the trend of its channels are accumulated in time (starting time constants in days, e.g. "
+                        "3 5; the kernel time of every physical term is learned within 2 to 10 days) and enter the "
+                        "memory as inputs; with --core-mz the accumulated-residual loss (--mz-acc-orth) uses the "
+                        "same time scales")
+    p.add_argument("--mz-acc-taus", type=float, nargs="*", default=[3.0, 5.0],
+                   help="--core-kern with --core-mz: time constants (days) of the accumulated residuals in the "
+                        "orthogonality loss (--mz-acc-orth); a core with --core-acc uses its own")
     p.add_argument("--mem-warm", type=int, nargs="*", default=[],
                    help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
     p.add_argument("--mem-freeze", action="store_true",

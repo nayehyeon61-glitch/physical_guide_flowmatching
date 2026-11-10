@@ -151,6 +151,44 @@ class LongTerm(nn.Module):
         return self.c2(ConvGRUCell.pad(F.silu(self.c1(ConvGRUCell.pad(z)))))
 
 
+PACC_TAU = (2.0, 10.0)  # days: the bounds of the learned kernel time of the accumulated physical tendency
+
+
+class MemoryKernel(nn.Module):
+    """The memory kernel network: the memory integral of the Mori-Zwanzig equation in its discrete form (the sum
+    over the lags of the discrete generalized Langevin equation, cf. Lin, Tian, Perez & Livescu 2023; the
+    distributed-delay closure of Gupta & Lermusiaux 2021), taken over the memory term's own past:
+
+        M(t) = sum_{s = 0}^{S - 1} K_s(x_t, m_t) * m(t - s),      K_s = k0[s] * (1 + tanh(net([x_t, m_t]))_s)
+
+    m(t - s) = the ConvGRU memory state of s days ago (``mem_ch`` channels), k0 (S, mem_ch) = the kernel itself: one
+    weight per lag and memory channel, learned, starting from exp(-s / tau0) (sum over the lags = 1), and the
+    network's S gain maps make it depend on the present state and memory (zero-initialized: a new kernel is k0).
+    The kernel is in the open (k0 by lag) instead of inside the GRU's gates, and a lag of s days has a direct path
+    to the tendency whatever the gates forget. ``static`` (diagnostic) = the kernel without its network (k0)."""
+
+    def __init__(self, cin: int, mem_ch: int, lags: int, hid: int = 24, tau0: float = 4.0):
+        super().__init__()
+        self.lags, self.static = int(lags), False
+        k = torch.exp(-torch.arange(self.lags, dtype=torch.float32) / tau0)
+        self.k0 = nn.Parameter((k / k.sum()).view(-1, 1).repeat(1, mem_ch))
+        self.c1, self.c2 = nn.Conv2d(cin + mem_ch, hid, 3), nn.Conv2d(hid, self.lags, 3)
+        nn.init.zeros_(self.c2.weight)
+        nn.init.zeros_(self.c2.bias)
+
+    def gain(self, x, m):
+        """(B, S, H, W): the state-dependent factor of the kernel at every lag and grid point."""
+        if self.static:
+            return x.new_ones(x.shape[0], self.lags, *x.shape[-2:])
+        h = F.silu(self.c1(ConvGRUCell.pad(torch.cat([x, m], 1))))
+        return 1 + torch.tanh(self.c2(ConvGRUCell.pad(h)))
+
+    def forward(self, x, past):
+        """past = [m(t), m(t - 1), ...] (newest first, at most S states; days before the start are absent)."""
+        g = self.gain(x, past[0])
+        return sum(self.k0[s].view(1, -1, 1, 1) * g[:, s:s + 1] * ms for s, ms in enumerate(past))
+
+
 def _mem_core_class():
     """DynCore with a memory term in the Mori-Zwanzig sense: dx/dt = f(x, m), m = ConvGRU state.
 
@@ -181,30 +219,74 @@ def _mem_core_class():
     with an e-folding time of tau_k days whatever the training does. The accumulators enter as their own term,
     dx/dt = f(x, G(x), m) + g(z_3, z_5), the long-memory term (LongTerm; ``acc_off`` switches it off, a diagnostic).
     The accumulators start empty with the sequence and are filled over the W days before the IC (W >= 8 for
-    tau = 5 d), in the rollout they go on with the states the core is stepped along."""
-    from .dyncore import DynCore, Net, _NetCfg, N_DYN, N_GFEAT
+    tau = 5 d), in the rollout they go on with the states the core is stepped along.
+
+    ``kern`` = S > 0 (owner, 2026-11-11: a memory kernel network that takes the memory term next to the G core as
+    its input and accumulates and strengthens its effect): the memory states of the last S days are kept and the
+    kernel network (MemoryKernel) sums them over the lags, M(t) = sum_s K_s(x_t, m_t) m(t - s); M enters the
+    long-memory term, dx/dt = f(x, G(x), m) + g(M) (with ``acc``: g(z_3, z_5, M)). The past starts empty with the
+    sequence, like the memory. ``kernel.static`` = the kernel without its network (diagnostic).
+
+    ``pacc`` = time constants in days, e.g. (3, 5), with ``cfg.gfeat`` (owner, 2026-11-11: the core is a tendency
+    structure that takes the physical terms in, so the kernel formula belongs IN the memory term, and the physical
+    tendency accumulated in time reinforces the memory term). The memory of the discrete Mori-Zwanzig equation is
+    the recursion h_(n+1) = A_n h_n + c_n (Venturi & Li 2023, eqs. 92-97): the kernel is the powers of a contraction
+    A (it fades exponentially, their theorem 6) and the source c is what the step of the resolved terms leaves in
+    the unresolved part. Here the resolved terms are the 48 physical terms G(x), and per time scale k
+        P_k(t) = a_k P_k(t-1) + (1 - a_k) G(x_t)          the physical tendency accumulated in time
+        D_k(t) = a_k D_k(t-1) + (1 - a_k) trend_t         the observed trend of the same channels, the same kernel
+        E_k(t) = b_k E_k(t-1) + (1 - b_k) e_t             (mz) the innovations, all channels
+        a_k = exp(-1 / tau_k),  tau_k in [PACC_TAU[0], PACC_TAU[1]] days, LEARNED per physical term (b_k: per
+        channel) from pacc[k]
+    (D_k - P_k = what the physical terms missed over the window; E_k = what the forecasts missed, where the
+    diagnostic scripts/diag_kai_longmem.py --phys finds most of the information of the accumulated past) and they
+    are inputs of the memory, m_t = GRU(m_(t-1), [x_t, trend_t, e_t, G_t, G_(t-1), P_k, D_k, E_k]); the tendency
+    stays dx/dt = f(x, G(x), m). The kernel cannot fall back to one day (tau >= PACC_TAU[0]); P and D are fed in
+    a rollout as well (G and the trend of the core's own states), E fades there with its kernel (e = 0).
+    ``pacc_off`` (diagnostic) = "all" / "phys" (P, D) / "innov" (E) held at zero."""
+    from .dyncore import DynCore, Net, _NetCfg, G_EQS, N_DYN, N_GFEAT
     from .core import time_features
+    from .coupling import LEVEL_DYN
+    eq_idx = sum((LEVEL_DYN[{"T": "t"}.get(e, e)] for e in G_EQS), [])  # the channel of every physical term
 
     class MemCore(DynCore):
         hist = True  # the caller has to hand over the past
 
         def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False, nomem=False,
-                     acc=(), acc_ch=12):
+                     acc=(), acc_ch=12, kern=0, kern_ch=24, pacc=()):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
             self.nomem = bool(nomem)  # control: the same sequence training, the memory state stays zero
             ng = N_GFEAT if cfg.gfeat else 0
             self.net = Net(N_DYN + mem_ch + static.shape[0] + 4 + ng, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
-            self.enc = nn.Conv2d((3 if mz else 2) * N_DYN + 2 * ng, mem_ch, 1)
+            self.pacc, self.PD, self.pacc_off = tuple(float(t) for t in pacc), None, False
+            if self.pacc:  # the physical tendency accumulated in time, a kernel per physical term, in the memory
+                if nomem or not ng:
+                    raise ValueError("the accumulated physical tendency needs the memory and the physical terms")
+                lo, hi = PACC_TAU
+                if not all(lo < t < hi for t in self.pacc):
+                    raise ValueError(f"time constants of the accumulated physical tendency: {lo} < tau < {hi} days")
+                p0 = (torch.tensor(self.pacc) - lo) / (hi - lo)
+                p0 = torch.log(p0 / (1 - p0)).view(-1, 1)
+                self.pacc_raw = nn.Parameter(p0.repeat(1, ng))  # the kernel time of every physical term
+                if mz:
+                    self.pacc_raw_e = nn.Parameter(p0.repeat(1, N_DYN))  # ... of every channel's innovation
+                self.register_buffer("eq_idx", torch.tensor(eq_idx))
+            self.pacc_ch = len(self.pacc) * (2 * ng + (N_DYN if mz else 0))
+            self.enc = nn.Conv2d((3 if mz else 2) * N_DYN + 2 * ng + self.pacc_ch, mem_ch, 1)
             self.gru = ConvGRUCell(mem_ch, mem_ch)
             self.acc, self.z, self.acc_off = tuple(float(t) for t in acc), None, False
+            self.kern, self.past, self.M = int(kern), [], None
+            if (self.acc or self.kern) and nomem:
+                raise ValueError("the no-memory control has no long-memory term")
             if self.acc:  # the accumulated memory: fixed exponential kernels of tau days, their own term
-                if nomem:
-                    raise ValueError("the no-memory control has no accumulated memory")
                 self.enc_acc = nn.Conv2d(self.enc.in_channels, int(acc_ch) * len(self.acc), 1)
                 lam = torch.exp(-1.0 / torch.tensor(self.acc)).repeat_interleave(int(acc_ch))
                 self.register_buffer("lam", lam.view(1, -1, 1, 1))
-                self.long = LongTerm(int(acc_ch) * len(self.acc), cfg.hidden, N_DYN)
+            if self.kern:  # the memory kernel network over the memory states of the last ``kern`` days
+                self.kernel = MemoryKernel(N_DYN, mem_ch, self.kern, hid=int(kern_ch))
+            if self.acc or self.kern:
+                self.long = LongTerm(int(acc_ch) * len(self.acc) + (mem_ch if self.kern else 0), cfg.hidden, N_DYN)
             self.m, self.prev, self.gprev, self.started = None, None, None, False
             self.fc, self.seq = None, None  # mz: the forecast of the next state; the forecasts of the sequence
             self.freeze_mem = False  # diagnostic: no update of the memory after the IC (the rollout's own states)
@@ -213,7 +295,7 @@ def _mem_core_class():
             """history (B, W, 66, H, W): the states before the IC, oldest first; None = an empty memory.
             mz: ``hours0`` (B,) = the IC's time, ``x0`` = the IC (its tisr is the forcing of the last forecast)."""
             self.m, self.prev, self.gprev, self.started, self.fc, self.seq = None, None, None, False, None, None
-            self.z = None
+            self.z, self.past, self.M, self.PD = None, [], None, None
             if history is None:
                 return
             W = history.shape[1]
@@ -246,12 +328,38 @@ def _mem_core_class():
                 g = self.features(x)
                 parts += [g, torch.zeros_like(g) if self.gprev is None else self.gprev]
                 self.gprev = g
+                if self.pacc:  # the kernel in the memory term: the time integral of the physical tendency,
+                    K = len(self.pacc)  # of the trend of its channels and of the innovations
+                    a = torch.exp(-1.0 / self.pacc_tau()).view(1, -1, 1, 1)  # (1, K * 48, 1, 1)
+                    src, ret = [g.repeat(1, K, 1, 1), trend[:, self.eq_idx].repeat(1, K, 1, 1)], [a, a]
+                    if self.mz:
+                        src.append(parts[2].repeat(1, K, 1, 1))
+                        ret.append(torch.exp(-1.0 / self.pacc_tau(innov=True)).view(1, -1, 1, 1))
+                    src, ret = torch.cat(src, 1), torch.cat(ret, 1)
+                    self.PD = (1 - ret) * src if self.PD is None else ret * self.PD + (1 - ret) * src
+                    n = 2 * K * g.shape[1]  # the channels of P and D; the rest is E
+                    off = {"all": slice(None), "phys": slice(0, n), "innov": slice(n, None)}.get(self.pacc_off)
+                    if off is None:
+                        parts.append(self.PD)
+                    else:
+                        on = torch.ones(1, self.PD.shape[1], 1, 1, dtype=self.PD.dtype, device=self.PD.device)
+                        on[:, off] = 0.0
+                        parts.append(self.PD * on)
             v = torch.cat(parts, 1)
             self.m = self.gru(self.enc(v), self.m)
             if self.acc:  # the time integral of the past with the fixed kernels (an empty accumulator = no past)
                 u = (1 - self.lam) * torch.tanh(self.enc_acc(v))
                 self.z = u if self.z is None else self.lam * self.z + u
+            if self.kern:  # the memory integral over the memory's own past, with the kernel of the state now
+                self.past = [self.m] + self.past[:self.kern - 1]
+                self.M = self.kernel(x, self.past)
             self.prev = x
+
+        def pacc_tau(self, innov=False):
+            """(K, 48): the learned e-folding time (days) of the kernel of every physical term; ``innov``:
+            (K, 66), of every channel's innovation."""
+            lo, hi = PACC_TAU
+            return lo + (hi - lo) * torch.sigmoid(self.pacc_raw_e if innov else self.pacc_raw)
 
         def _trunk(self, x, hours, g=None):
             B, _, H, W = x.shape
@@ -262,8 +370,9 @@ def _mem_core_class():
 
         def tendency(self, x, hours, g=None):
             f = super().tendency(x, hours, g)
-            if self.acc and self.z is not None and not self.acc_off:
-                f = f + self.long(self.z) * self.t6 * self.keep  # the long-memory term, the same in both stages
+            long = [v for v in (self.z, self.M) if v is not None]
+            if long and not self.acc_off:  # the long-memory term, the same in both stages of the step
+                f = f + self.long(torch.cat(long, 1)) * self.t6 * self.keep
             return f
 
         def step(self, x, hours, tisr_next):
@@ -278,7 +387,7 @@ def _mem_core_class():
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
-              nomem: bool = False, acc=(), acc_ch: int = 12):
+              nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=()):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -290,18 +399,24 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     ``nomem`` (with mem and mz) = the control of the memory term: the same sequence training with a zero memory.
     ``acc`` (with mem) = the accumulated memory: time constants in days of fixed exponential accumulators of the
     memory's inputs (``acc_ch`` channels each) and their own long-memory term in the tendency.
+    ``kern`` (with mem) = S: the memory kernel network (MemoryKernel, hidden ``kern_ch``) over the memory states of
+    the last S days; its sum over the lags enters the long-memory term.
+    ``pacc`` (with mem and gfeat) = the kernel in the memory term: the physical tendency G and the trend of its
+    channels accumulated in time with a learned kernel time per physical term (starting at these days), as inputs
+    of the memory.
     ``gfeat`` = the physical terms: the operator's tendency G(x) as 48 input channels (step 18); the caller attaches
     ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well."""
     from .dyncore import DynCore, DynCoreConfig
     if gfeat and hist and not mem:
         raise ValueError("the history core has no G(x) input; use mem for a memory of the physical terms")
-    if len(acc) and not mem:
-        raise ValueError("the accumulated memory belongs to the memory core (mem > 0)")
+    if (len(acc) or kern or len(pacc)) and not mem:
+        raise ValueError("the accumulated memory and the memory kernel belong to the memory core (mem > 0)")
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
                         gfeat=gfeat)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
-        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch)
+        core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch,
+                                 kern=kern, kern_ch=kern_ch, pacc=tuple(pacc))
     else:
         core = (_hist_core_class() if hist else DynCore)(*args)
     if norm == "gn":
