@@ -2,7 +2,7 @@
 
 ## 요청을 이렇게 읽었습니다
 
-소유자 요청(2026-11-10)은 여섯 번에 걸쳐 좁혀졌습니다.
+소유자 요청(2026-11-10~11)은 일곱 번에 걸쳐 좁혀졌습니다.
 
 1. "tendency core 파트를 KAI에 올려 보고, 원본과 비교해서 위치를 찾는다." 처음에는 KAI의 출력을 경향 형태로 바꾸는 것으로 읽었고, 소유자가 고쳤습니다: **core는 따로 학습하고, KAI의 step 가운데 어디에 넣을지를 확인한다.**
 2. "(1) 약점의 극복 (2) 그 후 KAI에 적합한 구조로 적용 및 위치 판단." 단독 점수가 아니라 KAI의 예측력을 올리는 연결로 판정합니다.
@@ -10,6 +10,7 @@
 4. "기억의 문제인 것 같다. Mori-Zwanzig를 GRU로 구현하고, 시간 예측 전에 과거의 시간 적분을 입력으로 넣는다." 이어서 "기억 loss는 단항이 아니라 sequence에 대한 Mori-Zwanzig 형태여야 한다."
 5. "tendency core는 G(x)로 48개의 물리항인데, 이 물리항에 추가로 기억항도 만들어야 하지 않나."
 6. "최종에서 좋은 결과를 확인하고 최종 보완 모델을 설계한다." (원문의 "보안"을 "보완"으로 읽었습니다.)
+7. (2026-11-11) "분리했던 Mori-Zwanzig의 form들을 전부 합쳐 보면", "memory 구조로 장기적인 기억(3~5일)을 확실히, 그 효과를 memory 구조와 loss 구조로", 그리고 "kernel 식을 memory 항에 녹이고, 물리 tendency를 시간 누적해서 memory 항으로 넣는다." 7절이 이 요청입니다(학습 진행 중).
 
 평가에 대한 요청도 둘 있었습니다: 좋아지고 나빠지는 정도를 항별로 나눌 것, 그리고 좋아지면 +, 나빠지면 −로 일관되게 쓸 것. 이 문서의 모든 변화량은 **이득**입니다(RMSE 이득 = RMSE 감소율 %, ACC 이득 = 증가량, + = 좋아짐).
 
@@ -221,6 +222,62 @@ MZ core는 섞은 상태와 자기 예측의 차이를 예측 오차로 받으�
 
 
 
+## 7. 장기 기억: 형태의 통합, 누적, memory 항 안의 kernel (2026-11-11, 진행 중)
+
+### 7.1 Mori-Zwanzig 형태를 따로 쓴 것과 합친 것 (일 core 대비 nRMSE 이득 %, 선행 1 / 3 / 5 / 7 / 10일)
+
+| core | 들어간 형태 | 이득 |
+|---|---|---|
+| core_gnm | GRU (8일), 보통 loss | +5.0 / +1.9 / +0.2 / −0.8 / −1.6 |
+| core_gnsq | sequence loss + 직교 loss, 기억은 0 | +1.8 / −0.9 / −1.9 / −1.7 / −1.6 |
+| core_gng | 물리항 G(x)만 | +5.2 / +1.3 / −0.1 / −0.1 / +0.3 |
+| core_gnmz | GRU + sequence loss + 직교 loss | +8.9 / +3.2 / +1.7 / +1.4 / +1.0 |
+| core_gngmz | 위 전부 + 물리항의 기억 (3일 sequence) | +12.7 / +4.0 / +1.1 / +0.3 / −0.5 |
+
+합친 것이 부분의 합보다 큽니다(1일: 5.0 + 1.8 < 8.9). 최종 모델의 core_gngmz가 이미 통합형이고, 합쳐지지 않은 형태는 8일 창 하나였습니다. 그것까지 넣은 core_gngmz8(`--core-gfeat --core-mem 8 --core-mz`)이 아래 장기 기억 구조들의 기준입니다.
+
+### 7.2 이 구현을 memory 구조라고 할 수 있는가
+
+하루짜리 기억으로는 그렇습니다. 근거는 셋입니다: 기억을 0으로 둔 대조(4.2절), 잔차에 남은 기억 4.5 % → 1.2 %, 기억을 자르거나 얼리는 시험. 장기 기억이나 엄밀한 Mori-Zwanzig 분해는 아닙니다: kernel을 추정하지 않았고, 직교 조건은 시차 1~2의 약한 벌점이며, 잡음 항이 없습니다. 논문에서는 "Mori-Zwanzig-motivated memory closure learned with a GRU"(Ma, Wang & E 2018)로 쓰는 것이 맞습니다.
+
+### 7.3 장기 기억 구조 세 가지
+
+학습된 GRU는 과거 하루만 씁니다. 3~5일의 과거를 구조로 보장하는 방법을 셋 구현했습니다.
+
+| core | 구조 | 옵션 |
+|---|---|---|
+| core_gngmzL | 기억의 입력을 3일, 5일의 **고정** 지수 kernel로 누적한 z를 tendency 옆의 따로 선 항 g(z)로 | `--core-acc 3 5` |
+| core_gngmzP | **kernel을 memory 항 안에**: 물리 tendency G, 같은 채널의 추세, innovation을 학습되는 kernel 시간으로 누적해 GRU 기억의 입력으로 | `--core-pacc 3 5` |
+| core_gngmzK | 대조: 지난 8일의 기억 상태를 kernel network로 합친 M을 따로 선 항 g(M)으로 | `--core-kern 8` |
+
+core_gngmzP가 소유자의 마지막 안입니다. tendency core는 물리항을 받아들이는 구조이므로 kernel도 옆에 세우지 않고 memory 항에 녹입니다. 이산 Mori-Zwanzig 식(Venturi & Li 2023, 식 92~97, 115)에서 기억은 `h(n+1) = A·h(n) + c(n)`이라는 누적 점화식이고 kernel은 수축 연산 A의 거듭제곱이라 지수로 옅어집니다(Theorem 6). 이 논문은 신경망의 layer를 시간으로 본 이론이므로 식의 형태에 대한 근거이고, 날씨 기억의 길이를 정해 주지는 않습니다.
+
+    P_k(t) = a_k P_k(t−1) + (1 − a_k) G(x_t)        물리 tendency의 시간 누적 (48 물리항)
+    D_k(t) = a_k D_k(t−1) + (1 − a_k) 추세(t)        같은 채널의 관측 추세 (D − P = 물리항이 그 기간에 놓친 양)
+    E_k(t) = b_k E_k(t−1) + (1 − b_k) e(t)           innovation의 누적 (66채널)
+    a_k = exp(−1/τ_k),  τ_k는 물리항(채널)마다 학습, 2~10일, 3일과 5일에서 시작
+    m_t = GRU(m_{t−1}, [x_t, 추세, e_t, G_t, G_{t−1}, P_k, D_k, E_k]),   dx/dt = f(x, G(x), m)
+
+τ의 하한이 2일이라 하루짜리 기억으로 돌아갈 수 없고, 학습 뒤의 τ가 물리항별 kernel 시간의 추정값입니다. loss는 세 구조 모두 같습니다: 하루의 잔차가 그 앞 3일, 5일에 걸쳐 누적된 잔차와 상관되지 않게 하는 직교 항(`--mz-acc-orth`)을 sequence loss에 더합니다.
+
+### 7.4 학습 전 진단 (2016, core_gngmz, 선형, 격자점별)
+
+`scripts/diag_kai_longmem.py`: IC 시점에 아는 과거가 선행 L일 예측 오차의 분산을 얼마나 설명하는가(%). 오늘의 상태와 어제 값만으로 1.2 / 1.5 / 1.2 / 1.0 %(선행 1 / 3 / 5 / 7일)이고, 3일과 5일로 누적한 과거가 +1.2 / +1.1 / +1.0 / +0.9 %p를 더합니다. q가 가장 크고(+1.7 ~ +2.0) z가 가장 작습니다.
+
+무엇을 누적해야 하는지는 `--phys`로 봤습니다(물리항이 있는 48채널, 기준에 G(x_d), G(x_{d−1}) 포함).
+
+| 더한 누적 | 1일 | 3일 | 5일 | 7일 |
+|---|---|---|---|---|
+| 물리 tendency G | +0.03 | +0.02 | +0.04 | +0.02 |
+| 그 위에 추세 | +0.16 | +0.21 | +0.23 | +0.18 |
+| 그 위에 innovation | +0.96 | +0.94 | +0.75 | +0.69 |
+
+물리 tendency의 누적만으로는 정보가 거의 없고, 정보는 innovation의 누적(며칠 동안 같은 부호로 이어지는 예측 오차)에 있습니다. 그래서 core_gngmzP는 셋을 함께 누적합니다. 다만 선형 진단은 하한이고, rollout에서는 innovation이 0이 되는 반면 G와 추세는 계속 들어옵니다. 어느 누적이 일하는지는 채점에서 따로 끄고 잽니다(`~nophys`, `~noinn`).
+
+### 7.5 결과
+
+학습 중입니다. 8일 sequence core는 CPU에서 하나에 약 4.5시간이 걸립니다. 순서는 core_gngmzP, core_gngmz8, core_gngmzL, core_gngmzK이고, 판정 기준은 (1) 기억을 최근 2일로 잘랐을 때의 손실(3~8일째의 과거가 더하는 것), (2) 누적을 껐을 때의 손실, (3) KAI와의 되먹임 연결에서의 이득입니다. 채점 때 끄는 시험은 그 항과 함께 학습된 모델에서는 효과를 크게 보이게 하므로, 1 %를 넘는 효과는 같은 크기의 대조 core를 학습한 뒤에 주장합니다.
+
 ## 재현
 
 ```bash
@@ -236,6 +293,10 @@ $R $C --tag core_gnmz --core-mem 3 --core-mz
 $R $C --tag core_gng --core-gfeat
 $R $C --tag core_gngmz --core-gfeat --core-mem 3 --core-mz      # 최종 모델의 core
 $R $C --tag core_gnsq --core-mem 3 --core-mz --core-nomem        # 대조: 기억을 0으로 둔 sequence 학습
+$R $C --tag core_gngmz8 --core-gfeat --core-mem 8 --core-mz                 # 7절: 8일 sequence 기준
+$R $C --tag core_gngmzP --core-gfeat --core-mem 8 --core-mz --core-pacc 3 5  # memory 항 안의 kernel (물리 tendency, 추세, innovation 누적)
+$R $C --tag core_gngmzL --core-gfeat --core-mem 8 --core-mz --core-acc 3 5   # 고정 kernel 누적, 따로 선 항
+$R $C --tag core_gngmzK --core-gfeat --core-mem 8 --core-mz --core-kern 8    # 대조: kernel network, 따로 선 항
 
 # 최종 모델: KAI와 core_gngmz를 매일 섞어 되먹이는 연결(loop_core_gngmz), RMSE용 출력(blend_core_gnk8@loop_core_gngmz)
 $R --score kai --score-cores core_gngmz core_gnk8 --loop-blend core_gngmz \
@@ -251,6 +312,7 @@ python scripts/eval_kai_breakdown.py runs/kaitend/score.json runs/kaitend/score_
    "loop_core_gngmz:kai" "loop_core_gngmz:blend_core_gngmz" "core_gngmz:core_gng" "core_gngmz:core_gnmz"
 python scripts/diag_kai_memory.py --cores core_gn core_gnmz core_gngmz --lags 6
 python scripts/diag_kai_physmem.py --cores core_gn core_gnh
+python scripts/diag_kai_longmem.py --cores core_gngmz            # 누적한 과거의 정보; --phys: 물리 tendency의 누적
 python scripts/plot_kai_longrange.py runs/kaitend/score.json runs/kaitend/score_raw.npz out.png kai core_gn core_gngmz blend_core_gngmz loop_core_gngmz
 
 # 원래 크기의 KAI (GPU): 모든 명령에 같은 크기를 줍니다
