@@ -3,7 +3,7 @@
     python scripts/plot_kai_longrange.py runs/kaitend/score_La.json runs/kaitend/score_La_raw.npz out.png \
         [--title "..."] tag[=label[=colour[=linestyle]]] ...
 
-Panels: normalized RMSE (65 channels), its change against KAI, anomaly correlation (65 channels), z500 ACC,
+Panels: normalized RMSE (65 channels), its gain over KAI (+ = better), anomaly correlation (65 channels), z500 ACC,
 z500 / t850 / t2m RMSE, z500 prediction / truth power at k1-9. Persistence and climatology are dotted.
 A tag that starts with ``blend`` is drawn dashed in the colour of the model that is blended with KAI, ``loop``
 (the two models mixed every step) dash-dotted. Other combinations (seq_, cas_, three-way blends) take their
@@ -90,7 +90,7 @@ def main(argv):
     kai = np.array(A["kai"]["nrmse"])
     panels = [
         ("normalized RMSE, 65 channels", lambda k: np.array(A[k]["nrmse"]), True, None),
-        ("normalized RMSE against KAI (%)", lambda k: 100 * (np.array(A[k]["nrmse"]) / kai - 1), False, 0.0),
+        ("normalized RMSE gain over KAI (%; + = better)", lambda k: 100 * (1 - np.array(A[k]["nrmse"]) / kai), False, 0.0),
         ("anomaly correlation, 65 channels", acc_mean, True, None),
         ("z500 anomaly correlation", lambda k: np.array(A[k]["acc"])[:, ch("z500")], True, None),
         ("z500 RMSE (m$^2$/s$^2$)", lambda k: np.array(A[k]["rmse"])[:, ch("z500")], True, None),
@@ -111,7 +111,7 @@ def main(argv):
                 st = style(k)
                 handles[st["label"]] = p.plot(days, fn(k), **st)[0]
         for tag, lab, col, ls in tags:
-            if tag not in A or (tag == "kai" and "against KAI" in ttl):
+            if tag not in A or (tag == "kai" and "over KAI" in ttl):
                 continue
             st = style(tag, lab, col, ls)
             handles[st["label"]] = p.plot(days, fn(tag), **st)[0]
