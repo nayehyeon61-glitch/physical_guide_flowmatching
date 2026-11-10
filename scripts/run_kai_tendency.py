@@ -337,33 +337,29 @@ def score(a, tags):
         del pred
         print("scored", tag, flush=True)
 
-    def hier_fn(jump, daily):
-        """Hierarchical rollout: lead = a * stride + b; the long-scale core takes the a stride-day steps from x0,
-        the daily model (a core or a scored position tag) the b < stride remaining days."""
-        jc, st = CoreBase(get_core(jump)), get_core(jump).stride
-        dstep = models[daily] if daily in models else CoreBase(get_core(daily))
+    def hier_fn(jumps, daily):
+        """Hierarchical rollout over time scales: every lead is split greedily into the largest steps first
+        (strides of the long-scale cores ``jumps``, then single days by ``daily``: a core or a scored position
+        tag), e.g. strides 5, 3, 1: day 9 = 5 + 3 + 1. The state at a lead is one step from an earlier lead."""
+        strides = sorted({get_core(j).stride: CoreBase(get_core(j)) for j in jumps}.items(), reverse=True)
+        strides.append((1, models[daily] if daily in models else CoreBase(get_core(daily))))
 
         def fn(x0, doy, tis):
-            out, y = [None] * L, x0
-            for j in range(L // st + 1):
-                x = y
-                for b in range(1, st):
-                    lead = j * st + b
-                    if lead > L:
-                        break
-                    x = dstep(x, doy + lead - 1, tis[:, lead - 1])
-                    out[lead - 1] = x
-                lead = (j + 1) * st
-                if lead <= L:
-                    y = jc(y, doy + j * st, tis[:, lead - 1])
-                    out[lead - 1] = y
-            return torch.stack(out, 1)
+            state = {0: x0}
+            for lead in range(1, L + 1):
+                rem, last = lead, None
+                for st, step in strides:  # greedy: the last (smallest) step used decides the parent lead
+                    if rem >= st:
+                        rem, last = rem % st, (st, step)
+                st, step = last
+                state[lead] = step(state[lead - st], doy + lead - st, tis[:, lead - 1])
+            return torch.stack([state[k] for k in range(1, L + 1)], 1)
         return fn
 
     for pair in a.hier:
-        jump, daily = pair.split(":")
-        name = f"hier_{jump}+{daily}"
-        fns[name] = hier_fn(jump, daily)
+        jumps, daily = pair.split(":")
+        name = f"hier_{jumps}+{daily}"
+        fns[name] = hier_fn(jumps.split("+"), daily)
         pred = rollout(fns[name], tez, ics)
         res[name] = metrics(pred)
         if name in a.blend_with:
@@ -538,8 +534,9 @@ def main(argv=None):
     p.add_argument("--core-stride", type=int, default=1,
                    help="days per solver step of the core (long-scale core; --curriculum then counts these steps)")
     p.add_argument("--hier", nargs="*", default=[],
-                   help="JUMP:DAILY pairs: the long-scale core JUMP takes the stride-day steps, DAILY (a core tag of "
-                        "--score-cores or a scored position tag) the remaining days; scored as hier_JUMP+DAILY")
+                   help="JUMPS:DAILY, JUMPS = long-scale core tags joined by '+': every lead is made of the largest "
+                        "steps first, DAILY (a core tag or a scored position tag) takes the single days; "
+                        "scored as hier_JUMPS+DAILY")
     p.add_argument("--core-zm", type=float, default=0.0, help="weight of a zonal-mean error term in the core loss")
     p.add_argument("--score-cores", nargs="*", default=None, help="core tags to score alone (default: --core-tag)")
     p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 3, 4], help="core rollout days")
