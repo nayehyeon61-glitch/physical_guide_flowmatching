@@ -256,7 +256,19 @@ def train(a, arm):
         m.train()
         return tot / len(idx)
 
-    for it in range(1, a.iters + 1):
+    # --resume: the state of the training is saved at every log step (<tag>.part) and a training that was cut
+    # off (the machine stopped) goes on from there
+    part, it0 = os.path.join(a.out, f"{a.tag or arm}.part"), 0
+    if a.resume and os.path.exists(part):
+        ck = torch.load(part, map_location="cpu", weights_only=False)
+        m.load_state_dict(ck["state"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        rng.bit_generator.state = ck["rng"]
+        torch.set_rng_state(ck["torch_rng"])
+        log, it0, t0 = ck["log"], ck["it"], time.time() - ck["sec"]
+        print(json.dumps(dict(resumed_at=it0)), flush=True)
+    for it in range(it0 + 1, a.iters + 1):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         x, tg, doy = batch(K)
         if is_core:
@@ -327,10 +339,19 @@ def train(a, arm):
                         te = m.pacc_tau(innov=True).detach()[:, scd].mean(-1)
                         log[-1]["pacc_tau_innov"] = [round(float(v), 2) for v in te]
             print(json.dumps(log[-1]), flush=True)
+            if a.resume and it < a.iters:
+                torch.save(dict(state=m.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), it=it, log=log,
+                                rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), sec=time.time() - t0),
+                           part + ".tmp")
+                os.replace(part + ".tmp", part)
+                if it == a.stop_at:
+                    sys.exit(3)
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
                     core_opts=getattr(m, "opts", None),
                     params=sum(p.numel() for p in m.parameters()), train_seconds=time.time() - t0),
                os.path.join(a.out, f"{a.tag or arm}.pt"))
+    if os.path.exists(part):
+        os.remove(part)
 
 
 # ---------------------------------------------------------------------------------------------- scoring
@@ -880,6 +901,9 @@ def parser():
     p.add_argument("--leads", type=int, default=10)
     p.add_argument("--ic-stride", type=int, default=3)
     p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--resume", action="store_true",
+                   help="training: save its state at every log step (<tag>.part) and go on from it if it is there")
+    p.add_argument("--stop-at", type=int, default=0, help="test of --resume: stop after the log step of this iteration")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     return p
