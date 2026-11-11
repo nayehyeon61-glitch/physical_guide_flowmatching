@@ -31,7 +31,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
 
 URLS = {"64x32": "https://storage.googleapis.com/weatherbench2/datasets/era5/1959-2023_01_10-6h-64x32_equiangular_conservative.zarr",
-        "128x64": "https://storage.googleapis.com/weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_conservative.zarr"}
+        "128x64": "https://storage.googleapis.com/weatherbench2/datasets/era5/1959-2022-6h-128x64_equiangular_conservative.zarr",
+        # KAI's own grid: 1.5 deg, 121 x 240, poles included, latitude S -> N (pgcfm.contract)
+        "240x121": "https://storage.googleapis.com/weatherbench2/datasets/era5/"
+                   "1959-2023_01_10-6h-240x121_equiangular_with_poles_conservative.zarr"}
 URL = URLS["64x32"]
 UPPER = {"z": "geopotential", "q": "specific_humidity", "t": "temperature",
          "u": "u_component_of_wind", "v": "v_component_of_wind"}
@@ -67,18 +70,11 @@ def tisr_1h(times, lat_deg, lon_deg, n_sub=12):
     return out
 
 
-def kai_year(ds, year, hour, path, days_step=None, grid="64x32"):
-    """``hour=None``: every 6 h time of the year; ``days_step`` keeps only every n-th day (all its times:
-    the step 18 resolution test needs 6 h triples, not whole years)."""
-    sel = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31"))
-    if hour is not None:
-        sel = sel.sel(time=sel.time.dt.hour == hour)
-    if days_step:
-        sel = sel.sel(time=((sel.time.dt.dayofyear - 1) % days_step) == 0)
+def fields_of(ds, sel):
+    """(T, 67, H, W) float32: the KAI channels of the times selected in ``sel``."""
     times = sel.time.values
     lat, lon = sel.latitude.values, sel.longitude.values
-    T, H, W = len(times), len(lat), len(lon)
-    f = np.empty((T, contract.N_CHANNELS, H, W), dtype=np.float32)
+    f = np.empty((len(times), contract.N_CHANNELS, len(lat), len(lon)), dtype=np.float32)
     for v, name in UPPER.items():
         x = sel[name].sel(level=contract.LEVELS_HPA).transpose("time", "level", "latitude", "longitude").values
         f[:, contract.level_slice(v)] = x
@@ -87,6 +83,50 @@ def kai_year(ds, year, hour, path, days_step=None, grid="64x32"):
     f[:, contract.CHANNEL_INDEX["skt"]] = f[:, contract.CHANNEL_INDEX["t2m"]]
     f[:, contract.CHANNEL_INDEX["tisr"]] = tisr_1h(times, lat, lon)
     f[:, contract.CHANNEL_INDEX["orog"]] = ds.geopotential_at_surface.transpose("latitude", "longitude").values
+    return f
+
+
+def daily_year(ds, year, path, days=None):
+    """``path`` (.npy): the daily means of the four 6-hourly times of every day of the year, (D, 67, H, W) float32,
+    the cache scripts/run_kai_tendency.py reads (--cache). Month by month, so a fine grid needs no 6-hourly year
+    file (1.5 deg: 11 GB) and little memory."""
+    sel = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31"))
+    if days:
+        sel = sel.isel(time=sel.time.dt.dayofyear <= days)
+    T = sel.sizes["time"]
+    assert T % 4 == 0, year
+    out = np.lib.format.open_memmap(path + ".tmp.npy", mode="w+", dtype=np.float32,
+                                    shape=(T // 4, contract.N_CHANNELS, sel.sizes["latitude"], sel.sizes["longitude"]))
+    for m in range(1, 13):
+        sm = sel.isel(time=sel.time.dt.month == m)
+        if sm.sizes["time"] == 0:
+            continue
+        assert (sm.time.dt.hour.values.reshape(-1, 4) == [0, 6, 12, 18]).all(), (year, m)
+        f = fields_of(ds, sm)
+        if not np.isfinite(f).all():
+            raise RuntimeError(f"{year}-{m:02d}: non-finite values")
+        i0 = int((sm.time.values[0] - np.datetime64(f"{year}-01-01")) / np.timedelta64(1, "D"))
+        out[i0:i0 + len(f) // 4] = f.reshape(-1, 4, *f.shape[1:]).mean(1)
+    out.flush()
+    del out
+    os.replace(path + ".tmp.npy", path)
+
+
+def kai_year(ds, year, hour, path, days_step=None, grid="64x32", days=None):
+    """``hour=None``: every 6 h time of the year; ``days_step`` keeps only every n-th day (all its times:
+    the step 18 resolution test needs 6 h triples, not whole years); ``days`` = only the first n days of the
+    year (a smoke test of a fine grid)."""
+    sel = ds.sel(time=slice(f"{year}-01-01", f"{year}-12-31"))
+    if days:
+        sel = sel.isel(time=sel.time.dt.dayofyear <= days)
+    if hour is not None:
+        sel = sel.sel(time=sel.time.dt.hour == hour)
+    if days_step:
+        sel = sel.sel(time=((sel.time.dt.dayofyear - 1) % days_step) == 0)
+    times = sel.time.values
+    lat, lon = sel.latitude.values, sel.longitude.values
+    T, H, W = len(times), len(lat), len(lon)
+    f = fields_of(ds, sel)
     if not np.isfinite(f).all():
         raise RuntimeError(f"{year}: non-finite values")
     with nc.Dataset(path + ".tmp", "w", format="NETCDF4") as out:
@@ -110,7 +150,7 @@ def kai_year(ds, year, hour, path, days_step=None, grid="64x32"):
     return f
 
 
-DEG = {"64x32": "5.625", "128x64": "2.8125"}  # file-name suffix of the ClimODE-format files per grid
+DEG = {"64x32": "5.625", "128x64": "2.8125", "240x121": "1.5"}  # file-name suffix of the ClimODE-format files per grid
 
 
 def climode_year(ds, year, root, grid="64x32"):
@@ -141,24 +181,36 @@ def constants(ds, root, grid="64x32"):
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True)
-    p.add_argument("--years", type=int, nargs="+", required=True)
+    p.add_argument("--years", type=int, nargs="*", default=[], help="none: only the constants file of the grid")
     p.add_argument("--hour", type=int, default=12, help="UTC hour of the daily KAI snapshot")
     p.add_argument("--all-hours", action="store_true", help="every 6 h time, to <out>/kai6h")
     p.add_argument("--no-climode", action="store_true")
-    p.add_argument("--grid", default="64x32", choices=list(URLS), help="128x64 = 2.8125 deg (step 18)")
+    p.add_argument("--grid", default="64x32", choices=list(URLS),
+                   help="128x64 = 2.8125 deg (step 18); 240x121 = 1.5 deg with poles, KAI's grid (tendency core +)")
+    p.add_argument("--days", type=int, default=None, help="only the first n days of every year (smoke test)")
+    p.add_argument("--daily-mean", action="store_true",
+                   help="write only <out>/kaiday/<year>.npy, the daily means of 00/06/12/18 UTC (tendency core +: "
+                        "no 6-hourly year files of a fine grid)")
     p.add_argument("--days-step", type=int, default=None, help="keep every n-th day only (all its times)")
     p.add_argument("--climode-only", action="store_true", help="only the 5 ClimODE variables (step 19 SR targets)")
     a = p.parse_args(argv)
     ds = open_wb2(a.grid)
     kai = os.path.join(a.out, "kai6h" if a.all_hours else "kai")
-    os.makedirs(kai, exist_ok=True)
-    if not a.no_climode and not os.path.exists(os.path.join(a.out, "era5_data", "constants",
-                                                            f"constants_{DEG[a.grid]}deg.nc")):
+    if not a.daily_mean:
+        os.makedirs(kai, exist_ok=True)
+    # orography and land-sea mask of the grid (the tendency core's static inputs): always, they are small
+    if not os.path.exists(os.path.join(a.out, "era5_data", "constants", f"constants_{DEG[a.grid]}deg.nc")):
         constants(ds, os.path.join(a.out, "era5_data"), a.grid)
-    for y in a.years:
+    for y in a.years if a.daily_mean else []:
+        path = os.path.join(a.out, "kaiday", f"{y}.npy")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.exists(path):
+            daily_year(ds, y, path, a.days)
+        print(f"{y} done (daily means)", flush=True)
+    for y in [] if a.daily_mean else a.years:
         path = os.path.join(kai, f"{y}.nc")
         if not os.path.exists(path) and not a.climode_only:
-            kai_year(ds, y, None if a.all_hours else a.hour, path, a.days_step, a.grid)
+            kai_year(ds, y, None if a.all_hours else a.hour, path, a.days_step, a.grid, a.days)
         if not a.no_climode:
             climode_year(ds, y, os.path.join(a.out, "era5_data"), a.grid)
         print(f"{y} done", flush=True)

@@ -48,6 +48,15 @@ LEVELS = [50, 100, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 LEVVARS = ["z", "q", "t", "u", "v"]
 SFC = ["t2m", "msl", "sp", "skt", "tcwv"]
 BANDS = [("k0 (zonal mean)", 0, 0), ("k1-3 (planetary)", 1, 3), ("k4-9 (synoptic)", 4, 9), ("k10+ (small)", 10, 32)]
+
+
+def bands_of(K):
+    """The wavenumber bands of a grid with K rfft bins: the 5.625 deg grid (K = 33) has BANDS; a finer grid
+    splits the small scales into those the 5.625 deg grid resolves (k10-32) and the ones only it has (k33+)."""
+    if K <= 33:
+        return [(n, lo, min(hi, K - 1)) for n, lo, hi in BANDS]
+    return BANDS[:3] + [("k10-32 (small)", 10, 32), ("k33+ (fine grid only)", 33, K - 1)]
+
 REGIONS = ["tropics (22.5S-22.5N)", "north of 22.5N", "south of 22.5S"]
 TERMS = ["bias", "amplitude", "phase"]  # the textbook split
 TERMS2 = ["bias", "pattern (information)", "amplitude cost"]
@@ -98,8 +107,8 @@ def breakdown(S, raw, std, a, b):
         wk[0] = wk[-1] = 1.0
         pw = lambda e, lo, hi: (e[:, sc, lo:hi + 1] * wk[lo:hi + 1]).sum(-1)  # noqa: E731  (L, 65)
         nb = lambda e, lo, hi: (np.sqrt(pw(e, lo, hi)) / std[sc]).mean(1)  # noqa: E731
-        out["scale"] = {n: 1 - nb(ea, lo, hi) / nb(eb, lo, hi) for n, lo, hi in BANDS}
-        out["scale_share"] = {n: (pw(eb, lo, hi) / pw(eb, 0, K - 1)).mean(1) for n, lo, hi in BANDS}
+        out["scale"] = {n: 1 - nb(ea, lo, hi) / nb(eb, lo, hi) for n, lo, hi in bands_of(K)}
+        out["scale_share"] = {n: (pw(eb, lo, hi) / pw(eb, 0, K - 1)).mean(1) for n, lo, hi in bands_of(K)}
     # terms. RMSE_A - RMSE_B = (MSE_A - MSE_B) / (RMSE_A + RMSE_B) per channel, and the MSE is a sum of terms, so
     # the gain of the 65-channel nRMSE splits exactly into one contribution per term (in % of B's nRMSE)
     ra, rb = np.sqrt(ma.mean(0)), np.sqrt(mb.mean(0))  # (L, 67)
@@ -208,7 +217,7 @@ def figure(B, path, title):
             p.legend(frameon=False, fontsize=8.5)
         elif k == "scale":
             base(p, "by scale: nRMSE gain per wavenumber band\n(%; + = A better; legend: share of B's MSE)")
-            for t, (name, _, _) in enumerate(BANDS):
+            for t, name in enumerate(B[k]):
                 sh = B["scale_share"][name]
                 p.plot(days, 100 * B[k][name], color=CAT[t], lw=2,
                        label=f"{name}: {100 * sh[0]:.0f} / {100 * sh[-1]:.0f} %")
@@ -229,7 +238,7 @@ def figure(B, path, title):
             p.plot(days, B[k][b], color=MUTED, lw=2.2, label="B")
             p.legend(frameon=False, fontsize=9)
     na, nb_ = B["nrmse"][a], B["nrmse"][b]
-    q = [0, 2, 4, L - 1]
+    q = sorted({x for x in (0, 2, 4, L - 1) if x < L})
     fig.suptitle(f"{title}\nA = {a},  B = {b};  65-channel normalized RMSE at day "
                  + "/".join(str(x + 1) for x in q) + ":  A " + "/".join(f"{na[x]:.3f}" for x in q)
                  + ",  B " + "/".join(f"{nb_[x]:.3f}" for x in q)
@@ -268,7 +277,7 @@ def table(B):
             print(f"    {name:22s} {f(B['dterm_pct'][:, t], 1)}")
     if "scale" in B:
         print("  by scale: nRMSE gain %  (share of B's error)")
-        for name, _, _ in BANDS:
+        for name in B["scale"]:
             print(f"    {name:18s} {f(B['scale'][name]):38s} ({'/'.join(f'{100 * B['scale_share'][name][x]:.0f}' for x in q)} %)")
     if "region" in B:
         print("  by region: nRMSE gain %")

@@ -2,6 +2,10 @@
 
 Data: KAI's contract (67 channels, daily mean of 00/06/12/18 UTC, z-score with std + 1e-8, no cross-year
 pairs), made from our 6-hourly WB2 files (scripts/wb2_to_kai.py --all-hours) at 5.625 deg (32 x 64).
+The tendency core + (docs/kai_tendency_plus.md): the same on KAI's own grid, 1.5 deg (121 x 240, poles included;
+``wb2_to_kai.py --grid 240x121`` or KAI's own daily files). A fine grid stays on disk and is normalized on access,
+the test forecasts are scored in chunks of ICs, ``--device cuda`` trains and scores on a GPU, ``--core-substeps``
+keeps the distance travelled per solver step and ``--core-ckpt`` the memory of a sequence at that of one day.
 
 1. ``--arm core``: the tendency core alone (pgcfm.dyncore.DynCore, step 16 recipe: Heun, tisr forcing,
    PositiveMass, rollout curriculum, latitude-weighted MSE in units of the increment std). Saved, then frozen.
@@ -26,8 +30,10 @@ pairs), made from our 6-hourly WB2 files (scripts/wb2_to_kai.py --all-hours) at 
 """
 
 import argparse
+import glob
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -41,38 +47,136 @@ from pgcfm.kai_tend import (ARMS, DYN, CachedFeatures, CoreBase, KAIPos, KAIPosC
                             config_dict, core_rollout, make_core, needs_core, operator_features)
 
 EPS = contract.KAI_STD_EPS
+LAZY_BYTES = 2 ** 30  # a year of daily fields larger than this stays on disk (1.5 deg: 2.9 GB; 5.625 deg: 0.2 GB)
 
 
 def daily(path6h: str, cache: str) -> np.ndarray:
-    """(D, 67, H, W) daily means (KAI: mean of 00/06/12/18 UTC) of one 6-hourly year file, cached as .npy."""
+    """(D, 67, H, W) daily means (KAI: mean of 00/06/12/18 UTC) of one 6-hourly year file, cached as .npy.
+    A year file that already holds one field a day (KAI's own daily files) is cached as it is."""
     if os.path.exists(cache):
         return np.load(cache, mmap_mode="r")
     with nc.Dataset(path6h) as d:
         f = d["fields"]
-        hours = np.asarray(d["time"][:])
+        hours = np.asarray(d["time"][:]) if "time" in d.variables else None
         T = f.shape[0]
-        assert hours[0] == 0 and T % 4 == 0 and np.all(np.diff(hours) == 6), path6h
         f.set_auto_mask(False)
-        out = np.empty((T // 4,) + f.shape[1:], dtype=np.float32)
-        for i in range(0, T, 400):  # read in large slabs (zlib chunks), average every 4 times
-            x = np.asarray(f[i:i + 400], dtype=np.float32)
-            out[i // 4:(i + len(x)) // 4] = x.reshape(-1, 4, *x.shape[1:]).mean(1)
+        if hours is not None and T > 1 and np.all(np.diff(hours) == 6):
+            assert hours[0] == 0 and T % 4 == 0, path6h
+            out = np.empty((T // 4,) + f.shape[1:], dtype=np.float32)
+            for i in range(0, T, 400):  # read in large slabs (zlib chunks), average every 4 times
+                x = np.asarray(f[i:i + 400], dtype=np.float32)
+                out[i // 4:(i + len(x)) // 4] = x.reshape(-1, 4, *x.shape[1:]).mean(1)
+        else:  # daily fields already
+            assert T <= 366, f"{path6h}: neither 6-hourly nor one field a day"
+            out = np.empty(f.shape, dtype=np.float32)
+            for i in range(0, T, 64):
+                out[i:i + 64] = f[i:i + 64]
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     np.save(cache + ".tmp.npy", out)
     os.replace(cache + ".tmp.npy", cache)
     return np.load(cache, mmap_mode="r")
 
 
-def lat_of(path6h):
-    with nc.Dataset(path6h) as d:
-        for k in ("latitude", "lat"):
-            if k in d.variables:
-                return np.asarray(d[k][:], dtype=np.float64)
-    raise KeyError("latitude")
+def lat_of(path6h, n_lat=None, era5=None):
+    """Latitudes of the data's grid: from the year file; without it or without coordinates in it (a cache of
+    daily means only, KAI's own files): from the constants file under ``era5`` that has ``n_lat`` rows, else the
+    registered grid of ``n_lat`` rows (121: 1.5 deg with poles)."""
+    if os.path.exists(path6h):
+        with nc.Dataset(path6h) as d:
+            for k in ("latitude", "lat"):
+                if k in d.variables:
+                    return np.asarray(d[k][:], dtype=np.float64)
+    if n_lat is None:
+        raise KeyError("latitude")
+    for p in sorted(glob.glob(os.path.join(era5 or "", "constants", "constants_*deg.nc"))):
+        with nc.Dataset(p) as d:
+            if "lat" in d.variables and d["lat"].shape[0] == n_lat:
+                return np.asarray(d["lat"][:], dtype=np.float64)
+    return contract.grid_latitudes(n_lat)
 
 
 def load_years(a, years):
-    return {y: np.asarray(daily(os.path.join(a.data, f"{y}.nc"), os.path.join(a.cache, f"{y}.npy"))) for y in years}
+    """year -> (D, 67, H, W) daily fields, in memory; a fine grid (or --lazy) stays on disk as np.memmap."""
+    out = {}
+    for y in years:
+        x = daily(os.path.join(a.data, f"{y}.nc"), os.path.join(a.cache, f"{y}.npy"))
+        out[y] = x if a.lazy or x[0].nbytes * 366 > LAZY_BYTES else np.asarray(x)
+    return out
+
+
+class ZYear:
+    """A year of daily fields (D, 67, H, W) normalized on access (the same numbers as ``zscore`` of the whole
+    year), so that a fine grid stays on disk. Index = days [, further indices of the (67, H, W) fields]."""
+
+    def __init__(self, x, mean, std, as_torch=False):
+        self.x, self.as_torch = x, as_torch
+        self.m, self.s = mean[:, None, None], std[:, None, None] + EPS
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        t, rest = (i[0], tuple(i[1:])) if isinstance(i, tuple) else (i, ())
+        y = ((np.asarray(self.x[t]) - self.m) / self.s).astype(np.float32)
+        if rest:
+            y = y[(slice(None),) * (y.ndim - 3) + rest]
+        return torch.from_numpy(y) if self.as_torch else y
+
+
+class Lazy:
+    """An (N, ...) array given by a function of a slice of its first axis (the ICs): only chunks of it are ever
+    in memory."""
+
+    def __init__(self, fn, n):
+        self.fn, self.n = fn, n
+
+    def __len__(self):
+        return self.n
+
+    @property
+    def shape(self):
+        return (self.n,)
+
+    def __getitem__(self, s):
+        return self.fn(s)
+
+
+def stats_stream(train, step=16):
+    """``stats`` for years that stay on disk: the same quantities from sums over slabs of days."""
+    ys = sorted(train)
+    C = train[ys[0]].shape[1]
+    off = np.asarray(train[ys[0]][:step], dtype=np.float64).mean((0, 2, 3))[None, :, None, None]
+    s1, s2, n = np.zeros(C), np.zeros(C), 0
+    for y in ys:
+        for i in range(0, len(train[y]), step):
+            x = np.asarray(train[y][i:i + step], dtype=np.float64) - off
+            s1 += x.sum((0, 2, 3))
+            s2 += (x ** 2).sum((0, 2, 3))
+            n += x.shape[0] * x.shape[2] * x.shape[3]
+    mean = off.reshape(-1) + s1 / n
+    std = np.sqrt(np.maximum(s2 / n - (s1 / n) ** 2, 0.0))
+    sq = []
+    for y in ys:
+        for i in range(0, len(train[y]) - 1, step):
+            x = np.asarray(train[y][i:i + step + 1], dtype=np.float64)
+            x = (x - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)
+            sq.append(np.mean(np.diff(x, axis=0) ** 2, (2, 3)))
+    inc = np.sqrt(np.mean(np.concatenate(sq, 0), 0))
+    inc = np.where(inc > 0, inc, 1.0)
+    # daily climatology: mean per day of year, 31-day smoothing (a year shorter than 365 days is a smoke test)
+    nd = max(366 if len(train[y]) >= 365 else len(train[y]) for y in ys)
+    clim, cnt = np.zeros((nd,) + train[ys[0]].shape[1:], dtype=np.float32), np.zeros(nd)
+    for y in ys:
+        for i in range(0, len(train[y]), step):
+            clim[i:i + step] += train[y][i:i + step]
+        cnt[:len(train[y])] += 1
+    for i in range(nd):
+        clim[i] = clim[i] / cnt[i] if cnt[i] else clim[i - 1]
+    half = min(15, (nd - 1) // 2)
+    out = np.empty_like(clim)
+    for i in range(nd):
+        out[i] = clim[np.arange(i - half, i + half + 1) % nd].mean(0)
+    return mean, std, inc, out
 
 
 def stats(a, train=None):
@@ -80,6 +184,10 @@ def stats(a, train=None):
     if os.path.exists(p):
         s = np.load(p)
         return s["mean"], s["std"], s["inc"], s["clim"]
+    if any(isinstance(v, np.memmap) for v in train.values()):
+        mean, std, inc, clim = stats_stream(train)
+        np.savez(p, mean=mean, std=std, inc=inc, clim=clim)
+        return mean, std, inc, clim
     allx = np.concatenate([train[y] for y in sorted(train)], 0).astype(np.float64)
     mean, std = allx.mean((0, 2, 3)), allx.std((0, 2, 3))
     z = lambda x: (x - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)  # noqa: E731
@@ -105,14 +213,23 @@ def zscore(x, mean, std):
     return ((x - mean[None, :, None, None]) / (std[None, :, None, None] + EPS)).astype(np.float32)
 
 
+def constants_of(a, lat):
+    """Orography, land-sea mask and longitudes of the data's grid: the constants file under --era5 whose
+    latitudes are the data's (scripts/wb2_to_kai.py writes constants_<deg>deg.nc for every grid)."""
+    import xarray as xr
+    for p in sorted(glob.glob(os.path.join(a.era5, "constants", "constants_*deg.nc"))):
+        with xr.open_dataset(p) as d:
+            if len(d["lat"]) == len(lat) and np.allclose(d["lat"].values, lat):
+                return (d["orography"].values.astype(np.float32), d["lsm"].values.astype(np.float32),
+                        d["lon"].values)
+    raise FileNotFoundError(f"no constants_*deg.nc with the data's {len(lat)} latitudes under {a.era5}/constants")
+
+
 def build_core(a, mean, std, inc, lat, load=True, tag=None):
     """The tendency core ``tag`` (default --core-tag): built from the options saved in its checkpoint, frozen.
     ``load=False``: a new core from the command line options (training)."""
-    import xarray as xr
     from pgcfm.core import static_features
-    with xr.open_dataset(os.path.join(a.era5, "constants", "constants_5.625deg.nc")) as d:
-        oro, lsm, lon = d["orography"].values.astype(np.float32), d["lsm"].values.astype(np.float32), d["lon"].values
-        assert np.allclose(d["lat"].values, lat)
+    oro, lsm, lon = constants_of(a, lat)
     contract.register_latitudes(lat)
     opts = dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm=a.core_norm, substeps=a.core_substeps,
                 stride=a.core_stride)
@@ -147,13 +264,23 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         # the physical terms G(x) (step 18's operator features) on the daily means; their scale (RMS over the last
         # training year, every 4th day) is a buffer of the core, so a loaded core brings its own
         y = a.train_years[-1]
-        xz = torch.from_numpy(zscore(load_years(a, [y])[y][::4], mean, std))
-        feats = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN])
+        yx = load_years(a, [y])[y]
+        H, W = yx.shape[-2:]
+        if load or not isinstance(yx, np.memmap) or H * W <= 8192:
+            xz = torch.from_numpy(zscore(yx[:1] if load else yx[::4], mean, std))
+            feats = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN])
+        else:  # a fine grid: the states of the scale estimate are read a few at a time
+            idx = np.arange(0, len(yx), 4)
+            states = Lazy(lambda i: torch.from_numpy(zscore(np.asarray(yx[idx[i]]), mean, std))[:, DYN], len(idx))
+            feats = operator_features(mean, std, torch.from_numpy(zscore(yx[:1], mean, std)), states=states,
+                                      chunk=max(1, 8 * 8192 // (H * W)))
         if not load:
             core.gscale.copy_(feats.scale)
-        feats.scale = core.gscale
+        core.to(a.device)
+        feats.to(a.device)
+        feats.scale = core.gscale  # after the move: the buffer the core now holds
         core.features = CachedFeatures(feats)
-    return core
+    return core.to(a.device)
 
 
 def build(a, arm, inc, core):
@@ -169,7 +296,7 @@ def build(a, arm, inc, core):
             p.requires_grad_(False)
     elif needs_core(arm):
         base = CoreBase(core)
-    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, base)
+    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, base).to(a.device)
 
 
 def train(a, arm):
@@ -178,11 +305,16 @@ def train(a, arm):
     tr = load_years(a, a.train_years)
     va = load_years(a, [a.val_year])[a.val_year]
     mean, std, inc, _ = stats(a, tr)
-    lat = lat_of(os.path.join(a.data, f"{a.val_year}.nc"))
-    trz = {y: torch.from_numpy(zscore(tr[y], mean, std)) for y in tr}
-    vaz = torch.from_numpy(zscore(va, mean, std))
+    lat = lat_of(os.path.join(a.data, f"{a.val_year}.nc"), va.shape[-2], a.era5)
+    dev = torch.device(a.device)
+    if isinstance(va, np.memmap):  # a fine grid (or --lazy): the years stay on disk, normalized per batch
+        trz = {y: ZYear(tr[y], mean, std, as_torch=True) for y in tr}
+        vaz = ZYear(va, mean, std, as_torch=True)
+    else:
+        trz = {y: torch.from_numpy(zscore(tr[y], mean, std)) for y in tr}
+        vaz = torch.from_numpy(zscore(va, mean, std))
     is_core = arm == "core"
-    dyn = torch.tensor(DYN)
+    dyn = torch.tensor(DYN, device=dev)
     st = a.core_stride if is_core else 1  # days per training step (long-scale core: > 1)
     core = None if is_core or not needs_core(arm) or arm == "stack" else build_core(a, mean, std, inc, lat)
     # does the model see the state one step before (the observed trend)? a history core, alone or inside KAI,
@@ -194,18 +326,19 @@ def train(a, arm):
             inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
             inc = np.where(inc > 0, inc, 1.0)
         m = build_core(a, mean, std, inc, lat, load=False)
+        m.grad_ckpt = bool(a.core_ckpt)  # the activations of a day are recomputed in the backward pass
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
-        s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1)
-        scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR])  # the 65 scored channels among the 66
-        keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1)
+        s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
+        scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
+        keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1).to(dev)
         orth_log, acc_log = None, None
         wl = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
-        wl = (wl / wl.mean()).view(1, 1, 1, -1, 1)
+        wl = (wl / wl.mean()).view(1, 1, 1, -1, 1).to(dev)
     else:
         m = build(a, arm, inc, core)
         if a.init:  # fine-tuning (e.g. --rollout 2 3 from a single-step checkpoint)
-            miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location="cpu",
+            miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location=dev,
                                                 weights_only=False)["state"], strict=False)
             assert set(miss.missing_keys) <= {"dyn", "gate"} and not miss.unexpected_keys, miss
         cur = a.rollout  # [1] = KAI's single-step training
@@ -229,8 +362,8 @@ def train(a, arm):
             pv.append(trz[y][d - W * st:d:st] if W else trz[y][d - st] if hist else None)
             doy.append(d)
         prev.clear()
-        prev.append(torch.stack(pv) if hist else None)
-        return torch.stack(xs), torch.stack(tg), torch.tensor(doy)
+        prev.append(torch.stack(pv).to(dev) if hist else None)
+        return torch.stack(xs).to(dev), torch.stack(tg).to(dev), torch.tensor(doy, device=dev)
 
     prev = [None]  # history cores: the state one step before the batch's start (memory cores: W steps, oldest first)
 
@@ -247,12 +380,15 @@ def train(a, arm):
         with torch.no_grad():
             idx = np.arange(st if hist else 0, len(vaz) - st, max(1, (len(vaz) - st) // 64))[:64]
             tot = 0.0
-            for i in range(0, len(idx), 16):
-                j = idx[i:i + 16]
+            for i in range(0, len(idx), a.val_batch):
+                j = idx[i:i + a.val_batch]
                 pv = vaz[j - st] if hist else None
                 if W:  # the same days as a history core; before the first day of the year: that day itself
                     pv = torch.stack([vaz[np.maximum(j - k * st, 0)] for k in range(W, 0, -1)], 1)
-                tot += float(lp(one_step(vaz[j], torch.tensor(j), vaz[j + st], pv), vaz[j + st])) * len(j)
+                if pv is not None:
+                    pv = pv.to(dev)
+                tgt = vaz[j + st].to(dev)
+                tot += float(lp(one_step(vaz[j].to(dev), torch.tensor(j, device=dev), tgt, pv), tgt)) * len(j)
         m.train()
         return tot / len(idx)
 
@@ -260,7 +396,7 @@ def train(a, arm):
     # off (the machine stopped) goes on from there
     part, it0 = os.path.join(a.out, f"{a.tag or arm}.part"), 0
     if a.resume and os.path.exists(part):
-        ck = torch.load(part, map_location="cpu", weights_only=False)
+        ck = torch.load(part, map_location=dev, weights_only=False)
         m.load_state_dict(ck["state"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
@@ -374,14 +510,34 @@ def simplex2(b1, b2, g11, g22, g12):
 def score(a, tags):
     mean, std, inc, clim = stats(a)
     te = load_years(a, [a.test_year])[a.test_year]
-    lat = lat_of(os.path.join(a.data, f"{a.test_year}.nc"))
+    lat = lat_of(os.path.join(a.data, f"{a.test_year}.nc"), te.shape[-2], a.era5)
+    dev = torch.device(a.device)
+    # a fine grid: the year stays on disk, the forecasts of a model go to a file under <out>/score_tmp and every
+    # metric is computed over chunks of ICs (the per-IC numbers are the same whatever the chunks)
+    big = isinstance(te, np.memmap)
+    tmp, n_tmp = os.path.join(a.out, "score_tmp"), [0]
+    if big:
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
     w = np.cos(np.deg2rad(lat))
     w = (w / w.mean())[:, None].astype(np.float32)
     L = a.leads
     regions = [np.abs(lat) < 20, lat >= 20, lat <= -20]
     sd = (std + EPS).astype(np.float32)[None, None, :, None, None]
     mn = mean.astype(np.float32)[None, None, :, None, None]
-    cores, dyn = {}, torch.tensor(DYN)
+    cores, dyn = {}, torch.tensor(DYN, device=dev)
+    CH = a.score_chunk or (max(1, int(1e8 // (L * te[0].size))) if big else 0)  # ICs per chunk; 0 = all at once
+
+    def chunks(n):
+        return [slice(None)] if not CH or CH >= n else [slice(i, min(n, i + CH)) for i in range(0, n, CH)]
+
+    def gmean(f, n):
+        """Mean over the ICs and the grid of f(IC slice) (n, L, 67, H, W) -> (L, 67)."""
+        ch = chunks(n)
+        if len(ch) == 1:
+            return f(ch[0]).mean((0, -2, -1))
+        tot = sum(f(c).mean((0, -2, -1), dtype=np.float64) * (c.stop - c.start) for c in ch)
+        return (tot / n).astype(np.float32)
 
     def get_core(tag):
         if tag not in cores:
@@ -390,19 +546,30 @@ def score(a, tags):
 
     def setup(year_x):
         ics = np.arange(0, len(year_x) - L, a.ic_stride)
+        if big:
+            return ics, ZYear(year_x, mean, std), Lazy(
+                lambda c: np.stack([year_x[i + 1:i + 1 + L] for i in ics[c]]), len(ics))
         return ics, zscore(year_x, mean, std), np.stack([year_x[i + 1:i + 1 + L] for i in ics])
 
     def rollout(fn, xz, ics):
-        out = []
+        out, nb = [], a.score_batch
+        if big:  # the forecasts of all ICs, on disk
+            n_tmp[0] += 1
+            out = np.lib.format.open_memmap(os.path.join(tmp, f"{n_tmp[0]}.npy"), mode="w+", dtype=np.float32,
+                                            shape=(len(ics), L) + te.shape[1:])
         with torch.no_grad():
-            for i in range(0, len(ics), 16):
-                j = ics[i:i + 16]
+            for i in range(0, len(ics), nb):
+                j = ics[i:i + nb]
                 tis = torch.from_numpy(np.stack([xz[k + 1:k + 1 + L, TISR] for k in j]))
                 pv = torch.from_numpy(xz[np.maximum(j - 1, 0)])  # the day before the IC (first day of the year: itself)
                 if getattr(fn, "mem", 0):  # a memory core: the fn.mem days before the IC, oldest first
                     pv = torch.from_numpy(np.stack([xz[np.maximum(j - k, 0)] for k in range(fn.mem, 0, -1)], 1))
-                out.append(fn(torch.from_numpy(xz[j]), torch.tensor(j), tis, pv).numpy())
-        return (np.concatenate(out) * sd + mn).astype(np.float32)
+                y = fn(torch.from_numpy(xz[j]).to(dev), torch.tensor(j, device=dev), tis.to(dev), pv.to(dev)).cpu().numpy()
+                if big:
+                    out[i:i + len(j)] = (y * sd + mn).astype(np.float32)
+                else:
+                    out.append(y)
+        return out if big else (np.concatenate(out) * sd + mn).astype(np.float32)
 
     def core_fn(tag, warm=None, freeze=False, noacc=False, k0=False, pacc_off=False):
         """``warm`` (memory cores, diagnostic): only the last ``warm`` days before the IC enter the memory
@@ -430,7 +597,7 @@ def score(a, tags):
         return fn
 
     def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with
-        ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location="cpu", weights_only=False)
+        ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location=dev, weights_only=False)
         arm = tag.split("_")[0]
         core = get_core(ck["args"].get("core_tag", "core")) if needs_core(arm) and arm != "stack" else None
         m = build(a, arm, inc, core)
@@ -440,14 +607,26 @@ def score(a, tags):
         return m, ck
 
     ics, tez, truth = setup(te)
-    cl = np.stack([clim[[min(i + k, 365) for k in range(1, L + 1)]] for i in ics])
+    nc_ = len(clim) - 1  # 365; a smoke test with a short year: its last day
+    cl_of = lambda c: np.stack([clim[[min(i + k, nc_) for k in range(1, L + 1)]] for i in ics[c]])  # noqa: E731
+    cl = Lazy(cl_of, len(ics)) if big else cl_of(slice(None))
     res = {}
 
     def metrics(pred, spectra=True):
+        """``pred`` (N, L, 67, H, W): an array, a file of forecasts or a Lazy; scored against the test year."""
+        parts = [metrics_chunk(pred[c], truth[c], cl[c], spectra) for c in chunks(len(ics))]
+        out = {k: np.concatenate([q[k] for q in parts]) for k in ("mse", "acc", "dec", "act", "mse_reg")}
+        # systematic part: the IC-mean of the global-mean error, in units of the channel's std (L, 67)
+        out["gbias"] = (np.concatenate([q["gm"] for q in parts]).mean(0) / (std + EPS)).astype(np.float32)
+        if spectra:
+            for k in ("sp_pred", "sp_true", "sp_err"):
+                out[k] = np.concatenate([q[k] for q in parts]).mean(0).astype(np.float32)
+        return out
+
+    def metrics_chunk(pred, truth, cl, spectra):
         err = pred - truth
         out = dict(mse=(err ** 2 * w).mean((-2, -1)).astype(np.float32))  # (N, L, 67)
-        # systematic part: the IC-mean of the global-mean error, in units of the channel's std (L, 67)
-        out["gbias"] = ((err * w).mean((-2, -1)).mean(0) / (std + EPS)).astype(np.float32)
+        out["gm"] = (err * w).mean((-2, -1))  # the global-mean error of every forecast
         pa, ta = pred - cl, truth - cl
         out["acc"] = ((pa * ta * w).sum((-2, -1))
                       / np.sqrt((pa ** 2 * w).sum((-2, -1)) * (ta ** 2 * w).sum((-2, -1)) + 1e-30)).astype(np.float32)
@@ -464,13 +643,26 @@ def score(a, tags):
         out["mse_reg"] = np.stack([(err[:, :, :, r] ** 2 * w[r]).mean((-2, -1)) / w[r].mean() for r in regions],
                                   -1).astype(np.float32)
         if spectra:  # zonal power (cos-lat weighted over rows) of prediction, truth and error per wavenumber
-            P = lambda f: (np.abs(np.fft.rfft(f, axis=-1)) ** 2 * w).mean(-2).mean(0).astype(np.float32)  # noqa: E731
+            P = lambda f: (np.abs(np.fft.rfft(f, axis=-1)) ** 2 * w).mean(-2)  # noqa: E731  (per IC; mean in metrics)
             out.update(sp_pred=P(pred), sp_true=P(truth), sp_err=P(err))
         return out
 
-    res["persistence"] = metrics(np.repeat(te[ics][:, None], L, 1))
-    res["climatology"] = metrics(cl.astype(np.float32))
+    def drop(*arrs):
+        """Remove the forecast files (fine grid) of arrays that are not kept for the blends."""
+        for x in arrs:
+            if isinstance(x, np.memmap) and not any(x is k for k in keep.values()):
+                os.remove(x.filename)
+
+    def scored(fn, **kw):
+        """The metrics of a forecast function whose forecasts are not kept."""
+        pred = rollout(fn, tez, ics)
+        out = metrics(pred, **kw)
+        drop(pred)
+        return out
+
     keep = {}  # test forecasts kept for the blends
+    res["persistence"] = metrics(Lazy(lambda c: np.repeat(te[ics[c]][:, None], L, 1), len(ics)))
+    res["climatology"] = metrics(Lazy(lambda c: cl[c].astype(np.float32), len(ics)))
     fns, models = {}, {}  # tag -> forecast function (x0, doy, tisr) -> (B, L, 67, H, W); tag -> KAIPos
     core_tags = a.score_cores if a.score_cores is not None else [a.core_tag]
     for ct in core_tags:
@@ -479,24 +671,25 @@ def score(a, tags):
         keep[ct] = rollout(fns[ct], tez, ics)
         res[ct] = metrics(keep[ct])
         if a.blend_cores is not None and ct not in a.blend_cores:
-            del keep[ct]
+            drop(keep.pop(ct))
         ckc = torch.load(os.path.join(a.out, f"{ct}.pt"), map_location="cpu", weights_only=False)
         res[ct].update(train_seconds=ckc["train_seconds"], params=ckc["params"])
+        del ckc
         print("scored", ct, flush=True)
         if getattr(get_core(ct), "mem", 0):  # how much of the past does the trained memory use?
             for wm in a.mem_warm:
-                res[f"{ct}~w{wm}"] = metrics(rollout(core_fn(ct, warm=wm), tez, ics))
+                res[f"{ct}~w{wm}"] = scored(core_fn(ct, warm=wm))
             if a.mem_freeze:
-                res[f"{ct}~frozen"] = metrics(rollout(core_fn(ct, freeze=True), tez, ics))
+                res[f"{ct}~frozen"] = scored(core_fn(ct, freeze=True))
             if any(getattr(get_core(ct), k, 0) for k in ("acc", "kern", "pacc")):
                 # the effect of the long-memory term: the same rollout without it
-                res[f"{ct}~noacc"] = metrics(rollout(core_fn(ct, noacc=True), tez, ics))
+                res[f"{ct}~noacc"] = scored(core_fn(ct, noacc=True))
             if getattr(get_core(ct), "pacc", ()):  # which accumulation? the physical tendency and trend / the
-                res[f"{ct}~nophys"] = metrics(rollout(core_fn(ct, pacc_off="phys"), tez, ics))  # innovations
+                res[f"{ct}~nophys"] = scored(core_fn(ct, pacc_off="phys"))  # innovations
                 if get_core(ct).mz:
-                    res[f"{ct}~noinn"] = metrics(rollout(core_fn(ct, pacc_off="innov"), tez, ics))
+                    res[f"{ct}~noinn"] = scored(core_fn(ct, pacc_off="innov"))
             if getattr(get_core(ct), "kern", 0):  # the kernel network's part: the same rollout with the kernel k0
-                res[f"{ct}~k0"] = metrics(rollout(core_fn(ct, k0=True), tez, ics))
+                res[f"{ct}~k0"] = scored(core_fn(ct, k0=True))
             print("scored", ct, "memory diagnostics", flush=True)
     for tag in tags:
         m, ck = load(tag)
@@ -506,17 +699,16 @@ def score(a, tags):
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
         if hasattr(m, "gate"):
-            res[tag]["gate"] = m.gate.detach().view(-1).numpy().copy()
+            res[tag]["gate"] = m.gate.detach().view(-1).cpu().numpy().copy()
         if tag in a.blend_bases or tag in a.blend_with:
             keep[tag] = pred
         if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
-            res[f"{tag}~notau"] = metrics(rollout(lambda x, d, t, pv=None: m.rollout(x, d, L, t, prev=pv), tez, ics),
-                                          spectra=False)
+            res[f"{tag}~notau"] = scored(lambda x, d, t, pv=None: m.rollout(x, d, L, t, prev=pv), spectra=False)
             m.ablate = False
             if m.cfg.form == "full" and m.uses_core:  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
-                res[f"{tag}~open"] = metrics(rollout(
-                    lambda x, d, t, pv=None: m.rollout(x, d, L, t, open_loop=True, prev=pv), tez, ics))
+                res[f"{tag}~open"] = scored(lambda x, d, t, pv=None: m.rollout(x, d, L, t, open_loop=True, prev=pv))
+        drop(pred)
         del pred
         print("scored", tag, flush=True)
 
@@ -548,6 +740,7 @@ def score(a, tags):
         res[name] = metrics(pred)
         if name in a.blend_with:
             keep[name] = pred
+        drop(pred)
         del pred
         print("scored", name, flush=True)
     done = set()
@@ -572,6 +765,7 @@ def score(a, tags):
             res[name] = metrics(pred)
             if name in a.blend_with:
                 keep[name] = pred
+            drop(pred)
             del pred
             print("scored", name, flush=True)
 
@@ -585,21 +779,23 @@ def score(a, tags):
     for bt in bases:
         kai_m = models[bt]
         sfx = "" if bt == "kai" else f"@{bt}"
-        vk = rollout(fns[bt], vaz, vics)
+        vk, nv = rollout(fns[bt], vaz, vics), len(vics)
         for other in [t for t in core_tags if t in keep] + [t for t in a.blend_with
                                                             if t in keep and t not in core_tags and t != bt]:
             vc = rollout(fns[other], vaz, vics)
-            num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
-            den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
+            num = gmean(lambda c: (vk[c] - vc[c]) * (vtruth[c] - vc[c]) * w, nv)
+            den = gmean(lambda c: (vk[c] - vc[c]) ** 2 * w, nv)
             wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
-            del vc
+            drop(vc)
+            vc = None  # frees the validation forecasts (the weights are computed)
             name = ("blend" if other == "core" else f"blend_{other}") + sfx
             wb = wk[None, :, :, None, None]
-            res[name] = metrics(wb * keep[bt] + (1 - wb) * keep[other])
+            res[name] = metrics(Lazy(lambda c, wb=wb, kb=keep[bt], ko=keep[other]: wb * kb[c] + (1 - wb) * ko[c],
+                                     len(ics)))
             res[name]["kai_weight"] = wk
             print("scored", name, flush=True)
             if other in a.loop_blend:  # the same two models coupled every step: the day-1 weights, fed back
-                w1 = torch.from_numpy(wk[0]).view(1, -1, 1, 1)
+                w1 = torch.from_numpy(wk[0]).view(1, -1, 1, 1).to(dev)
                 base = CoreBase(get_core(other), stateful=True)
 
                 def loop_fn(x0, doy, tis, pv=None, w1=w1, base=base, kai_m=kai_m):
@@ -615,27 +811,31 @@ def score(a, tags):
                 lname = ("loop" if other == "core" else f"loop_{other}") + sfx
                 loop_fn.mem = base.mem
                 fns[lname] = loop_fn
-                res[lname] = metrics(rollout(loop_fn, tez, ics))
+                res[lname] = scored(loop_fn)
                 res[lname]["kai_weight"] = np.repeat(wk[:1], L, 0)
                 print("scored", lname, flush=True)
         for combo in a.blend_multi:  # KAI with two others: weights >= 0, sum 1, per lead and channel
             oth = combo.split("+")
             if len(oth) != 2 or not all(o in keep for o in oth):
                 continue
-            avg = lambda f: (f * w).mean((0, -2, -1)).astype(np.float64)  # noqa: E731  (L, 67)
-            r = vtruth - vk
-            d1 = rollout(fns[oth[0]], vaz, vics) - vk
-            d2 = rollout(fns[oth[1]], vaz, vics) - vk
-            b1, b2, g11, g22, g12 = avg(d1 * r), avg(d2 * r), avg(d1 * d1), avg(d2 * d2), avg(d1 * d2)
-            del r, d1, d2
+            v1, v2 = rollout(fns[oth[0]], vaz, vics), rollout(fns[oth[1]], vaz, vics)
+            r = lambda c: vtruth[c] - vk[c]  # noqa: E731
+            d1 = lambda c: v1[c] - vk[c]  # noqa: E731
+            d2 = lambda c: v2[c] - vk[c]  # noqa: E731
+            avg = lambda f, g: gmean(lambda c: f(c) * g(c) * w, nv).astype(np.float64)  # noqa: E731  (L, 67)
+            b1, b2, g11, g22, g12 = avg(d1, r), avg(d2, r), avg(d1, d1), avg(d2, d2), avg(d1, d2)
+            drop(v1, v2)
+            v1 = v2 = None
             best = simplex2(b1, b2, g11, g22, g12)  # (2, L, 67)
             w1, w2 = (x[None, :, :, None, None] for x in best)
             name = f"blend_{combo}" + sfx
-            res[name] = metrics(keep[bt] + w1 * (keep[oth[0]] - keep[bt]) + w2 * (keep[oth[1]] - keep[bt]))
+            res[name] = metrics(Lazy(lambda c, w1=w1, w2=w2, kb=keep[bt], k1=keep[oth[0]], k2=keep[oth[1]]:
+                                     kb[c] + w1 * (k1[c] - kb[c]) + w2 * (k2[c] - kb[c]), len(ics)))
             res[name]["kai_weight"] = 1 - best.sum(0)
             res[name]["other_weights"] = best
             print("scored", name, flush=True)
-        del vk
+        drop(vk)
+        vk = None
     # --blend-loop LOOP+OTHER: the coupled loop as the base of a lead-wise blend with another scored core (the RMSE
     # readout of the final model: the loop keeps the strong trajectory, the blend adds the long-rollout core's
     # damped field per lead and channel). Name: blend_<other>@<loop>.
@@ -644,19 +844,24 @@ def score(a, tags):
         if lp not in fns or other not in keep or not bases:
             continue
         vk, vc = rollout(fns[lp], vaz, vics), rollout(fns[other], vaz, vics)
-        num = ((vk - vc) * (vtruth - vc) * w).mean((0, -2, -1))
-        den = ((vk - vc) ** 2 * w).mean((0, -2, -1))
+        num = gmean(lambda c: (vk[c] - vc[c]) * (vtruth[c] - vc[c]) * w, len(vics))
+        den = gmean(lambda c: (vk[c] - vc[c]) ** 2 * w, len(vics))
         wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of the loop
-        del vk, vc
+        drop(vk, vc)
+        vk = vc = None
         wb = wk[None, :, :, None, None]
         name = f"blend_{other}@{lp}"
-        res[name] = metrics(wb * rollout(fns[lp], tez, ics) + (1 - wb) * keep[other])
+        tl = rollout(fns[lp], tez, ics)
+        res[name] = metrics(Lazy(lambda c, wb=wb, tl=tl, ko=keep[other]: wb * tl[c] + (1 - wb) * ko[c], len(ics)))
+        drop(tl)
+        del tl
         res[name]["kai_weight"] = wk
         print("scored", name, flush=True)
     # --seq-mix A+B[+C]: the members' one-day forecasts mixed EVERY step with weights per lead and channel and fed
     # back (the step-wise coupling with lead-dependent weights). The weights are fitted on the validation year
     # step by step: given the mixed states of day k, the weights of day k + 1 minimize that day's error.
     for combo in a.seq_mix:
+        assert not big and dev.type == "cpu", "--seq-mix: small grids on the CPU only"
         mem = combo.split("+")
         if not (2 <= len(mem) <= 3) or not all(t in models or t in a.seq_cores for t in mem):
             continue
@@ -698,10 +903,13 @@ def score(a, tags):
             return torch.stack(out, 1)
         name = f"seq_{combo}"
         fns[name] = seq_fn
-        res[name] = metrics(rollout(seq_fn, tez, ics))
+        res[name] = scored(seq_fn)
         res[name]["seq_weights"] = W
         print("scored", name, flush=True)
     run_cascades()
+    if big:
+        keep.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
     np.savez_compressed(os.path.join(a.out, "score_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
     summarize(a, res, std, ics)
@@ -906,6 +1114,16 @@ def parser():
     p.add_argument("--stop-at", type=int, default=0, help="test of --resume: stop after the log step of this iteration")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cpu", help="cuda: train and score on a GPU (the data stays in main memory)")
+    p.add_argument("--lazy", action="store_true",
+                   help="keep the years on disk and normalize per batch (automatic above 1 GB a year: the 1.5 deg grid)")
+    p.add_argument("--core-ckpt", action="store_true",
+                   help="core training: gradient checkpointing per day, the activations of a day are recomputed in "
+                        "the backward pass (a fine grid with --core-substeps: a sequence costs the memory of one day)")
+    p.add_argument("--score-batch", type=int, default=16, help="ICs per forward pass of a rollout in the score")
+    p.add_argument("--val-batch", type=int, default=16, help="days per forward pass of the validation loss")
+    p.add_argument("--score-chunk", type=int, default=0,
+                   help="ICs per chunk of the metrics (0 = all at once; a fine grid: about 0.8 GB a chunk)")
     return p
 
 

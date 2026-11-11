@@ -9,6 +9,11 @@ WeatherBench1-style ``<out>/era5_data``), built from one ``YYYYMMDD.nc`` per UTC
     * tisr and skt are the archive's own fields (wb2_to_kai.py had to compute tisr and copy t2m)
     * orography / lsm from the 0.25 deg constant files, regridded the same way
 
+``--daily-mean`` (the tendency core +, docs/kai_tendency_plus.md): only the daily means of the four snapshots,
+``<out>/kaiday/<year>.npy`` (D, 67, H, W) float32, the cache scripts/run_kai_tendency.py reads; no 6-hourly file
+(12.8 GB a year at 1.40625 deg). ``--grid 1.5`` = KAI's own grid, 121 x 240 with the two pole rows (their cells
+are the half cells poleward of 89.25 deg, as in WeatherBench2's 240x121 conservative files).
+
 The archive is only read. One process per year:
 
     python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5/hourly --check --years 2016 --out data/era5_5p625
@@ -28,7 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
 
 H, W, DEG, LAT, LON = None, None, None, None, None
-GRIDS = {"5.625": (32, 64), "2.8125": (64, 128), "1.40625": (128, 256), "0.703125": (256, 512)}
+GRIDS = {"5.625": (32, 64), "2.8125": (64, 128), "1.40625": (128, 256), "0.703125": (256, 512), "1.5": (121, 240)}
 
 
 def set_grid(deg):
@@ -38,6 +43,9 @@ def set_grid(deg):
     global H, W, DEG, LAT, LON
     H, W = GRIDS[deg]
     DEG = deg
+    if deg == "1.5":  # KAI's grid: equiangular WITH poles (pgcfm.contract), not nested in the 64x32 grid
+        LAT, LON = np.linspace(-90.0, 90.0, H), 1.5 * np.arange(W)
+        return
     LAT = -90 + float(deg) * (np.arange(H) + 0.5)  # S -> N
     LON = float(deg) * np.arange(W) if deg == "5.625" else -2.8125 + float(deg) * (np.arange(W) + 0.5)
 
@@ -98,7 +106,7 @@ def weights(src_lat, src_lon):
     d = abs(src_lat[1] - src_lat[0])
     lo, hi = np.clip(src_lat - d / 2, -90, 90), np.clip(src_lat + d / 2, -90, 90)
     s = lambda q: np.sin(np.deg2rad(q))  # noqa: E731
-    wy = overlap(s(lo), s(hi), s(LAT - float(DEG) / 2), s(LAT + float(DEG) / 2))
+    wy = overlap(s(lo), s(hi), s(np.clip(LAT - float(DEG) / 2, -90, 90)), s(np.clip(LAT + float(DEG) / 2, -90, 90)))
     dl = src_lon[1] - src_lon[0]
     wx = np.zeros((W, len(src_lon)))
     for shift in (-360.0, 0.0, 360.0):  # periodic in longitude
@@ -193,17 +201,37 @@ def constants(root, orog_file, lsm_file):
     os.replace(p + ".tmp", p)
 
 
-def year_job(src, out, year, orog_z, pattern=PATTERN, deg="5.625"):
+def year_job(src, out, year, orog_z, pattern=PATTERN, deg="5.625", daily=False, n_days=None):
     global PATTERN
     PATTERN = pattern
     set_grid(deg)
     kai = os.path.join(out, "kai6h", f"{year}.nc")
     root = os.path.join(out, "era5_data")
-    if os.path.exists(kai) and os.path.exists(os.path.join(root, "geopotential_500", f"geopotential_500_{year}_{DEG}deg.nc")):
+    day_file = os.path.join(out, "kaiday", f"{year}.npy")
+    if daily and os.path.exists(day_file):
         return f"{year} exists"
-    days = np.arange(np.datetime64(f"{year}-01-01"), np.datetime64(f"{year + 1}-01-01"))
+    if not daily and os.path.exists(kai) and os.path.exists(
+            os.path.join(root, "geopotential_500", f"geopotential_500_{year}_{DEG}deg.nc")):
+        return f"{year} exists"
+    days = np.arange(np.datetime64(f"{year}-01-01"), np.datetime64(f"{year + 1}-01-01"))[:n_days]
     with nc.Dataset(day_path(src, days[0])) as d:
         wy, wx = weights(np.asarray(var(d, "latitude")[:], np.float64), np.asarray(var(d, "longitude")[:], np.float64))
+    if daily:  # the tendency core +: the mean of the four snapshots of every day, written day by day
+        os.makedirs(os.path.dirname(day_file), exist_ok=True)
+        f = np.lib.format.open_memmap(day_file + ".tmp.npy", mode="w+", dtype=np.float32,
+                                      shape=(len(days), contract.N_CHANNELS, H, W))
+        for i, day in enumerate(days):
+            fd, _ = day_fields(day_path(src, day), wy, wx)
+            fd[:, contract.CHANNEL_INDEX["orog"]] = orog_z
+            if not np.isfinite(fd).all():
+                raise RuntimeError(f"{day}: non-finite values")
+            f[i] = fd.mean(0)
+            if (i + 1) % 60 == 0:
+                print(f"  {year}: {i + 1}/{len(days)} days", flush=True)
+        f.flush()
+        del f
+        os.replace(day_file + ".tmp.npy", day_file)
+        return f"{year} done (daily means)"
     f = np.empty((4 * len(days), contract.N_CHANNELS, H, W), dtype=np.float32)
     cm = {k: np.empty((4 * len(days), H, W), dtype=np.float32) for k in CLIMODE}
     for i, day in enumerate(days):
@@ -235,6 +263,9 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--pattern", default=PATTERN, help='day file under --src: "{ymd}.nc" (default), "{year}/{ymd}.nc", ...')
     p.add_argument("--check", action="store_true", help="only check the first year's first day file and stop")
+    p.add_argument("--daily-mean", action="store_true",
+                   help="write only <out>/kaiday/<year>.npy, the daily means of 00/06/12/18 UTC (tendency core +)")
+    p.add_argument("--days", type=int, default=None, help="only the first n days of every year (smoke test)")
     a = p.parse_args(argv)
     PATTERN = a.pattern
     set_grid(a.grid)
@@ -245,8 +276,9 @@ def main(argv=None):
     with xr.open_dataset(os.path.join(a.out, "era5_data", "constants", f"constants_{DEG}deg.nc")) as c:
         orog_z = c["geopotential_at_surface"].values.astype(np.float32)
     with ProcessPoolExecutor(a.workers) as ex:
-        for r in ex.map(year_job, [a.src] * len(a.years), [a.out] * len(a.years), a.years,
-                        [orog_z] * len(a.years), [a.pattern] * len(a.years), [a.grid] * len(a.years)):
+        n = len(a.years)
+        for r in ex.map(year_job, [a.src] * n, [a.out] * n, a.years, [orog_z] * n, [a.pattern] * n, [a.grid] * n,
+                        [a.daily_mean] * n, [a.days] * n):
             print(r, flush=True)
 
 

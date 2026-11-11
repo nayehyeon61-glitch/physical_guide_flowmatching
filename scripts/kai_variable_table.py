@@ -86,6 +86,7 @@ def main(argv=None):
     p.add_argument("--extra", nargs="*", default=[], help="more score.json files of the same test set (missing models)")
     p.add_argument("--stats", default="", help="stats.npz of the run: adds the column norm (training std) to the csv")
     p.add_argument("--raw", nargs="*", default=[], help="score_*_raw.npz: adds information RMSE i1..iN and activity a1..aN")
+    p.add_argument("--grid", default="5.625", help="grid spacing in degrees, for the title only")
     a = p.parse_args(argv)
     d = json.load(open(a.score))
     arms = dict(d["arms"])
@@ -101,6 +102,8 @@ def main(argv=None):
     lab = dict(models)
     R = {k: np.array(arms[k]["rmse"]) for k, _ in models}
     sc = [i for i, n in enumerate(NAMES) if n not in ("tisr", "orog")]
+    n_lead = min(len(v) for v in R.values())  # a short score (smoke test): only the leads it has
+    a.leads, a.head_leads = [x for x in a.leads if x <= n_lead], [x for x in a.head_leads if x <= n_lead]
     L = [x - 1 for x in a.leads]
     ls = " / ".join(str(x) for x in a.leads)
 
@@ -112,7 +115,7 @@ def main(argv=None):
 
     n_ic = d.get("ics", 0)
     n_ic = n_ic if isinstance(n_ic, int) else len(n_ic)
-    out = [f"# 변수별 RMSE 비교 ({os.path.basename(a.score)}, IC {n_ic}개, 일평균 5.625°)", "",
+    out = [f"# 변수별 RMSE 비교 ({os.path.basename(a.score)}, IC {n_ic}개, 일평균 {a.grid}°)", "",
            f"RMSE는 물리 단위이고 낮을수록 좋습니다. 선행 {ls}일 순서입니다.",
            "단위: z m²/s², t / t2m / skt K, u / v m/s, q g/kg, msl / sp hPa, tcwv kg/m².", "",
            "모델: " + "; ".join(f"{b} = `{k}`" for k, b in models), "",

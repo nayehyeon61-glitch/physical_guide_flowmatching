@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from . import contract
 
@@ -308,7 +309,7 @@ def _mem_core_class():
                 nxt = history[:, k + 1] if k + 1 < W else x0
                 xk = history[:, k]  # one tensor for the memory and the step (the operator's G is cached per tensor)
                 self.remember(xk)
-                self.fc = super().step(xk, hours0 - (W - k) * 24.0, None if nxt is None else nxt[:, TISR_DYN])
+                self.fc = self._advance(xk, hours0 - (W - k) * 24.0, None if nxt is None else nxt[:, TISR_DYN])
                 out.append(self.fc)
             self.seq = torch.stack(out, 1)
 
@@ -345,8 +346,16 @@ def _mem_core_class():
                         on = torch.ones(1, self.PD.shape[1], 1, 1, dtype=self.PD.dtype, device=self.PD.device)
                         on[:, off] = 0.0
                         parts.append(self.PD * on)
-            v = torch.cat(parts, 1)
-            self.m = self.gru(self.enc(v), self.m)
+            if self.grad_ckpt and torch.is_grad_enabled() and not self.acc:
+                # the tendency core +: the memory update is recomputed in the backward pass as well (its inputs
+                # are kept one by one, not their concatenation; the memory before it is read from the closure)
+                m0 = self.m
+                self.m = torch.utils.checkpoint.checkpoint(lambda *p: self.gru(self.enc(torch.cat(p, 1)), m0),
+                                                           *parts, use_reentrant=False)
+                v = None
+            else:
+                v = torch.cat(parts, 1)
+                self.m = self.gru(self.enc(v), self.m)
             if self.acc:  # the time integral of the past with the fixed kernels (an empty accumulator = no past)
                 u = (1 - self.lam) * torch.tanh(self.enc_acc(v))
                 self.z = u if self.z is None else self.lam * self.z + u
@@ -375,11 +384,40 @@ def _mem_core_class():
                 f = f + self.long(torch.cat(long, 1)) * self.t6 * self.keep
             return f
 
+        def _advance(self, x, hours, tisr_next):
+            """One day of the solver with the memory of this day (all its Heun substeps).
+
+            ``grad_ckpt`` (the tendency core +, a fine grid with several substeps a day): the activations of a
+            substep are not kept for the backward pass but recomputed in it (torch.utils.checkpoint), so a
+            sequence of W + K days costs the memory of ONE substep. The substep is then a pure function of its
+            inputs: the memory state and the accumulators it reads are handed over as arguments (in the backward
+            pass the attributes already hold the values of later days)."""
+            if not (self.grad_ckpt and torch.is_grad_enabled()):
+                return DynCore.step(self, x, hours, tisr_next)
+            names = [k for k in ("m", "z", "M") if getattr(self, k) is not None]
+            n = self.n_sub()
+
+            def sub(i):
+                def f(x, hours, *state):
+                    keep = [getattr(self, k) for k in names]
+                    for k, v in zip(names, state):
+                        setattr(self, k, v)
+                    try:
+                        return DynCore.substep(self, x, hours, i, n)
+                    finally:
+                        for k, v in zip(names, keep):
+                            setattr(self, k, v)
+                return f
+            state = [getattr(self, k) for k in names]
+            for i in range(n):
+                x = torch.utils.checkpoint.checkpoint(sub(i), x, hours, *state, use_reentrant=False)
+            return DynCore.finish(self, x, tisr_next)
+
         def step(self, x, hours, tisr_next):
             if not (self.freeze_mem and self.started):
                 self.remember(x)  # the time integral of the past first, then the prediction in time
             self.started = True
-            self.fc = super().step(x, hours, tisr_next)
+            self.fc = self._advance(x, hours, tisr_next)
             return self.fc
     return MemCore
 
@@ -440,11 +478,13 @@ class CachedFeatures:
         return self.val
 
 
-def operator_features(mean, std, x_full: torch.Tensor, states: Optional[torch.Tensor] = None, scale=None):
+def operator_features(mean, std, x_full: torch.Tensor, states: Optional[torch.Tensor] = None, scale=None,
+                      device=None, chunk: int = 8):
     """Step 18's operator features on KAI's daily contract: G(x) = -R0(x), the discrete primitive-equation
     operator's own tendency of (u, v, T, q) on the 12 levels (48 physical terms) at a normalized state of the 66
     dynamic channels. ``x_full`` (>= 1, 67, H, W) normalized: its orography channel is the lower boundary.
-    ``states`` (N, 66, H, W): estimate the per-channel scale (RMS of G over the valid points) from them."""
+    ``states`` (N, 66, H, W): estimate the per-channel scale (RMS of G over the valid points) from them, ``chunk``
+    states at a time (anything with .shape[0] and slices that give tensors: a fine grid is read from disk)."""
     from .coupling import PhysicsConfig, PhysicsGuide
     from .dyncore import OperatorFeatures, StrongPhysics
     H, W = x_full.shape[-2:]
@@ -453,13 +493,24 @@ def operator_features(mean, std, x_full: torch.Tensor, states: Optional[torch.Te
         q.requires_grad_(False)
     feats = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC)), x_full[:1, [OROG]].float(), scale)
     if states is not None:
-        feats.scale = feats.estimate_scale(states)
+        feats.scale = feats.estimate_scale(states, chunk)
+    if device is not None:  # after the scale estimate (CPU states): the operator follows the core to its device
+        feats.to(device)
     return feats
 
 
 def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:
-    """One day of the core on the 66 dynamic channels (season phase from the day of year)."""
-    return core.step(xd, doy.float() * 24.0, tisr_next)
+    """One day of the core on the 66 dynamic channels (season phase from the day of year). ``core.grad_ckpt``:
+    the activations of a substep are recomputed in the backward pass (a memory core does that itself, _advance;
+    a history core keeps its trend as an attribute and is stepped as it is)."""
+    hours = doy.float() * 24.0
+    if getattr(core, "grad_ckpt", False) and torch.is_grad_enabled() and not getattr(core, "hist", False):
+        n, x = core.n_sub(), xd
+        for i in range(n):
+            x = torch.utils.checkpoint.checkpoint(lambda x, h, i=i: core.substep(x, h, i, n), x, hours,
+                                                  use_reentrant=False)
+        return core.finish(x, tisr_next)
+    return core.step(xd, hours, tisr_next)
 
 
 def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
@@ -491,7 +542,9 @@ class CoreBase:
         self.mem = getattr(core, "mem", 0)
         if self.mem and not stateful:  # e.g. inside KAI's training, where every batch is a new trajectory
             raise NotImplementedError("a memory core is stepped along one trajectory only (CoreBase(core, stateful=True))")
-        self.core, self.dyn, self.hist = core, torch.tensor(DYN), getattr(core, "hist", False) and not self.mem
+        dev = next(core.parameters()).device  # the index of the dynamic channels lives where the core does
+        self.core, self.dyn = core, torch.tensor(DYN, device=dev)
+        self.hist = getattr(core, "hist", False) and not self.mem
 
     def start(self, history, doy, x0):
         """history (B, W, 67, H, W): the full states of the W days before the IC x0 (B, 67, H, W), oldest first."""
