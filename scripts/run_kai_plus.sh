@@ -16,6 +16,9 @@
 #   GRID=1.40625 SRC=local bash scripts/run_kai_plus.sh           # from the local 0.25 deg hourly archive ($ARCHIVE)
 #   SRC=none DATA=/path/with/kaiday bash scripts/run_kai_plus.sh  # the daily means are there already
 #   PLUS_HIDDEN=96 PLUS_BLOCKS="2 2 2" CORE_BATCH=4 ...           # a wider core+ (about 3 GB of activations per sample; default 1.6 GB)
+#   KAI_CKPT=0 KAI_BATCH=8 RO_BATCH=2 ...                         # KAI without gradient checkpointing: faster per iteration, but
+#                                                                 #   about 6 GB of activations per sample and rollout day at 1.5 deg
+#                                                                 #   (with it, the default: about 2 GB; CPU measurements, docs sec. 4)
 #   GFEAT=0 ...                                                   # core+ without the physical terms (GRU + MZ only)
 #   SMOKE=1 bash scripts/run_kai_plus.sh                          # a few iterations of every step on 24 days a year,
 #                                                                 #   in its own folders (data/era5_1p5_smoke, runs/kaiplus_1p5_smoke)
@@ -44,7 +47,9 @@ KAI_DEPTHS=${KAI_DEPTHS:-"3 3 15 3"}
 KAI_DIMS=${KAI_DIMS:-"48 96 192 288"}
 KAI_ITERS=${KAI_ITERS:-20000}
 KAI_BATCH=${KAI_BATCH:-8}
+KAI_CKPT=${KAI_CKPT:-1}                # gradient checkpointing per KAI block (KAI keeps the full grid in every stage)
 RO_ITERS=${RO_ITERS:-1000}
+RO_BATCH=${RO_BATCH:-4}                # the rollout fine-tuning stores 3 days of activations per sample
 SUBSTEPS=${SUBSTEPS:-4}                # Heun steps a day: about 5.625 / GRID
 PLUS_HIDDEN=${PLUS_HIDDEN:-48}
 PLUS_BLOCKS=${PLUS_BLOCKS:-"2 2"}
@@ -59,7 +64,7 @@ LEADS=${LEADS:-10}
 C=core_plus
 LOGK=500; LOGC=250
 if [ "$SMOKE" = 1 ]; then
-    KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; KAI_ITERS=4; KAI_BATCH=2; RO_ITERS=2; CORE_ITERS=2; CORE_BATCH=1
+    KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; KAI_ITERS=4; KAI_BATCH=2; RO_ITERS=2; RO_BATCH=2; CORE_ITERS=2; CORE_BATCH=1
     SCORE_BATCH=2; VAL_BATCH=1; IC_STRIDE=6; LEADS=4; LOGK=2; LOGC=1; THREADS=${THREADS_SMOKE:-2}
 fi
 mkdir -p "$OUT"
@@ -91,9 +96,10 @@ D="$D --val-year $VAL_YEAR --test-year $TEST_YEAR --device $DEVICE --threads $TH
 R="python scripts/run_kai_tendency.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS"
 
 # 2. KAI at its own size, 3. the same KAI fine-tuned in its own 2 to 3 day rollout
-step kai "$OUT/kai.pt" $R --arm kai --tag kai --iters "$KAI_ITERS" --batch "$KAI_BATCH" --log-every $LOGK --resume
+KC=""; [ "$KAI_CKPT" = 1 ] && KC="--kai-ckpt"
+step kai "$OUT/kai.pt" $R --arm kai --tag kai --iters "$KAI_ITERS" --batch "$KAI_BATCH" --log-every $LOGK --resume $KC
 step kai_ro "$OUT/kai_ro.pt" $R --arm kai --tag kai_ro --init kai --rollout 2 3 --lr 3e-4 --iters "$RO_ITERS" \
-    --batch "$KAI_BATCH" --log-every $LOGK --resume
+    --batch "$RO_BATCH" --log-every $LOGK --resume $KC
 
 # 4. the tendency core +
 G=""; [ "$GFEAT" = 1 ] && G="--core-gfeat"

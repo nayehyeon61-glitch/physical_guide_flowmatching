@@ -605,6 +605,9 @@ class KAIPos(nn.Module):
         # rollout training: the gradient of a later day's loss has to pass through the frozen core's input
         # (c(x) = x + ...: without it the main path of forms "core" / "gate" is cut). Off = single-step training.
         self.core_grad = False
+        # gradient checkpointing per block: KAI keeps the full grid in all four stages, so on a fine grid the
+        # stored activations of a training step (about 12 x dim maps per block) are the memory limit
+        self.grad_ckpt = False
         self.uses_core = cfg.form in ("core", "gate") or cfg.inject not in ("none", "hist")
         if self.uses_core and core is None:
             raise ValueError("this arm needs the frozen tendency core")
@@ -628,7 +631,12 @@ class KAIPos(nn.Module):
         m = self.kai.core_model
         h = torch.cat([x, tau], 1) if cfg.inject in ("in", "hist") else x
         for i in range(4):
-            h = m.stages[i](m.downsample_layers[i](h))
+            h = m.downsample_layers[i](h)
+            if self.grad_ckpt and torch.is_grad_enabled() and h.requires_grad:
+                for blk in m.stages[i]:  # a block's activations are recomputed in the backward pass
+                    h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False)
+            else:
+                h = m.stages[i](h)
             if cfg.inject.startswith("s") and i == self.stage:
                 h = h + self.proj(tau)
         o = m.head(h)

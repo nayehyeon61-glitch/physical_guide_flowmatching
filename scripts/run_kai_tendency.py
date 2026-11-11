@@ -343,6 +343,7 @@ def train(a, arm):
             assert set(miss.missing_keys) <= {"dyn", "gate"} and not miss.unexpected_keys, miss
         cur = a.rollout  # [1] = KAI's single-step training
         m.core_grad = max(cur) > 1
+        m.grad_ckpt = bool(a.kai_ckpt)  # the activations of a block are recomputed in the backward pass
         gate = [q for k, q in m.named_parameters() if k == "gate"]
         rest = [q for k, q in m.named_parameters() if k != "gate"]
         opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else []),
@@ -464,6 +465,8 @@ def train(a, arm):
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
+            if dev.type == "cuda":  # peak GPU memory since the start (training step and validation)
+                log[-1]["gpu_gb"] = round(torch.cuda.max_memory_allocated(dev) / 2 ** 30, 2)
             if is_core and orth_log is not None:  # residual correlation at lag 1, 2 in the last batch's sequences
                 log[-1]["res_corr"] = [round(o, 4) for o in orth_log]
                 if acc_log:  # correlation of the residual with the residuals accumulated over tau days
@@ -1148,6 +1151,9 @@ def parser():
     p.add_argument("--core-ckpt", action="store_true",
                    help="core training: gradient checkpointing per day, the activations of a day are recomputed in "
                         "the backward pass (a fine grid with --core-substeps: a sequence costs the memory of one day)")
+    p.add_argument("--kai-ckpt", action="store_true",
+                   help="KAI training: gradient checkpointing per block (KAI keeps the full grid in every stage; a fine "
+                        "grid at KAI's own size stores about 6 GB of activations per sample and day without it)")
     p.add_argument("--score-batch", type=int, default=16, help="ICs per forward pass of a rollout in the score")
     p.add_argument("--val-batch", type=int, default=16, help="days per forward pass of the validation loss")
     p.add_argument("--score-chunk", type=int, default=0,
