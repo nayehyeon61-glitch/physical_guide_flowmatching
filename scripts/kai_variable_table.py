@@ -71,7 +71,9 @@ def main(argv=None):
     def gain(ka, kb, c):
         return " / ".join(f"{100 * (1 - R[ka][i, c] / R[kb][i, c]):+.1f}" for i in L)
 
-    out = [f"# 변수별 RMSE 비교 ({os.path.basename(a.score)}, IC {len(d.get('ics', []))}개, 일평균 5.625°)", "",
+    n_ic = d.get("ics", 0)
+    n_ic = n_ic if isinstance(n_ic, int) else len(n_ic)
+    out = [f"# 변수별 RMSE 비교 ({os.path.basename(a.score)}, IC {n_ic}개, 일평균 5.625°)", "",
            f"RMSE는 물리 단위이고 낮을수록 좋습니다. 선행 {ls}일 순서입니다.",
            "단위: z m²/s², t / t2m / skt K, u / v m/s, q g/kg, msl / sp hPa, tcwv kg/m².", "",
            "모델: " + "; ".join(f"{b} = `{k}`" for k, b in models), "",
