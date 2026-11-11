@@ -22,6 +22,9 @@
 #   GFEAT=0 ...                                                   # core+ without the physical terms (GRU + MZ only)
 #   SMOKE=1 bash scripts/run_kai_plus.sh                          # a few iterations of every step on 24 days a year,
 #                                                                 #   in its own folders (data/era5_1p5_smoke, runs/kaiplus_1p5_smoke)
+#   KAI_ITERS=200 RO_ITERS=20 CORE_ITERS=40 LOGK=50 LOGC=10 OUT=runs/kaiplus_1p5_test bash scripts/run_kai_plus.sh
+#                                                                 # a short training test at the real size on the real data: the
+#                                                                 #   logs give seconds per iteration ("sec") and GPU memory ("gpu_gb")
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -62,7 +65,7 @@ VAL_BATCH=${VAL_BATCH:-4}                # days per forward pass of the validati
 IC_STRIDE=${IC_STRIDE:-3}
 LEADS=${LEADS:-10}
 C=core_plus
-LOGK=500; LOGC=250
+LOGK=${LOGK:-500}; LOGC=${LOGC:-250}   # iterations between two log lines of the KAI / core training (each runs the validation loss)
 if [ "$SMOKE" = 1 ]; then
     KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; KAI_ITERS=4; KAI_BATCH=2; RO_ITERS=2; RO_BATCH=2; CORE_ITERS=2; CORE_BATCH=1
     SCORE_BATCH=2; VAL_BATCH=1; IC_STRIDE=6; LEADS=4; LOGK=2; LOGC=1; THREADS=${THREADS_SMOKE:-2}
