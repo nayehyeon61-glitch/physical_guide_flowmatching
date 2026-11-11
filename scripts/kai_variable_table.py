@@ -1,0 +1,121 @@
+"""Per-variable table of a KAI / tendency-core score: RMSE in physical units by lead, and the gains.
+
+    python scripts/kai_variable_table.py runs/kaitend/score_Lk.json out.md \
+        "kai=KAI" "core_gngmz=final core" "loop_core_gngmz=final model" ... [--base kai] [--pairs A:B ...]
+        [--leads 1 3 5 7 10] [--head t2m t850 z500 u850 msl]
+
+Owner (2026-11-11): the comparison is read as a weather-benchmark table, per variable (t2m, t850, z500, ...) in
+physical units with persistence and climatology as references, next to the normalized 65-channel gains.
+Writes a Markdown file with (1) the RMSE of every scored variable for every listed model, (2) the gain of every
+model over ``--base`` in % (+ = better), (3) the gain of A over B for every ``--pairs A:B``; prints the head table
+(the ``--head`` variables) and up to which lead each model beats climatology.
+Units: z m2/s2, t / t2m / skt K, u / v m/s, q g/kg, msl / sp hPa, tcwv kg/m2.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from pgcfm import contract  # noqa: E402
+
+NAMES = contract.CHANNEL_NAMES
+
+
+def unit(n):
+    if n in ("msl", "sp"):
+        return 0.01, "hPa"
+    if n == "tcwv":
+        return 1.0, "kg/m²"
+    if n[0] == "q":
+        return 1000.0, "g/kg"
+    if n[0] == "z":
+        return 1.0, "m²/s²"
+    if n[0] in "uv":
+        return 1.0, "m/s"
+    return 1.0, "K"  # t levels, t2m, skt
+
+
+def fmt(v):
+    return f"{v:.0f}" if v >= 100 else f"{v:.1f}" if v >= 10 else f"{v:.2f}" if v >= 0.1 else f"{v:.3f}"
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("score")
+    p.add_argument("out")
+    p.add_argument("models", nargs="+", help="tag=label; persistence and climatology are added in front")
+    p.add_argument("--base", default="kai")
+    p.add_argument("--pairs", nargs="*", default=[], help="A:B = gain of A over B per variable")
+    p.add_argument("--leads", type=int, nargs="+", default=[1, 3, 5, 7, 10])
+    p.add_argument("--head", nargs="+", default=["t2m", "t850", "z500", "u850", "msl"])
+    p.add_argument("--head-leads", type=int, nargs="+", default=[1, 5, 10])
+    a = p.parse_args(argv)
+    d = json.load(open(a.score))
+    arms = d["arms"]
+    models = [("persistence", "persistence"), ("climatology", "climatology")]
+    models += [tuple(m.split("=", 1)) if "=" in m else (m, m) for m in a.models]
+    models = [(k, lab) for k, lab in models if k in arms]
+    lab = dict(models)
+    R = {k: np.array(arms[k]["rmse"]) for k, _ in models}
+    sc = [i for i, n in enumerate(NAMES) if n not in ("tisr", "orog")]
+    L = [x - 1 for x in a.leads]
+    ls = " / ".join(str(x) for x in a.leads)
+
+    def cell(k, c, leads=L):
+        return " / ".join(fmt(R[k][i, c] * unit(NAMES[c])[0]) for i in leads)
+
+    def gain(ka, kb, c):
+        return " / ".join(f"{100 * (1 - R[ka][i, c] / R[kb][i, c]):+.1f}" for i in L)
+
+    out = [f"# 변수별 RMSE 비교 ({os.path.basename(a.score)}, IC {len(d.get('ics', []))}개, 일평균 5.625°)", "",
+           f"RMSE는 물리 단위이고 낮을수록 좋습니다. 선행 {ls}일 순서입니다.",
+           "단위: z m²/s², t / t2m / skt K, u / v m/s, q g/kg, msl / sp hPa, tcwv kg/m².", "",
+           "모델: " + "; ".join(f"{b} = `{k}`" for k, b in models), "",
+           f"## 1. 변수별 RMSE (선행 {ls}일)", "",
+           "| 변수 | 단위 | " + " | ".join(b for _, b in models) + " |", "|---|---|" + "---|" * len(models)]
+    out += [f"| {NAMES[c]} | {unit(NAMES[c])[1]} | " + " | ".join(cell(k, c) for k, _ in models) + " |" for c in sc]
+    cmp_ = [(k, b) for k, b in models if k not in ("persistence", "climatology", a.base)]
+    if a.base in R and cmp_:
+        out += ["", f"## 2. {lab[a.base]} 대비 RMSE 이득 % (+ = 좋아짐, 선행 {ls}일)", "",
+                "| 변수 | " + " | ".join(b for _, b in cmp_) + " |", "|---|" + "---|" * len(cmp_)]
+        out += [f"| {NAMES[c]} | " + " | ".join(gain(k, a.base, c) for k, _ in cmp_) + " |" for c in sc]
+    pairs = [pr.split(":") for pr in a.pairs]
+    pairs = [(x, y) for x, y in pairs if x in R and y in R]
+    if pairs:
+        out += ["", f"## 3. 짝 비교: RMSE 이득 % (+ = 앞의 모델이 좋음, 선행 {ls}일)", "",
+                "| 변수 | " + " | ".join(f"{lab[x]} 대 {lab[y]}" for x, y in pairs) + " |", "|---|" + "---|" * len(pairs)]
+        out += [f"| {NAMES[c]} | " + " | ".join(gain(x, y, c) for x, y in pairs) + " |" for c in sc]
+    with open(a.out, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+    hl = [x - 1 for x in a.head_leads]
+    head = [h for h in a.head if h in NAMES]
+    print(f"RMSE, 선행 {' / '.join(str(x) for x in a.head_leads)}일")
+    print("| 모델 | " + " | ".join(f"{h} ({unit(h)[1]})" for h in head) + " |")
+    print("|---|" + "---|" * len(head))
+    for k, b in models:
+        print(f"| {b} | " + " | ".join(cell(k, NAMES.index(h), hl) for h in head) + " |")
+    if a.base in R:
+        for x, y in [(k, a.base) for k, _ in cmp_] + pairs:
+            print(f"\nRMSE 이득 %, {lab[x]} 대 {lab[y]}, 선행 {ls}일")
+            for h in head:
+                print(f"| {h} | {gain(x, y, NAMES.index(h))} |")
+    if "climatology" in R:
+        print("\nclimatology를 이기는 마지막 선행일")
+        for k, b in models:
+            if k in ("persistence", "climatology"):
+                continue
+            row = []
+            for h in head:
+                c = NAMES.index(h)
+                days = [i + 1 for i in range(R[k].shape[0]) if R[k][i, c] < R["climatology"][i, c]]
+                row.append(f"{h} {max(days) if days else 0}")
+            print(f"  {b}: " + ", ".join(row))
+
+
+if __name__ == "__main__":
+    main()
