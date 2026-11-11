@@ -834,13 +834,38 @@ def score(a, tags):
             res[name]["kai_weight"] = 1 - best.sum(0)
             res[name]["other_weights"] = best
             print("scored", name, flush=True)
+            if combo in a.loop_multi:  # KAI and both cores coupled every step: the day-1 weights, fed back
+                wa, wb2 = (torch.from_numpy(best[i][0].astype(np.float32)).view(1, -1, 1, 1).to(dev) for i in (0, 1))
+                pair = [CoreBase(get_core(o), stateful=True) for o in oth]
+                mem = max(b.mem for b in pair)
+
+                def loop2_fn(x0, doy, tis, pv=None, wa=wa, wb2=wb2, pair=pair, kai_m=kai_m, mem=mem):
+                    x, p, out = x0, pv, []
+                    if mem:  # pv = the mem days before the IC, oldest first; every memory core gets its own length
+                        for b in pair:
+                            if b.mem:
+                                b.start(pv[:, -b.mem:], doy, x0)
+                        p = pv[:, -1]
+                    for k in range(L):
+                        yk = kai_m(x, doy + k, tis[:, k], prev=p)
+                        y1, y2 = (b(x, doy + k, tis[:, k], prev=p) for b in pair)
+                        x, p = yk + wa * (y1 - yk) + wb2 * (y2 - yk), x
+                        out.append(x)
+                    return torch.stack(out, 1)
+                lname = f"loop_{combo}" + sfx
+                loop2_fn.mem = mem
+                fns[lname] = loop2_fn
+                res[lname] = scored(loop2_fn)
+                res[lname]["kai_weight"] = np.repeat((1 - best.sum(0))[:1], L, 0)
+                res[lname]["other_weights"] = np.repeat(best[:, :1], L, 1)
+                print("scored", lname, flush=True)
         drop(vk)
         vk = None
     # --blend-loop LOOP+OTHER: the coupled loop as the base of a lead-wise blend with another scored core (the RMSE
     # readout of the final model: the loop keeps the strong trajectory, the blend adds the long-rollout core's
     # damped field per lead and channel). Name: blend_<other>@<loop>.
     for combo in a.blend_loop:
-        lp, other = combo.split("+", 1)
+        lp, other = combo.rsplit("+", 1)  # the loop of two cores has a "+" in its own name
         if lp not in fns or other not in keep or not bases:
             continue
         vk, vc = rollout(fns[lp], vaz, vics), rollout(fns[other], vaz, vics)
@@ -1024,6 +1049,9 @@ def parser():
                    help="scored KAI tags that are blended with the cores / --blend-with tags")
     p.add_argument("--loop-blend", nargs="*", default=[],
                    help="core tags: score the step-wise blend (KAI and core forecasts mixed every day and fed back)")
+    p.add_argument("--loop-multi", nargs="*", default=[],
+                   help="A+B of --blend-multi (two core tags): also score the coupled loop of the base KAI with both "
+                        "cores, the day-1 weights of that blend fed back every day (name loop_A+B)")
     p.add_argument("--blend-loop", nargs="*", default=[],
                    help="LOOP+OTHER: lead-wise blend of a scored coupled loop (loop_<core>) with another scored core, "
                         "weights from the validation year (name blend_<other>@<loop>)")
