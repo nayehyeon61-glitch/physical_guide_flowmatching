@@ -49,7 +49,7 @@ x(t + 1일) = PositiveMass( x_n, 다음 날의 일사 )
 | `pgcfm/kai_tend.py` | `MemCore._advance`: substep마다 checkpoint, 기억 상태를 인자로 넘김. `remember`: GRU 갱신도 checkpoint. `core_step`: 기억항이 없는 core도 substep마다 checkpoint. `operator_features(..., chunk)`. `KAIPos.grad_ckpt`: KAI의 블록마다 checkpoint(4.4절) |
 | `scripts/run_kai_tendency.py` | `--device`, `--lazy`, `--core-ckpt`, `--kai-ckpt`, `--score-batch`, `--score-chunk`, `--val-batch`. 한 해가 1 GB를 넘으면 자료를 디스크에 둠(`ZYear`, `Lazy`, `stats_stream`). 채점을 초기장 묶음으로 나눔. GPU에서는 학습 log에 그때까지의 최대 GPU 메모리(`gpu_gb`)를 적음 |
 | `scripts/wb2_to_kai.py` | `--grid 240x121`(WeatherBench2의 1.5° 극 포함 격자), `--daily-mean`, `--days` |
-| `scripts/local_era5_to_kai.py` | `--grid 1.5`(극 포함), `--daily-mean`, `--days`. 0.25° 시간별 archive에서 면적 보존 평균 |
+| `scripts/local_era5_to_kai.py` | `--grid 1.5`(극 포함), `--daily-mean`, `--days`. 0.25° 시간별 archive에서 면적 보존 평균. `--src-daily`: 이미 일평균인 archive(`ERA5_0p25_DAILY`)를 그대로 읽음. 파일 배치를 첫날에서 스스로 찾고, `--check --src-daily`가 찾은 것과 값의 범위를 보여 줌 |
 | `scripts/run_kai_plus.sh` | 자료, KAI, rollout 미세조정 KAI, core +, 채점, 항별 분해, 변수별 표를 차례로 실행. 끝난 단계는 건너뛰고, 끊긴 학습은 이어서 함 |
 | `scripts/kai_step_memory.py` | KAI 학습 step 하나의 메모리, 시간, 기울기를 재는 작은 도구(4.4절) |
 | `scripts/eval_kai_breakdown.py`, `scripts/kai_variable_table.py` | 촘촘한 격자의 규모 분해: 작은 규모를 k10~32(5.625°도 푸는 규모)와 k33 이상(촘촘한 격자에만 있는 규모)으로 나눔. 선행일이 짧은 채점도 처리. 5.625° 출력은 그대로 |
@@ -115,7 +115,17 @@ core + 학습의 메모리를 단계별로 쟀습니다(batch 1, 자료와 모�
 
 그래서 `--kai-ckpt`를 넣었습니다. 블록의 입력만 남기고 블록 안의 activation은 backward에서 다시 계산합니다. 기울기는 checkpoint가 없을 때와 bit 단위로 같았습니다(시험 크기의 2일 rollout, 원래 크기의 31 × 60 모두 최대 차이 0). 대신 forward를 한 번 더 하므로 iteration당 시간이 늘어납니다. 이론상 약 1.3배이고, CPU에서 잰 값은 1.6배였습니다.
 
-실행 script는 `KAI_CKPT=1`이 기본이고, 미세조정의 batch를 따로 둡니다(`RO_BATCH`, 기본 4). 고친 뒤 새 clone에서 `SMOKE=1 DEVICE=cpu`를 다시 돌렸고, 미세조정 단계가 5.4 GB 한도 안에서 통과했습니다(고치기 전에는 6.8 GB에서 멈췄습니다).
+실행 script는 `KAI_CKPT=1`이 기본이고, 미세조정의 batch를 따로 둡니다(`RO_BATCH`, 기본 4). 고친 뒤 새 clone에서 `SMOKE=1 DEVICE=cpu`를 다시 돌려 끝까지 통과했습니다(미세조정, core +, 채점, 그림 6장, 변수별 표. 한 process의 최대 메모리 3.4 GB. 고치기 전에는 미세조정에서 6.8 GB를 넘었습니다).
+
+`--src-daily`(일평균 archive를 그대로 읽는 경로)는 실제 lustre 폴더 없이 다음으로 확인했습니다(`tests/test_local_era5_daily.py`와 손으로 돌린 것).
+
+| 시험 | 결과 |
+| --- | --- |
+| 합성 archive 네 배치(하루 파일 하나, 연도 폴더와 긴 변수 이름과 Pa 단위 층과 남북이 뒤집힌 위도, 변수별 연도 파일, 월 폴더)가 시간별 archive의 일평균과 같은가 | 같음(최대 차이 2e-4 이하, 변수와 층과 날짜가 섞이지 않음) |
+| skt나 tisr이 없는 archive | skt는 t2m을 복사, tisr은 계산해서 채우고 그 사실을 출력 |
+| 실제 1.5° 일평균 이틀을 파일로 써서 다시 읽기(같은 격자) | 원래 값과 bit 단위로 같음, 단위 경고 없음 |
+| 실제 크기(0.25°, 721 × 1440) 파일 이틀을 1.5°로 | 하루 약 5초, 메모리 0.6 GB, 전구 평균 보존 |
+| 하루 파일이 빠진 해 | 그 날짜를 적은 오류로 멈춤 |
 
 ## 5. GPU에서 돌리는 법
 
@@ -148,7 +158,27 @@ tail -f runs/kaiplus_1p5.log
 - 2번이 통과하면 장치 처리(GPU로 옮기는 곳)와 설치는 맞습니다. 결과는 `runs/kaiplus_1p5_smoke/`에 따로 쌓이고, 학습되지 않은 망이라 점수는 의미가 없습니다.
 - 3번은 본 학습과 같은 망, 같은 batch, 같은 자료입니다. log의 `sec`에서 iteration당 시간을, `gpu_gb`에서 메모리를 읽어 본 학습의 시간을 계산할 수 있습니다. 자료는 `data/era5_1p5/`에 한 번만 받고 4번이 그대로 씁니다(1.5° 일평균 한 해가 약 2.8 GB, 여섯 해 약 17 GB. 내려받는 시간은 이 기계에서 72일에 약 1분 반이었으니 한 해에 약 8분입니다).
 - 같은 명령을 다시 실행하면 끝난 단계는 건너뛰고 끊긴 학습은 이어서 합니다. 실행 전에 명령만 보려면 앞에 `DRYRUN=1`을 붙입니다.
-- 가지고 계신 0.25° 시간별 archive에서 자료를 만들려면 `SRC=local ARCHIVE=/lustre/home/mahmed/ERA5/hourly`를 붙입니다(실제 archive로는 확인하지 못했습니다). 일평균이 이미 있으면 `SRC=none DATA=<kaiday가 있는 폴더>`입니다.
+- 자료를 내려받지 않고 lustre의 0.25° 일평균을 쓰려면 아래 5.1절처럼 `SRC=daily`를 붙입니다. 0.25° 시간별 archive에서 만들려면 `SRC=local ARCHIVE=/lustre/home/mahmed/ERA5/hourly`입니다(실제 archive로는 확인하지 못했습니다). 1.5° 일평균(`kaiday/<연도>.npy`)이 이미 있으면 `SRC=none DATA=<그 폴더>`입니다.
+
+### 5.1 lustre의 0.25° 일평균(`ERA5_0p25_DAILY`)으로 학습하기
+
+```bash
+# (a) 폴더를 읽을 수 있는지 점검: 몇 초, 아무것도 쓰지 않습니다
+python scripts/local_era5_to_kai.py --src /lustre/home/mahmed/ERA5_0p25_DAILY --src-daily --check \
+    --years 2015 --grid 1.5 --out data/era5_1p5_daily
+
+# (b) 마지막 줄이 OK이고 WARNING이 없으면, 위의 2~4번에 SRC=daily만 붙입니다
+SRC=daily SMOKE=1 bash scripts/run_kai_plus.sh
+SRC=daily KAI_ITERS=200 RO_ITERS=20 CORE_ITERS=40 LOGK=50 LOGC=10 OUT=runs/kaiplus_1p5_daily_test bash scripts/run_kai_plus.sh
+grep -h '"it"' runs/kaiplus_1p5_daily_test/{kai,kai_ro,core_plus}.log
+SRC=daily nohup bash scripts/run_kai_plus.sh > runs/kaiplus_1p5_daily.log 2>&1 &
+```
+
+- 0.25° 일평균을 면적 보존 평균으로 1.5°(121 × 240)에 옮겨 `data/era5_1p5_daily/kaiday/<연도>.npy`에 씁니다. lustre 폴더는 읽기만 합니다. 내려받은 자료와 섞이지 않도록 폴더가 따로입니다(`data/era5_1p5_daily`, `runs/kaiplus_1p5_daily`, 시험은 `_smoke`가 붙습니다).
+- 파일 배치는 첫날에서 스스로 찾습니다: 이름에 날짜가 든 하루 파일(연도나 월 폴더 안이어도 됨), 변수별 파일, 월이나 연 단위 파일(시간축에서 그 날을 찾음). 변수 이름은 짧은 이름(z, q, t, u, v, t2m, sp, tcwv, msl 또는 mslp, skt, tisr)과 긴 이름을 모두 읽고, 층은 hPa와 Pa를 모두 읽습니다. skt가 없으면 t2m을 복사하고 tisr이 없으면 계산합니다.
+- (a)가 `NOT OK`이거나 `WARNING`을 내면 그 출력을 그대로 보내 주세요. 배치가 다르면 `PATTERN='{year}/{ymd}.nc'`처럼 직접 줄 수도 있습니다(`{ymd}`, `{ymd_dash}`, `{ym}`, `{year}`, `{var}`, `*`).
+- 변환 시간은 이 기계에서 하루에 약 5초였습니다(한 해 약 30분, 연도마다 process 하나라서 여섯 해가 함께 돕니다. `WORKERS`). lustre의 읽기 속도에 따라 달라집니다.
+- 실제 `ERA5_0p25_DAILY`로는 확인하지 못했습니다. 일평균의 정의(24시간 평균인지 00/06/12/18 UTC 평균인지)가 내려받은 자료와 다를 수 있고, 그러면 점수가 소수점에서 달라집니다. 학습 연도는 `TRAIN_YEARS="2008 2009 ... 2015"`처럼 늘릴 수 있습니다.
 
 기본값: 학습 2012~15, 검증 2016, 시험 2017(5.625° 시험과 같은 해), KAI는 원래 크기 (3, 3, 15, 3) / (48, 96, 192, 288). 결과는 `runs/kaiplus_1p5/`에 쌓입니다: `score.log`, `score_plus.json`, `breakdown/breakdown_plus.txt`, `variable_table_plus.md`, 단계별 log `kai.log`, `kai_ro.log`, `core_plus.log`.
 

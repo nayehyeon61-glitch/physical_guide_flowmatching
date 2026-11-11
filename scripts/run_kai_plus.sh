@@ -3,6 +3,8 @@
 # resolution instead of 5.625 deg. Same pieces, trained separately, on daily means:
 #   1. data     daily means of 00/06/12/18 UTC on the fine grid, <DATA>/kaiday/<year>.npy
 #               GRID=1.5      KAI's grid, 121 x 240 with the pole rows       (SRC=wb2: WeatherBench2 240x121)
+#               SRC=daily     from a local archive of 0.25 deg DAILY MEANS (ERA5_0p25_DAILY): regridded as they are
+#               SRC=local     from a local archive of 0.25 deg hourly files: the mean of 00/06/12/18 UTC
 #               GRID=1.40625  128 x 256 without poles, 4 x 4 cells = one 5.625 deg cell (SRC=local: 0.25 deg archive)
 #   2. kai      KAI-alpha at its own size (3 3 15 3 / 48 96 192 288), KAI's recipe
 #   3. kai_ro   the same KAI fine-tuned on 2 to 3 day rollouts (the fair baseline of the coupled model)
@@ -13,6 +15,9 @@
 # Every step is skipped when its checkpoint / marker exists; a training that was cut off resumes (--resume).
 #
 #   bash scripts/run_kai_plus.sh                                  # GRID=1.5, WB2 download, OUT=runs/kaiplus_1p5
+#   SRC=daily bash scripts/run_kai_plus.sh                        # from the local 0.25 deg daily means ($ARCHIVE; first
+#                                                                 #   python scripts/local_era5_to_kai.py --src-daily --check ...);
+#                                                                 #   folders data/era5_1p5_daily, runs/kaiplus_1p5_daily
 #   GRID=1.40625 SRC=local bash scripts/run_kai_plus.sh           # from the local 0.25 deg hourly archive ($ARCHIVE)
 #   SRC=none DATA=/path/with/kaiday bash scripts/run_kai_plus.sh  # the daily means are there already
 #   PLUS_HIDDEN=96 PLUS_BLOCKS="2 2 2" CORE_BATCH=4 ...           # a wider core+ (about 3 GB of activations per sample; default 1.6 GB)
@@ -35,12 +40,16 @@ SFX=""
 if [ "$SMOKE" = 1 ]; then  # a smoke test: its own folders, one training year, 24 days a year
     SFX=_smoke; TRAIN_YEARS=${TRAIN_YEARS:-2015}; DAYS=${DAYS:-24}
 fi
-DATA=${DATA:-data/era5_$TAGG$SFX}
-OUT=${OUT:-runs/kaiplus_$TAGG$SFX}
+SRC=${SRC:-wb2}                        # wb2 | daily | local | none
+SRCTAG=""; [ "$SRC" = daily ] && SRCTAG=_daily   # the local daily means get their own folders: sources are not mixed
+DATA=${DATA:-data/era5_$TAGG$SRCTAG$SFX}
+OUT=${OUT:-runs/kaiplus_$TAGG$SRCTAG$SFX}
 DAYS=${DAYS:-}                         # only the first n days of every year (a smoke test)
 DEVICE=${DEVICE:-cuda}
-SRC=${SRC:-wb2}                        # wb2 | local | none
+if [ "$SRC" = daily ]; then ARCHIVE=${ARCHIVE:-/lustre/home/mahmed/ERA5_0p25_DAILY}; fi
 ARCHIVE=${ARCHIVE:-/lustre/home/mahmed/ERA5/hourly}
+# PATTERN (file layout under $ARCHIVE), OROG, LSM (0.25 deg constant files): the defaults of local_era5_to_kai.py
+LOCAL_OPTS=(${PATTERN:+--pattern "$PATTERN"} ${OROG:+--orog "$OROG"} ${LSM:+--lsm "$LSM"})
 WORKERS=${WORKERS:-8}
 TRAIN_YEARS=${TRAIN_YEARS:-"2012 2013 2014 2015"}
 VAL_YEAR=${VAL_YEAR:-2016}
@@ -88,8 +97,10 @@ if [ -n "$need" ]; then
         wb2)   [ "$GRID" = 1.5 ] || { echo "SRC=wb2 has GRID=1.5 only (240x121); use SRC=local"; exit 1; }
                step data /nonexistent python scripts/wb2_to_kai.py --out "$DATA" --grid 240x121 --daily-mean \
                    --no-climode --years $need ${DAYS:+--days $DAYS} ;;
+        daily) step data /nonexistent python scripts/local_era5_to_kai.py --src "$ARCHIVE" --src-daily --out "$DATA" \
+                   --grid "$GRID" --daily-mean --years $need --workers "$WORKERS" ${DAYS:+--days $DAYS} ${LOCAL_OPTS[@]+"${LOCAL_OPTS[@]}"} ;;
         local) step data /nonexistent python scripts/local_era5_to_kai.py --src "$ARCHIVE" --out "$DATA" \
-                   --grid "$GRID" --daily-mean --years $need --workers "$WORKERS" ${DAYS:+--days $DAYS} ;;
+                   --grid "$GRID" --daily-mean --years $need --workers "$WORKERS" ${DAYS:+--days $DAYS} ${LOCAL_OPTS[@]+"${LOCAL_OPTS[@]}"} ;;
         *)     echo "no data for the years$need under $DATA (kaiday/<year>.npy or kai6h/<year>.nc)"; exit 1 ;;
     esac
 fi
