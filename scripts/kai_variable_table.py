@@ -2,7 +2,7 @@
 
     python scripts/kai_variable_table.py runs/kaitend/score_Lk.json out.md \
         "kai=KAI" "core_gngmz=final core" "loop_core_gngmz=final model" ... [--base kai] [--pairs A:B ...]
-        [--leads 1 3 5 7 10] [--head t2m t850 z500 u850 msl]
+        [--leads 1 3 5 7 10] [--head t2m t850 z500 u850 msl] [--csv out.csv]
 
 Owner (2026-11-11): the comparison is read as a weather-benchmark table, per variable (t2m, t850, z500, ...) in
 physical units with persistence and climatology as references, next to the normalized 65-channel gains.
@@ -10,6 +10,8 @@ Writes a Markdown file with (1) the RMSE of every scored variable for every list
 model over ``--base`` in % (+ = better), (3) the gain of A over B for every ``--pairs A:B``; prints the head table
 (the ``--head`` variables) and up to which lead each model beats climatology.
 Units: z m2/s2, t / t2m / skt K, u / v m/s, q g/kg, msl / sp hPa, tcwv kg/m2.
+``--csv`` also writes the RMSE of every listed model at every lead as one row per model and variable
+(model, label, variable, group, level, unit, d1 .. dN): the data file of the heat map / line graph page.
 """
 
 import argparse
@@ -53,6 +55,7 @@ def main(argv=None):
     p.add_argument("--leads", type=int, nargs="+", default=[1, 3, 5, 7, 10])
     p.add_argument("--head", nargs="+", default=["t2m", "t850", "z500", "u850", "msl"])
     p.add_argument("--head-leads", type=int, nargs="+", default=[1, 5, 10])
+    p.add_argument("--csv", default="", help="also write model,label,variable,group,level,unit,d1..dN (physical units)")
     a = p.parse_args(argv)
     d = json.load(open(a.score))
     arms = d["arms"]
@@ -93,6 +96,17 @@ def main(argv=None):
         out += [f"| {NAMES[c]} | " + " | ".join(gain(x, y, c) for x, y in pairs) + " |" for c in sc]
     with open(a.out, "w", encoding="utf-8") as fh:
         fh.write("\n".join(out) + "\n")
+
+    if a.csv:
+        nl = R[models[0][0]].shape[0]
+        with open(a.csv, "w", encoding="utf-8") as fh:
+            fh.write("model,label,variable,group,level,unit," + ",".join(f"d{i + 1}" for i in range(nl)) + "\n")
+            for k, b in models:
+                for c in sc:
+                    n = NAMES[c]
+                    lev = n[1:] if n[0] in "zqtuv" and n[1:].isdigit() else ""
+                    row = [k, b.replace(",", " "), n, n[0] if lev else "sfc", lev, unit(n)[1]]
+                    fh.write(",".join(row + [f"{R[k][i, c] * unit(n)[0]:.5g}" for i in range(nl)]) + "\n")
 
     hl = [x - 1 for x in a.head_leads]
     head = [h for h in a.head if h in NAMES]
