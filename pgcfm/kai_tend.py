@@ -152,6 +152,69 @@ class LongTerm(nn.Module):
         return self.c2(ConvGRUCell.pad(F.silu(self.c1(ConvGRUCell.pad(z)))))
 
 
+class UNetTrunk(nn.Module):
+    """A multi-scale trunk for the tendency core + (docs/kai_tendency_plus_arch.md): the core's own residual blocks
+    (ClimODE's ResidualBlock: two 3x3 convolutions, longitude circular, latitude reflect) on three grids, the data's
+    and its 2x and 4x coarsening (1.5 / 3 / 6 deg), joined by skip connections.
+
+    Why: the plain trunk keeps the 5.625 deg design (8 convolutions = 17 x 17 cells) on a grid with cells 3.75 times
+    smaller, so one evaluation of the tendency sees 2,800 km instead of 10,000 km. The coarsest level here has the
+    cell size the 5.625 deg core was built for; the finest keeps the data's grid for what only it resolves.
+
+    ``dims`` = widths of the levels, fine to coarse; ``reps`` = residual blocks per level on the way down (the way
+    up has one block per level, after the concatenation with the skip). Coarsening = 2 x 2 mean (an odd number of
+    rows, the 121 rows with the poles, is first extended by one reflected row); refining = bilinear to the skip's
+    size, periodic in longitude. The output has dims[0] channels on the data's grid."""
+
+    def __init__(self, c_in: int, dims=(64, 128, 192), reps: int = 2):
+        super().__init__()
+        from model_utils import ResidualBlock  # third_party/climode, on the path through pgcfm.core
+        self.dims = tuple(int(d) for d in dims)
+        self.down, self.up = nn.ModuleList(), nn.ModuleList()
+        c = c_in
+        for d in self.dims:
+            self.down.append(nn.Sequential(ResidualBlock(c, d), *[ResidualBlock(d, d) for _ in range(reps - 1)]))
+            c = d
+        for hi, lo in zip(self.dims[-2::-1], self.dims[:0:-1]):  # coarse to fine: (width of the skip, width below)
+            self.up.append(ResidualBlock(hi + lo, hi))
+
+    @staticmethod
+    def coarsen(x):
+        if x.shape[-2] % 2:
+            x = F.pad(x, (0, 0, 0, 1), mode="reflect")
+        return F.avg_pool2d(x, 2)
+
+    @staticmethod
+    def refine(x, size):
+        H, W = size
+        f = W // x.shape[-1]  # the longitudes are halved exactly
+        x = F.pad(x, (1, 1, 0, 0), mode="circular")
+        return F.interpolate(x, size=(H, W + 2 * f), mode="bilinear", align_corners=False)[..., f:-f]
+
+    def forward(self, x):
+        x, skips = x.float(), []
+        for i, blk in enumerate(self.down):
+            x = blk(x if i == 0 else self.coarsen(x))
+            skips.append(x)
+        for blk, skip in zip(self.up, skips[-2::-1]):
+            x = blk(torch.cat([skip, self.refine(x, skip.shape[-2:])], 1))
+        return x
+
+
+class UNetNet(nn.Module):
+    """The multi-scale trunk + the zero-initialized linear head (pgcfm.core.Net with a UNetTrunk)."""
+
+    def __init__(self, c_in: int, c_out: int, dims=(64, 128, 192), reps: int = 2):
+        super().__init__()
+        self.trunk = UNetTrunk(c_in, dims, reps)
+        self.head = nn.Conv2d(self.trunk.dims[0], c_out, 1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x):
+        return self.head(self.trunk(x))
+
+
 PACC_TAU = (2.0, 10.0)  # days: the bounds of the learned kernel time of the accumulated physical tendency
 
 
@@ -254,7 +317,7 @@ def _mem_core_class():
         hist = True  # the caller has to hand over the past
 
         def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False, nomem=False,
-                     acc=(), acc_ch=12, kern=0, kern_ch=24, pacc=()):
+                     acc=(), acc_ch=12, kern=0, kern_ch=24, pacc=(), mem_enc=0):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
             self.nomem = bool(nomem)  # control: the same sequence training, the memory state stays zero
@@ -275,6 +338,12 @@ def _mem_core_class():
                 self.register_buffer("eq_idx", torch.tensor(eq_idx))
             self.pacc_ch = len(self.pacc) * (2 * ng + (N_DYN if mz else 0))
             self.enc = nn.Conv2d((3 if mz else 2) * N_DYN + 2 * ng + self.pacc_ch, mem_ch, 1)
+            if mem_enc:  # the tendency core + at 1.5 deg: the 294 inputs of the memory are not projected to its
+                # channels by one linear map but through a hidden layer of ``mem_enc`` channels (per grid point)
+                c = self.enc.in_channels
+                self.enc = nn.Sequential(nn.Conv2d(c, int(mem_enc), 1), nn.GroupNorm(1, int(mem_enc)), nn.GELU(),
+                                         nn.Conv2d(int(mem_enc), mem_ch, 1))
+                self.enc.in_channels = c
             self.gru = ConvGRUCell(mem_ch, mem_ch)
             self.acc, self.z, self.acc_off = tuple(float(t) for t in acc), None, False
             self.kern, self.past, self.M = int(kern), [], None
@@ -425,7 +494,8 @@ def _mem_core_class():
 def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: np.ndarray, lat_deg,
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
-              nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=()):
+              nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
+              trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -443,20 +513,32 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     channels accumulated in time with a learned kernel time per physical term (starting at these days), as inputs
     of the memory.
     ``gfeat`` = the physical terms: the operator's tendency G(x) as 48 input channels (step 18); the caller attaches
-    ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well."""
+    ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well.
+    ``trunk`` "unet" = the multi-scale trunk (UNetTrunk) with the widths ``unet_dims`` (fine to coarse) and
+    ``blocks[0]`` residual blocks per level, instead of the plain ``hidden`` x ``blocks`` ResNet.
+    ``mem_enc`` (with mem) = hidden channels of a two-layer encoder of the memory's inputs (0 = one linear map)."""
     from .dyncore import DynCore, DynCoreConfig
     if gfeat and hist and not mem:
         raise ValueError("the history core has no G(x) input; use mem for a memory of the physical terms")
     if (len(acc) or kern or len(pacc)) and not mem:
         raise ValueError("the accumulated memory and the memory kernel belong to the memory core (mem > 0)")
+    if mem_enc and not mem:
+        raise ValueError("the memory encoder belongs to the memory core (mem > 0)")
+    if trunk not in ("res", "unet"):
+        raise ValueError(trunk)
+    if trunk == "unet":
+        hidden = int(unet_dims[0])  # the width the head (and a long-memory term) reads
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
                         gfeat=gfeat)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
         core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch,
-                                 kern=kern, kern_ch=kern_ch, pacc=tuple(pacc))
+                                 kern=kern, kern_ch=kern_ch, pacc=tuple(pacc), mem_enc=mem_enc)
     else:
         core = (_hist_core_class() if hist else DynCore)(*args)
+    if trunk == "unet":  # the same inputs and head, the multi-scale trunk in place of the plain ResNet
+        c_in = core.net.trunk.layer_cnn[0][0].conv1.in_channels
+        core.net = UNetNet(c_in, core.net.head.out_channels, unet_dims, int(blocks[0]))
     if norm == "gn":
         stateless_norm(core.net)
     elif norm != "bn":

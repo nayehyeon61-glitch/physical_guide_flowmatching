@@ -250,6 +250,10 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["pacc"] = list(a.core_pacc)
     if a.core_gfeat:
         opts["gfeat"] = True
+    if a.core_trunk != "res":  # only when asked for: the options of the cores trained before stay as they were
+        opts.update(trunk=a.core_trunk, unet_dims=list(a.core_unet_dims))
+    if a.core_mem_enc:
+        opts["mem_enc"] = a.core_mem_enc
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -1086,6 +1090,13 @@ def parser():
                    help="memory core (Mori-Zwanzig memory term as a ConvGRU state): days before the IC that warm "
                         "the memory up; 0 = off")
     p.add_argument("--core-mem-ch", type=int, default=24, help="channels of the memory state")
+    p.add_argument("--core-mem-enc", type=int, default=0,
+                   help="hidden channels of a two-layer encoder of the memory's inputs (0 = one linear map)")
+    p.add_argument("--core-trunk", default="res", choices=["res", "unet"],
+                   help="unet: the multi-scale trunk on the grid and its 2x and 4x coarsening (--core-unet-dims), "
+                        "--core-blocks[0] residual blocks per level")
+    p.add_argument("--core-unet-dims", type=int, nargs="+", default=[64, 128, 192],
+                   help="widths of the levels of the multi-scale trunk, fine to coarse")
     p.add_argument("--core-mz", action="store_true",
                    help="memory core in the Mori-Zwanzig sequence form: the --core-mem days are forecast one by one "
                         "from an empty memory (sequence loss on all of them + the rollout), the forecast errors "
