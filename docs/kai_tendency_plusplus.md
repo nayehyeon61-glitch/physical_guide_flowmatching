@@ -48,6 +48,9 @@ ARCH=u96 bash scripts/run_kai_plusplus.sh
 # seed twin 대신 서로 다른 확장 core 둘. 크기 실험이 둘 다 학습했으면 학습 없이 채점만 합니다
 ARCH=w128 ARCH2=u96 SC=pp_w128_u96 bash scripts/run_kai_plusplus.sh
 
+# GPU를 골라서 (크기 실험이 다른 GPU에서 도는 동안)
+CUDA_VISIBLE_DEVICES=1 bash scripts/run_kai_plusplus.sh
+
 # 학습은 다른 GPU에서 돌리고, 여기서는 checkpoint를 기다렸다가 채점만
 TRAIN=0 WAIT=1 bash scripts/run_kai_plusplus.sh
 
@@ -56,6 +59,9 @@ DRYRUN=1 bash scripts/run_kai_plusplus.sh
 ```
 
 - 학습하는 것: `core_plus_<ARCH>.pt`(seed 0)와 `core_plus_<ARCH>_s1.pt`(seed 1). 이미 있으면 건너뜁니다.
+- **같은 core를 두 곳에서 학습하지 않습니다.** 크기 실험이 `core_plus_w128`을 학습하는 중이면(같은 서버에 그 학습 process가 있거나, 폴더의 `core_plus_w128.part` 또는 `.log`가 최근 2시간 안에 바뀌었으면) ++ driver는 seed twin을 먼저 학습하고, 그다음 `core_plus_w128.pt`가 생기기를 기다립니다. 두 학습이 한 폴더에서 같은 이름으로 돌면 서로의 중간 저장을 덮어쓰기 때문입니다. 멈춘 학습을 기다리지 않고 여기서 바로 이으려면 `FORCE=1`을 줍니다.
+- 반대 방향의 확인은 없습니다. ++ driver가 학습하는 core(예: `core_plus_w128_s1`)를 다른 명령으로 동시에 시작하지 마세요.
+- GPU는 `CUDA_VISIBLE_DEVICES`로 고릅니다. 크기 실험과 같은 GPU에 올리면 메모리는 들어가도(변형 하나에 12.6~17.8 GB) 둘 다 느려집니다.
 - 폴더에 `core_plus_s1.pt`(+ 버전 core의 seed twin, 크기 실험의 `s1`)가 있으면 **+ 버전의 two core 모델**도 함께 채점해서 나란히 놓습니다.
 - 채점은 예보 파일을 디스크에 잠시 씁니다(core나 KAI 하나의 예보가 약 9 GB, 모두 60 GB 안팎).
 
@@ -86,7 +92,8 @@ DRYRUN=1 bash scripts/run_kai_plusplus.sh
 
 ## 6. 시험 상태
 
-- CPU 작은 시험(24일 자료, 작은 KAI, 작은 변형: trunk 24, 기억 12, encoder 24, 2 iteration): 확장 core 둘의 학습, 채점, 분해, 변수별 표까지의 결과는 아래 "작은 시험" 줄에 적습니다.
-- 실제 크기(1.5°, GPU)에서는 아직 돌리지 않았습니다. 확장 core의 학습 자체는 크기 실험 쪽에서 GPU로 돌고 있습니다.
-
-작은 시험: 2026-11-12 19:40 KST에 시작해 도는 중입니다. 끝나면 이 줄을 결과로 바꿉니다.
+- **CPU 작은 시험: 통과** (2026-11-12 19:40~20:29 KST, `SMOKE=1`, 24일 자료, 작은 KAI, 작은 변형: trunk 24, 기억 12채널, encoder 24, 2 iteration). 확장 core 둘(seed 0, 1)의 학습, 채점(예보 34종, 쌍 19개와 부트스트랩 구간), 정보 / 진폭 분해(쌍 16개), 변수별 표까지 한 번에 끝났습니다. 폴더에 `core_plus_s1.pt`가 있어서 + 버전의 two core 모델과 단순 감쇠 대조도 함께 채점됐습니다. seed twin은 첫 core와 다른 예보를 냈습니다(seed가 적용됨).
+- 이 시험의 수치에는 의미가 없습니다. 2 iteration만 학습한 core는 persistence와 거의 같습니다. 도는지만 본 것입니다.
+- 같은 core를 두 번 학습하지 않는 확인(3절)은 학습을 흉내 낸 가짜 실행으로 일곱 경우를 시험했습니다: 아무것도 없을 때, 다른 곳에서 학습 중(중간 저장이 최근 것), 멈춘 학습(3시간 전), 같은 서버의 process, `FORCE=1`, 둘 다 학습 중, `ARCH2`.
+- ++ driver로 돌려 본 변형은 넓은 trunk(`w*`)뿐입니다. 다중 규모 trunk(`u*`)는 같은 옵션을 크기 실험 쪽에서 GPU로 학습하고 있지만, ++ driver를 거친 작은 시험은 하지 않았습니다.
+- 실제 크기(1.5°, GPU)에서는 아직 돌리지 않았습니다. 학습 시간(2절)과 디스크(3절)는 추정입니다.

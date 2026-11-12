@@ -10,7 +10,9 @@
 #   B = core_plus_${ARCH}_s1   the same core, seed 1                  -> the ++ model = kai_ro + A + B
 #       ARCH2=u96 instead:     B = core_plus_u96 (seed 0), a pair of two different extended cores (no seed twin)
 #
-#   1. train   A and B, each skipped when its checkpoint exists; a training that was cut off resumes
+#   1. train   A and B, each skipped when its checkpoint exists; a training that was cut off resumes. A core that is
+#              being trained elsewhere (the size experiment, another GPU) is never trained a second time: the other
+#              core goes first and the driver waits for that checkpoint (FORCE=1 trains it here anyway)
 #   2. score   every core alone, the one-core loops, the two-core loop and the lead-wise mix (blend) on KAI and on the
 #              fine-tuned KAI, next to the + version (core_plus; with core_plus_s1 in the folder also the + two-core
 #              model), and the damping control (KAI mixed with the climatology like a core); paired bootstrap, exact
@@ -49,6 +51,8 @@ SEED2=${SEED2:-1}
 TRAIN=${TRAIN:-1}; SCORE=${SCORE:-1}; WAIT=${WAIT:-0}
 SC=${SC:-pp}                           # the name of the score: score_$SC.json, breakdown_$SC/, variable_table_$SC.md
 SCORE_BATCH=${SCORE_BATCH:-4}; IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}
+BUSY_MIN=${BUSY_MIN:-120}              # a .part / .log that changed in the last BUSY_MIN minutes = a training is alive
+POLL=${POLL:-600}                      # seconds between two looks at a checkpoint that is waited for
 MEM="--core-mem-ch 48 --core-mem-enc 128"
 if [ "$SMOKE" = 1 ]; then  # small variants of the same kinds, a few iterations: does every step run?
     TRAIN_YEARS=2015; KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; CORE_ITERS=2; CORE_BATCH=1; LOGC=2; VAL_BATCH=1
@@ -85,6 +89,24 @@ step() {  # step <name> <done file> <command...>: skipped when the done file exi
     "$@" >> "$OUT/$name.log" 2>&1 || { echo "[++] $name FAILED, see $OUT/$name.log"; exit 1; }
     echo "[++] $name: end $(date '+%m-%d %H:%M')"
 }
+busy() {  # is the core $1 being trained by someone else? a process of this machine with --tag $1, or (another
+          # machine on the same disk) its training state $1.part or its log changed in the last BUSY_MIN minutes
+    pgrep -f -- "--tag $1( |\$)" > /dev/null 2>&1 && return 0
+    local f
+    for f in "$OUT/$1.part" "$OUT/$1.log"; do
+        if [ -e "$f" ] && [ -n "$(find "$f" -mmin "-$BUSY_MIN" 2>/dev/null)" ]; then return 0; fi
+    done
+    return 1
+}
+wait_for() {  # two trainings of one tag in one folder would overwrite each other's state: wait while $1 is busy.
+              # It ends with the checkpoint there (the step is then skipped) or with a training that stopped
+              # (the step then resumes it here)
+    if [ "${DRYRUN:-0}" = 1 ] || [ "${FORCE:-0}" = 1 ]; then return 0; fi
+    while [ ! -e "$OUT/$1.pt" ] && busy "$1"; do
+        echo "[++] $1 is being trained elsewhere: waiting for $1.pt $(date '+%m-%d %H:%M') (FORCE=1 trains it here)"
+        sleep "$POLL"
+    done
+}
 for f in kai.pt kai_ro.pt core_plus.pt; do
     [ -e "$OUT/$f" ] || [ "${DRYRUN:-0}" = 1 ] || { echo "$OUT/$f is missing: run scripts/run_kai_plus.sh first"; exit 1; }
 done
@@ -106,8 +128,13 @@ M="$A+$B"
 
 # 1. the two extended cores
 if [ "$TRAIN" = 1 ]; then
-    step "$A" "$OUT/$A.pt" $R $CT $(opts_of "$ARCH") --tag "$A"
-    step "$B" "$OUT/$B.pt" $R $CT $OB --tag "$B"
+    ORDER="A B"  # the core that is being trained elsewhere goes last: the other one is trained here meanwhile
+    if [ ! -e "$OUT/$A.pt" ] && [ "${DRYRUN:-0}" != 1 ] && [ "${FORCE:-0}" != 1 ] && busy "$A"; then ORDER="B A"; fi
+    for x in $ORDER; do
+        if [ "$x" = A ]; then t=$A; o="$(opts_of "$ARCH")"; else t=$B; o="$OB"; fi
+        wait_for "$t"
+        step "$t" "$OUT/$t.pt" $R $CT $o --tag "$t"
+    done
 fi
 [ "$SCORE" = 1 ] || exit 0
 if [ "$WAIT" = 1 ] && [ "${DRYRUN:-0}" != 1 ]; then
