@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Tendency core ++ (docs/kai_tendency_plusplus.md): the two-core model of docs/kai_tendency.md sec. 7.9 (the rollout
+# fine-tuned KAI coupled with TWO separately trained tendency cores, seed 0 and 1) with the extended core of the size
+# experiment (scripts/run_kai_plus_arch.sh: wider trunk or multi-scale trunk, memory 48 channels with a two-layer
+# encoder) in place of the 5.625 deg network that the + version kept on the 1.5 deg grid.
+# It runs in the folder of the finished + run: KAI, the fine-tuned KAI and core + are reused, and so is an extended
+# core that the size experiment has trained already (same tag, same options, same seed).
+#
+#   A = core_plus_$ARCH        the extended core, seed 0   (w96 / w128 / u64 / u96, as in run_kai_plus_arch.sh)
+#   B = core_plus_${ARCH}_s1   the same core, seed 1                  -> the ++ model = kai_ro + A + B
+#       ARCH2=u96 instead:     B = core_plus_u96 (seed 0), a pair of two different extended cores (no seed twin)
+#
+#   1. train   A and B, each skipped when its checkpoint exists; a training that was cut off resumes
+#   2. score   every core alone, the one-core loops, the two-core loop and the lead-wise mix (blend) on KAI and on the
+#              fine-tuned KAI, next to the + version (core_plus; with core_plus_s1 in the folder also the + two-core
+#              model), and the damping control (KAI mixed with the climatology like a core); paired bootstrap, exact
+#              term split, per-variable table. Files *_$SC.* (score_pp.json, breakdown_pp/, variable_table_pp.md)
+#
+#   bash scripts/run_kai_plusplus.sh                              # ARCH=w128: train what is missing, then score
+#   ARCH=u96 bash scripts/run_kai_plusplus.sh                     # the multi-scale core and its seed twin
+#   ARCH=w128 ARCH2=u96 bash scripts/run_kai_plusplus.sh          # two different extended cores (nothing to train
+#                                                                 #   when the size experiment has both)
+#   TRAIN=0 WAIT=1 bash scripts/run_kai_plusplus.sh               # only score, after waiting for the checkpoints
+#                                                                 #   (the trainings run elsewhere, one per GPU)
+#   SCORE=0 bash scripts/run_kai_plusplus.sh                      # only train
+#   SMOKE=1 OUT=... DATA=... DEVICE=cpu bash ...                  # a few iterations of small variants (CPU test)
+#   DRYRUN=1 ...                                                  # print the commands only
+set -euo pipefail
+cd "$(dirname "$0")/.."
+SMOKE=${SMOKE:-0}
+OUT=${OUT:-runs/kaiplus_1p5_daily}
+DATA=${DATA:-data/era5_1p5_daily}
+DEVICE=${DEVICE:-cuda}
+THREADS=${THREADS:-8}
+TRAIN_YEARS=${TRAIN_YEARS:-"2012 2013 2014 2015"}
+VAL_YEAR=${VAL_YEAR:-2016}
+TEST_YEAR=${TEST_YEAR:-2017}
+KAI_DEPTHS=${KAI_DEPTHS:-"3 3 15 3"}   # the KAI of the folder (kai.pt, kai_ro.pt)
+KAI_DIMS=${KAI_DIMS:-"48 96 192 288"}
+CORE_ITERS=${CORE_ITERS:-6000}         # the schedule of core_plus in this folder
+CORE_BATCH=${CORE_BATCH:-8}
+CORE_MEM=${CORE_MEM:-8}
+SUBSTEPS=${SUBSTEPS:-4}
+LOGC=${LOGC:-250}
+VAL_BATCH=${VAL_BATCH:-4}
+ARCH=${ARCH:-w128}                     # the extended core: w96 | w128 | u64 | u96
+ARCH2=${ARCH2:-}                       # empty: the second core is the seed twin of the first; else another variant
+SEED2=${SEED2:-1}
+TRAIN=${TRAIN:-1}; SCORE=${SCORE:-1}; WAIT=${WAIT:-0}
+SC=${SC:-pp}                           # the name of the score: score_$SC.json, breakdown_$SC/, variable_table_$SC.md
+SCORE_BATCH=${SCORE_BATCH:-4}; IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}
+MEM="--core-mem-ch 48 --core-mem-enc 128"
+if [ "$SMOKE" = 1 ]; then  # small variants of the same kinds, a few iterations: does every step run?
+    TRAIN_YEARS=2015; KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; CORE_ITERS=2; CORE_BATCH=1; LOGC=2; VAL_BATCH=1
+    SCORE_BATCH=2; IC_STRIDE=6; LEADS=4; THREADS=${THREADS_SMOKE:-2}; MEM="--core-mem-ch 12 --core-mem-enc 24"
+fi
+opts_of() {  # the variants of scripts/run_kai_plus_arch.sh (the same tags give the same cores)
+    if [ "$SMOKE" = 1 ]; then
+        case "$1" in
+            w*) echo "--core-hidden 24 $MEM" ;;
+            u*) echo "--core-trunk unet --core-unet-dims 16 24 32 $MEM" ;;
+            *)  echo "unknown variant $1" >&2; exit 1 ;;
+        esac
+        return
+    fi
+    case "$1" in
+        w96)  echo "--core-hidden 96 $MEM" ;;
+        w128) echo "--core-hidden 128 $MEM" ;;
+        u64)  echo "--core-trunk unet --core-unet-dims 64 128 192 $MEM" ;;
+        u96)  echo "--core-trunk unet --core-unet-dims 96 160 224 $MEM" ;;
+        *)    echo "unknown variant $1" >&2; exit 1 ;;
+    esac
+}
+name_of() {
+    case "$1" in
+        w96) echo "wide core (96)" ;; w128) echo "wide core (128)" ;;
+        u64) echo "multi-scale core (64/128/192)" ;; u96) echo "multi-scale core (96/160/224)" ;; *) echo "core $1" ;;
+    esac
+}
+step() {  # step <name> <done file> <command...>: skipped when the done file exists, log to $OUT/<name>.log
+    local name=$1 mark=$2; shift 2
+    if [ -e "$mark" ]; then echo "[++] $name: done, skipped"; return; fi
+    if [ "${DRYRUN:-0}" = 1 ]; then echo "[dry] $name: $(printf '%q ' "$@")"; return; fi
+    echo "[++] $name: start $(date '+%m-%d %H:%M'), log $OUT/$name.log"
+    "$@" >> "$OUT/$name.log" 2>&1 || { echo "[++] $name FAILED, see $OUT/$name.log"; exit 1; }
+    echo "[++] $name: end $(date '+%m-%d %H:%M')"
+}
+for f in kai.pt kai_ro.pt core_plus.pt; do
+    [ -e "$OUT/$f" ] || [ "${DRYRUN:-0}" = 1 ] || { echo "$OUT/$f is missing: run scripts/run_kai_plus.sh first"; exit 1; }
+done
+D="--data $DATA/kai6h --cache $DATA/kaiday --era5 $DATA/era5_data --out $OUT --train-years $TRAIN_YEARS"
+D="$D --val-year $VAL_YEAR --test-year $TEST_YEAR --device $DEVICE --threads $THREADS --val-batch $VAL_BATCH"
+R="python scripts/run_kai_tendency.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS"
+CT="--arm core --core-norm gn --core-gfeat --core-mem $CORE_MEM --core-mz --core-substeps $SUBSTEPS --core-ckpt"
+CT="$CT --core-blocks 2 2 --iters $CORE_ITERS --batch $CORE_BATCH --log-every $LOGC --resume"
+
+C=core_plus
+A=${C}_$ARCH; NA=$(name_of "$ARCH")
+if [ -n "$ARCH2" ]; then
+    [ "$ARCH2" != "$ARCH" ] || { echo "ARCH2 = ARCH: leave ARCH2 empty for the seed twin"; exit 1; }
+    B=${C}_$ARCH2; NB=$(name_of "$ARCH2"); OB="$(opts_of "$ARCH2")"; WHAT="two different extended cores"
+else
+    B=${A}_s$SEED2; NB="$NA, seed $SEED2"; OB="$(opts_of "$ARCH") --seed $SEED2"; WHAT="the extended core and its seed twin"
+fi
+M="$A+$B"
+
+# 1. the two extended cores
+if [ "$TRAIN" = 1 ]; then
+    step "$A" "$OUT/$A.pt" $R $CT $(opts_of "$ARCH") --tag "$A"
+    step "$B" "$OUT/$B.pt" $R $CT $OB --tag "$B"
+fi
+[ "$SCORE" = 1 ] || exit 0
+if [ "$WAIT" = 1 ] && [ "${DRYRUN:-0}" != 1 ]; then
+    for t in $A $B; do
+        until [ -e "$OUT/$t.pt" ]; do echo "[++] waiting for $t.pt $(date '+%m-%d %H:%M')"; sleep 600; done
+    done
+fi
+
+# 2. score. The ++ model = loop_$M@kai_ro (trajectory) and blend_$M@kai_ro (lowest RMSE).
+CORES="$C $A $B"; MULTI="$M"
+PAIRS="loop_$M@kai_ro:kai_ro loop_$M@kai_ro:kai loop_$M@kai_ro:loop_$C@kai_ro loop_$M@kai_ro:loop_$A@kai_ro"
+PAIRS="$PAIRS loop_$A@kai_ro:loop_$C@kai_ro loop_$B@kai_ro:loop_$A@kai_ro $A:$C $B:$A"
+PAIRS="$PAIRS blend_$M@kai_ro:kai_ro blend_$M@kai_ro:kai blend_$M@kai_ro:blend_$C@kai_ro blend_$M@kai_ro:loop_$M@kai_ro"
+PAIRS="$PAIRS blend_$M@kai_ro:blend_climatology@kai_ro blend_$C@kai_ro:blend_climatology@kai_ro"
+PAIRS="$PAIRS blend_climatology@kai_ro:kai_ro blend_climatology:kai"
+BP=("loop_$M@kai_ro:kai_ro=++ loop (fine-tuned KAI, $WHAT) vs the fine-tuned KAI"
+    "loop_$M@kai_ro:loop_$C@kai_ro=++ loop vs the + loop (fine-tuned KAI with one core +)"
+    "loop_$M@kai_ro:loop_$A@kai_ro=two extended cores vs one in the loop on the fine-tuned KAI"
+    "loop_$A@kai_ro:loop_$C@kai_ro=one core in the loop on the fine-tuned KAI: $NA vs core +"
+    "loop_$B@kai_ro:loop_$A@kai_ro=the second extended core vs the first, each in the one-core loop"
+    "$A:$C=alone: $NA vs core +"
+    "blend_$M@kai_ro:kai_ro=++ blend (fine-tuned KAI mixed with both extended cores) vs the fine-tuned KAI"
+    "blend_$M@kai_ro:kai=++ blend vs KAI"
+    "blend_$M@kai_ro:blend_$C@kai_ro=++ blend vs the + blend (one core +)"
+    "blend_$M@kai_ro:loop_$M@kai_ro=++ blend vs ++ loop"
+    "blend_$M@kai_ro:blend_climatology@kai_ro=++ blend vs the fine-tuned KAI damped toward the climatology"
+    "blend_$C@kai_ro:blend_climatology@kai_ro=+ blend vs the fine-tuned KAI damped toward the climatology"
+    "blend_climatology@kai_ro:kai_ro=fine-tuned KAI damped toward the climatology vs the fine-tuned KAI")
+VT=("kai=KAI" "kai_ro=KAI (rollout fine-tuned)" "loop_$C@kai_ro=+ loop: fine-tuned KAI + core +"
+    "loop_$A@kai_ro=fine-tuned KAI + $NA loop" "loop_$M@kai_ro=++ loop: fine-tuned KAI + two extended cores"
+    "blend_$C@kai_ro=+ blend" "blend_$M@kai_ro=++ blend" "blend_climatology@kai_ro=fine-tuned KAI damped to climatology")
+VP=("loop_$M@kai_ro:loop_$C@kai_ro" "loop_$M@kai_ro:kai_ro" "blend_$M@kai_ro:blend_$C@kai_ro" "blend_$M@kai_ro:kai_ro")
+C2=${C}_s1
+if [ -e "$OUT/$C2.pt" ] && [ "$B" != "$C2" ]; then  # the + two-core model (seed 0, 1): the same-structure baseline
+    MB="$C+$C2"; CORES="$CORES $C2"; MULTI="$MULTI $MB"
+    PAIRS="$PAIRS loop_$M@kai_ro:loop_$MB@kai_ro blend_$M@kai_ro:blend_$MB@kai_ro loop_$MB@kai_ro:loop_$C@kai_ro"
+    BP+=("loop_$M@kai_ro:loop_$MB@kai_ro=++ loop vs the + two-core loop (fine-tuned KAI, two cores +)"
+         "blend_$M@kai_ro:blend_$MB@kai_ro=++ blend vs the + two-core blend"
+         "loop_$MB@kai_ro:loop_$C@kai_ro=+ version: two cores + vs one in the loop on the fine-tuned KAI")
+    VT+=("loop_$MB@kai_ro=+ two-core loop: fine-tuned KAI + two cores +")
+    VP=("loop_$M@kai_ro:loop_$MB@kai_ro" "${VP[@]}")
+fi
+step "score_$SC" "$OUT/score_$SC.json" bash -c "$R --score kai kai_ro --score-cores $CORES --blend-bases kai kai_ro \
+    --loop-blend $CORES --blend-multi $MULTI --loop-multi $MULTI --blend-with climatology \
+    --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --pairs $PAIRS \
+    && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"
+if [ "${DRYRUN:-0}" != 1 ]; then
+    mkdir -p "$OUT/breakdown_$SC"
+    python scripts/eval_kai_breakdown.py --stats "$OUT/stats.npz" "$OUT/score_$SC.json" "$OUT/score_${SC}_raw.npz" \
+        "$OUT/breakdown_$SC" "${BP[@]}" \
+        > "$OUT/breakdown_$SC/breakdown_$SC.txt" 2>&1 || echo "[++] breakdown failed, see $OUT/breakdown_$SC/breakdown_$SC.txt"
+    python scripts/kai_variable_table.py "$OUT/score_$SC.json" "$OUT/variable_table_$SC.md" "${VT[@]}" \
+        --base kai_ro --grid 1.5 --pairs "${VP[@]}" > "$OUT/variable_table_$SC.log" 2>&1 \
+        || echo "[++] variable table failed, see $OUT/variable_table_$SC.log"
+    echo "[++] done: $OUT/score_$SC.log, $OUT/breakdown_$SC/breakdown_$SC.txt, $OUT/variable_table_$SC.md"
+fi
