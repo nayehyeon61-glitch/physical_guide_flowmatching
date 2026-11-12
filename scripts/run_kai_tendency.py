@@ -168,7 +168,8 @@ def stats_stream(train, step=16):
     clim, cnt = np.zeros((nd,) + train[ys[0]].shape[1:], dtype=np.float32), np.zeros(nd)
     for y in ys:
         for i in range(0, len(train[y]), step):
-            clim[i:i + step] += train[y][i:i + step]
+            x = train[y][i:i + step]  # the last chunk of a 365-day year is shorter than the slice of the 366-day clim
+            clim[i:i + len(x)] += x
         cnt[:len(train[y])] += 1
     for i in range(nd):
         clim[i] = clim[i] / cnt[i] if cnt[i] else clim[i - 1]
@@ -402,7 +403,7 @@ def train(a, arm):
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         rng.bit_generator.state = ck["rng"]
-        torch.set_rng_state(ck["torch_rng"])
+        torch.set_rng_state(ck["torch_rng"].cpu())  # map_location moved it to the GPU; the CPU generator needs a CPU ByteTensor
         log, it0, t0 = ck["log"], ck["it"], time.time() - ck["sec"]
         print(json.dumps(dict(resumed_at=it0)), flush=True)
     for it in range(it0 + 1, a.iters + 1):

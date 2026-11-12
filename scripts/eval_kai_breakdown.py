@@ -254,9 +254,10 @@ def table(B):
     hd = "/".join(str(x + 1) for x in q)
     f = lambda v, s=100, d=1: "/".join(f"{s * v[x]:+.{d}f}" for x in q)  # noqa: E731
     print(f"\n=== {a} against {b}  (day {hd}); every change is a gain of A over B: + = A better, - = A worse ===")
-    print(f"  65-ch nRMSE   A {'/'.join(f'{B['nrmse'][a][x]:.3f}' for x in q)}  B {'/'.join(f'{B['nrmse'][b][x]:.3f}' for x in q)}"
+    j = lambda k, m: "/".join(f"{B[k][m][x]:.3f}" for x in q)  # noqa: E731  (no nested quotes: Python < 3.12)
+    print(f"  65-ch nRMSE   A {j('nrmse', a)}  B {j('nrmse', b)}"
           f"  gain % {f(1 - B['nrmse'][a] / B['nrmse'][b])}")
-    print(f"  65-ch ACC     A {'/'.join(f'{B['acc'][a][x]:.3f}' for x in q)}  B {'/'.join(f'{B['acc'][b][x]:.3f}' for x in q)}")
+    print(f"  65-ch ACC     A {j('acc', a)}  B {j('acc', b)}")
     print("  by variable: RMSE gain %  |  ACC gain  |  cells better/worse (95 %)")
     for g in B["groups"]:
         nb, nw, nt = B["cells"][g]
@@ -278,13 +279,15 @@ def table(B):
     if "scale" in B:
         print("  by scale: nRMSE gain %  (share of B's error)")
         for name in B["scale"]:
-            print(f"    {name:18s} {f(B['scale'][name]):38s} ({'/'.join(f'{100 * B['scale_share'][name][x]:.0f}' for x in q)} %)")
+            sh = "/".join(f"{100 * B['scale_share'][name][x]:.0f}" for x in q)
+            print(f"    {name:18s} {f(B['scale'][name]):38s} ({sh} %)")
     if "region" in B:
         print("  by region: nRMSE gain %")
         for name in REGIONS:
             print(f"    {name:18s} {f(B['region'][name])}")
     if "act" in B:
-        print(f"  activity      A {'/'.join(f'{B['act'][a][x]:.2f}' for x in q)}  B {'/'.join(f'{B['act'][b][x]:.2f}' for x in q)}")
+        ac = lambda m: "/".join(f"{B['act'][m][x]:.2f}" for x in q)  # noqa: E731
+        print(f"  activity      A {ac(a)}  B {ac(b)}")
     print("  by season of the IC: nRMSE gain %")
     for s in SEASONS:
         print(f"    {s} ({B['season_n'][s]:2d} ICs)  {f(B['season'][s])}")
