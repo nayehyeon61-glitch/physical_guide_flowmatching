@@ -1,0 +1,97 @@
+[gpu] using free GPU 4 on terra 11-11 21:34
+[chain] GPU 4 11-11 21:34
+[chain] smoke
+[plus] data: start 21:34, log runs/kaiplus_1p5_daily_smoke/data.log
+[plus] kai: start 21:36, log runs/kaiplus_1p5_daily_smoke/kai.log
+[plus] kai_ro: start 21:37, log runs/kaiplus_1p5_daily_smoke/kai_ro.log
+[plus] core_plus: start 21:37, log runs/kaiplus_1p5_daily_smoke/core_plus.log
+[plus] score: start 21:38, log runs/kaiplus_1p5_daily_smoke/score.log
+[plus] breakdown failed, see runs/kaiplus_1p5_daily_smoke/breakdown/breakdown_plus.txt
+[plus] done: runs/kaiplus_1p5_daily_smoke/score.log, runs/kaiplus_1p5_daily_smoke/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_smoke/variable_table_plus.md
+[chain] test 11-11 21:39
+[plus] data: start 21:39, log runs/kaiplus_1p5_daily_test/data.log
+[plus] kai: start 22:32, log runs/kaiplus_1p5_daily_test/kai.log
+[plus] kai FAILED, see runs/kaiplus_1p5_daily_test/kai.log
+[chain] test FAILED
+[gpu] using free GPU 0 on terra 11-11 22:33
+[chain] GPU 0 11-11 22:33
+[chain] smoke
+[plus] kai: done, skipped
+[plus] kai_ro: done, skipped
+[plus] core_plus: done, skipped
+[plus] score: done, skipped
+[plus] done: runs/kaiplus_1p5_daily_smoke/score.log, runs/kaiplus_1p5_daily_smoke/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_smoke/variable_table_plus.md
+[chain] test 11-11 22:33
+[plus] kai: start 22:33, log runs/kaiplus_1p5_daily_test/kai.log
+[plus] kai_ro: start 22:36, log runs/kaiplus_1p5_daily_test/kai_ro.log
+[plus] core_plus: start 22:37, log runs/kaiplus_1p5_daily_test/core_plus.log
+[plus] score: start 22:41, log runs/kaiplus_1p5_daily_test/score.log
+[plus] done: runs/kaiplus_1p5_daily_test/score.log, runs/kaiplus_1p5_daily_test/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_test/variable_table_plus.md
+{"it": 50, "K": 1, "loss": 0.4462116062641144, "val": 0.4457052182406187, "sec": 38.65023469924927, "gpu_gb": 9.14}
+{"it": 100, "K": 1, "loss": 0.3934551179409027, "val": 0.3996386043727398, "sec": 68.10928201675415, "gpu_gb": 9.14}
+{"it": 150, "K": 1, "loss": 0.3732651174068451, "val": 0.3824574053287506, "sec": 97.49478721618652, "gpu_gb": 9.14}
+{"it": 200, "K": 1, "loss": 0.3767099976539612, "val": 0.3788453973829746, "sec": 126.60393786430359, "gpu_gb": 9.14}
+{"it": 20, "K": 3, "loss": 0.47552865743637085, "val": 0.3846374489367008, "sec": 17.10787296295166, "gpu_gb": 10.25}
+{"it": 10, "K": 1, "loss": 0.9070618152618408, "val": 0.4519156403839588, "sec": 53.694334745407104, "gpu_gb": 10.48, "res_corr": [0.0112, -0.2162]}
+{"it": 20, "K": 2, "loss": 0.9475150108337402, "val": 0.44137051329016685, "sec": 108.81184363365173, "gpu_gb": 11.2, "res_corr": [-0.0116, -0.1919]}
+{"it": 30, "K": 3, "loss": 0.9704050421714783, "val": 0.437065651640296, "sec": 168.3029203414917, "gpu_gb": 11.85, "res_corr": [-0.0053, -0.1735]}
+{"it": 40, "K": 4, "loss": 1.1163564920425415, "val": 0.4358552619814873, "sec": 232.9085283279419, "gpu_gb": 12.55, "res_corr": [0.0149, -0.1742]}
+[chain] full 11-11 23:06
+[plus] kai: start 23:06, log runs/kaiplus_1p5_daily/kai.log
+[gpu] using free GPU 4 on terra 11-11 23:28
+[chain] GPU 4 11-11 23:28
+[chain] smoke
+[plus] kai: done, skipped
+[plus] kai_ro: done, skipped
+[plus] core_plus: done, skipped
+[plus] score: done, skipped
+[plus] done: runs/kaiplus_1p5_daily_smoke/score.log, runs/kaiplus_1p5_daily_smoke/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_smoke/variable_table_plus.md
+[chain] test 11-11 23:28
+[plus] kai: done, skipped
+[plus] kai_ro: done, skipped
+[plus] core_plus: done, skipped
+[plus] score: done, skipped
+[plus] done: runs/kaiplus_1p5_daily_test/score.log, runs/kaiplus_1p5_daily_test/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_test/variable_table_plus.md
+{"it": 50, "K": 1, "loss": 0.4462116062641144, "val": 0.4457052182406187, "sec": 38.65023469924927, "gpu_gb": 9.14}
+{"it": 100, "K": 1, "loss": 0.3934551179409027, "val": 0.3996386043727398, "sec": 68.10928201675415, "gpu_gb": 9.14}
+{"it": 150, "K": 1, "loss": 0.3732651174068451, "val": 0.3824574053287506, "sec": 97.49478721618652, "gpu_gb": 9.14}
+{"it": 200, "K": 1, "loss": 0.3767099976539612, "val": 0.3788453973829746, "sec": 126.60393786430359, "gpu_gb": 9.14}
+{"it": 20, "K": 3, "loss": 0.47552865743637085, "val": 0.3846374489367008, "sec": 17.10787296295166, "gpu_gb": 10.25}
+{"it": 10, "K": 1, "loss": 0.9070618152618408, "val": 0.4519156403839588, "sec": 53.694334745407104, "gpu_gb": 10.48, "res_corr": [0.0112, -0.2162]}
+{"it": 20, "K": 2, "loss": 0.9475150108337402, "val": 0.44137051329016685, "sec": 108.81184363365173, "gpu_gb": 11.2, "res_corr": [-0.0116, -0.1919]}
+{"it": 30, "K": 3, "loss": 0.9704050421714783, "val": 0.437065651640296, "sec": 168.3029203414917, "gpu_gb": 11.85, "res_corr": [-0.0053, -0.1735]}
+{"it": 40, "K": 4, "loss": 1.1163564920425415, "val": 0.4358552619814873, "sec": 232.9085283279419, "gpu_gb": 12.55, "res_corr": [0.0149, -0.1742]}
+[chain] full 11-11 23:28
+[plus] kai: start 23:28, log runs/kaiplus_1p5_daily/kai.log
+[plus] kai FAILED, see runs/kaiplus_1p5_daily/kai.log
+[chain] full FAILED
+[gpu] using free GPU 4 on terra 11-11 23:30
+[chain] GPU 4 11-11 23:30
+[chain] smoke
+[plus] kai: done, skipped
+[plus] kai_ro: done, skipped
+[plus] core_plus: done, skipped
+[plus] score: done, skipped
+[plus] done: runs/kaiplus_1p5_daily_smoke/score.log, runs/kaiplus_1p5_daily_smoke/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_smoke/variable_table_plus.md
+[chain] test 11-11 23:30
+[plus] kai: done, skipped
+[plus] kai_ro: done, skipped
+[plus] core_plus: done, skipped
+[plus] score: done, skipped
+[plus] done: runs/kaiplus_1p5_daily_test/score.log, runs/kaiplus_1p5_daily_test/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily_test/variable_table_plus.md
+{"it": 50, "K": 1, "loss": 0.4462116062641144, "val": 0.4457052182406187, "sec": 38.65023469924927, "gpu_gb": 9.14}
+{"it": 100, "K": 1, "loss": 0.3934551179409027, "val": 0.3996386043727398, "sec": 68.10928201675415, "gpu_gb": 9.14}
+{"it": 150, "K": 1, "loss": 0.3732651174068451, "val": 0.3824574053287506, "sec": 97.49478721618652, "gpu_gb": 9.14}
+{"it": 200, "K": 1, "loss": 0.3767099976539612, "val": 0.3788453973829746, "sec": 126.60393786430359, "gpu_gb": 9.14}
+{"it": 20, "K": 3, "loss": 0.47552865743637085, "val": 0.3846374489367008, "sec": 17.10787296295166, "gpu_gb": 10.25}
+{"it": 10, "K": 1, "loss": 0.9070618152618408, "val": 0.4519156403839588, "sec": 53.694334745407104, "gpu_gb": 10.48, "res_corr": [0.0112, -0.2162]}
+{"it": 20, "K": 2, "loss": 0.9475150108337402, "val": 0.44137051329016685, "sec": 108.81184363365173, "gpu_gb": 11.2, "res_corr": [-0.0116, -0.1919]}
+{"it": 30, "K": 3, "loss": 0.9704050421714783, "val": 0.437065651640296, "sec": 168.3029203414917, "gpu_gb": 11.85, "res_corr": [-0.0053, -0.1735]}
+{"it": 40, "K": 4, "loss": 1.1163564920425415, "val": 0.4358552619814873, "sec": 232.9085283279419, "gpu_gb": 12.55, "res_corr": [0.0149, -0.1742]}
+[chain] full 11-11 23:30
+[plus] kai: start 23:30, log runs/kaiplus_1p5_daily/kai.log
+[plus] kai_ro: start 05:13, log runs/kaiplus_1p5_daily/kai_ro.log
+[plus] core_plus: start 05:35, log runs/kaiplus_1p5_daily/core_plus.log
+[plus] score: start 17:23, log runs/kaiplus_1p5_daily/score.log
+[plus] done: runs/kaiplus_1p5_daily/score.log, runs/kaiplus_1p5_daily/breakdown/breakdown_plus.txt, runs/kaiplus_1p5_daily/variable_table_plus.md
+[chain] ALL DONE 11-12 17:59
