@@ -443,7 +443,40 @@ nRMSE(kai_ro 위): core_gngmz8 둘 연결 0.175 / 0.310 / 0.403 / 0.468 / 0.527,
 
 ![seed 차이: kai_ro 위의 한 core 연결, seed 1 대 seed 0](kai_tendency/breakdown_loop_core_gngmz8s1-kai_ro__vs__loop_core_gngmz8-kai_ro.png)
 
-변수별 RMSE(물리 단위)는 `scripts/kai_variable_table.py`로 만듭니다(소유자 사본 `variable_table_Li.md`, `variable_table_Ln.md`, `variable_table_Lo.md`, `variable_table_Lm.md`, `variable_table_Lp.md`, `variable_table_Lq.md`, heat map과 그래프는 https://claude.ai/artifact/7U5voj1VdLQbR5w9n6UCbB).
+### 7.10 넓은 core 하나 대 core 둘: 두 core의 이득은 평균보다 크기의 것 (score Lr)
+
+7.9의 남은 질문은 core 둘의 이득이 "따로 학습한 둘을 평균해서"인지 "parameter가 두 배라서"인지였습니다. 두 core와 parameter 수가 같은 넓은 core 하나를 학습했습니다(core_gngmz8w: `--core-hidden 72 --core-mem-ch 34`, 520,966개 대 두 core 519,684개; seed 0, 같은 3,000 iteration; 한 step 검증 loss 0.2232 대 0.2379 / 0.2372; 학습은 iteration당 2.2배로 core 둘의 학습과 비슷한 계산량).
+
+| 비교 | 전체 | 정보 항 | 진폭 항 | 유의한 칸 (이득 / 손실) |
+|---|---|---|---|---|
+| **같은 parameter: loop(kai_ro, core_gngmz8w) 대 loop(kai_ro, core_gngmz8 둘)** | **+3.0 / +1.8 / +1.1 / +0.9 / +0.9** | +2.9 / +1.8 / +0.9 / +0.5 / +0.3 | +0.1 / 0.0 / +0.1 / +0.4 / +0.7 | 501 / 17 |
+| 같은 parameter: loop(KAI, core_gngmz8w) 대 loop(KAI, core_gngmz8 둘) | +3.1 / +2.1 / +1.4 / +1.1 / +1.1 | +3.0 / +2.0 / +1.1 / +0.6 / +0.3 | +0.1 / +0.1 / +0.3 / +0.5 / +0.8 | 536 / 9 |
+| 크기의 효과: loop(kai_ro, core_gngmz8w) 대 loop(kai_ro, core_gngmz8) | +4.6 / +3.1 / +2.1 / +1.4 / +1.0 | +4.5 / +2.9 / +1.7 / +0.9 / +0.4 | +0.1 / +0.1 / +0.3 / +0.5 / +0.5 | 561 / 1 |
+| 크기의 효과: loop(KAI, core_gngmz8w) 대 loop(KAI, core_gngmz8) | +4.7 / +3.6 / +2.7 / +2.0 / +1.4 | +4.6 / +3.3 / +2.0 / +1.0 / +0.4 | +0.1 / +0.2 / +0.7 / +0.9 / +0.9 | 610 / 0 |
+| 평균의 효과 (7.9 재현): loop(kai_ro, core_gngmz8 둘) 대 loop(kai_ro, core_gngmz8) | +1.7 / +1.3 / +1.0 / +0.6 / 0.0 | +1.6 / +1.1 / +0.8 / +0.4 / +0.1 | 0.0 / +0.1 / +0.2 / +0.1 / −0.2 | 501 / 28 |
+| 단독: core_gngmz8w 대 core_gngmz8 | +6.8 / +5.9 / +4.7 / +3.8 / +3.4 | +6.6 / +5.1 / +3.1 / +1.8 / +0.7 | +0.2 / +0.9 / +1.5 / +1.9 / +2.5 | 641 / 0 |
+| loop(kai_ro, core_gngmz8w) 대 kai_ro | +23.8 / +9.4 / +5.8 / +3.9 / +3.0 | +21.7 / +7.5 / +3.7 / +1.8 / +0.6 | +1.4 / +1.6 / +1.8 / +1.8 / +2.1 | 601 / 0 |
+| blend(KAI, core_gngmz8w) 대 blend(KAI, core_gngmz8 둘) | +3.1 / +2.2 / +0.8 / −0.1 / −1.4 | +3.0 / +2.2 / +1.1 / +0.7 / +0.3 | +0.1 / 0.0 / −0.3 / −0.8 / −1.7 | 332 / 145 |
+| blend(kai_ro, core_gngmz8w) 대 blend(kai_ro, core_gngmz8 둘) | +3.0 / +1.9 / +0.8 / +0.1 / −0.9 | +2.9 / +1.9 / +0.9 / +0.6 / +0.2 | +0.1 / 0.0 / −0.2 / −0.5 / −1.1 | 376 / 120 |
+| blend(kai_ro, core_gngmz8w) 대 blend(kai_ro, core_gngmz8) | +4.6 / +2.8 / +1.8 / +1.5 / +1.0 | +4.5 / +2.6 / +1.5 / +1.0 / +0.4 | +0.1 / +0.1 / +0.2 / +0.4 / +0.4 | 612 / 2 |
+
+nRMSE(kai_ro 위 연결): core_gngmz8w 0.170 / 0.305 / 0.399 / 0.464 / 0.522, core_gngmz8 둘 0.175 / 0.310 / 0.403 / 0.468 / 0.527, core_gngmz8 하나 0.178 / 0.314 / 0.407 / 0.471 / 0.527. ACC 0.935 / 0.776 / 0.598 / 0.433 / 0.257 대 0.931 / 0.766 / 0.587 / 0.424 / 0.248 대 0.928 / 0.758 / 0.575 / 0.411 / 0.239. 연결에서 KAI의 가중(선행 1일, 변수 평균)은 core 하나 0.27, core 둘 0.23, 넓은 core 0.20입니다.
+
+- **두 core의 이득은 평균의 효과보다 크기의 효과가 큽니다.** 같은 parameter를 core 하나에 몰아 준 쪽이 core 둘의 평균을 모든 선행일에서 이기고(501칸 대 17칸), 이득은 거의 정보 항입니다.
+- **가장 좋은 궤적 모델은 loop(kai_ro, core_gngmz8w)로 바뀝니다**(8.2절). 다만 넓은 core 둘은 시험하지 않았으므로 크기와 평균이 더해지는지는 모릅니다.
+- **혼합의 7~10일에서는 core 둘이 같거나 낫습니다**(kai_ro 위 +0.1 / −0.9). 정보는 넓은 core가 여전히 낫고(+0.6 / +0.2), 진 것은 진폭 항입니다: 예보 둘을 평균한 혼합이 더 매끄럽습니다(10일 activity 0.60 대 0.64). 10일의 RMSE가 가장 작은 것은 blend(kai_ro, core_gngmz8 둘)(0.495 대 0.499)이지만 그 몫은 감쇠입니다.
+- **작은 규모(k10+)는 연결에서 5일부터 집니다**(+1.4 / +0.1 / −0.5 / −1.2 / −2.6). 평균이 지워 주던 예측 불가능한 작은 규모가 넓은 core 하나에는 남습니다. 종관과 행성파는 모든 선행일에서 이깁니다(+3.6 / +1.9 / +1.4 / +1.2 / +0.7, +3.7 / +2.2 / +1.0 / +0.8 / +1.5).
+- **온도는 10일에 집니다**(변수군 t +3.3 / +2.0 / +0.9 / +0.4 / −0.6, t2m −1.1, t850 −0.8). z와 바람은 10일에도 이깁니다(z500 +1.8, u850 +1.2).
+- 한계: 넓은 core의 seed는 하나입니다(seed 차이 0.1 ~ 0.4 %; 선행 1~5일의 이득은 분명하고, 7~10일의 +0.9는 그 두세 배, 10일의 95 % 구간 +0.3 ~ +1.6). 폭은 48 → 72 한 점만 쟀고, 더 넓히면 어디서 멈추는지는 모릅니다. KAI를 같은 만큼 키운 대조도 없습니다.
+- 1.5°에 주는 뜻: core를 키우는 방향(`scripts/run_kai_plus_arch.sh`의 크기 실험, `docs/kai_tendency_plusplus.md`의 확장 core)이 맞고, GPU 시간이 한정되면 확장 core 하나가 먼저, seed twin은 그다음입니다. 5.625°의 수를 옮긴 추정이고 1.5°에서 잰 것은 아닙니다.
+
+![kai_ro 위의 연결: 넓은 core 하나 대 8일 기준 core 둘 (같은 parameter)](kai_tendency/breakdown_loop_core_gngmz8w-kai_ro__vs__loop_core_gngmz8s1_core_gngmz8-kai_ro.png)
+
+![kai_ro 위의 연결: 넓은 core 대 8일 기준 core 하나](kai_tendency/breakdown_loop_core_gngmz8w-kai_ro__vs__loop_core_gngmz8-kai_ro.png)
+
+![kai_ro 위의 선행일별 혼합: 넓은 core 하나 대 8일 기준 core 둘](kai_tendency/breakdown_blend_core_gngmz8w-kai_ro__vs__blend_core_gngmz8s1_core_gngmz8-kai_ro.png)
+
+변수별 RMSE(물리 단위)는 `scripts/kai_variable_table.py`로 만듭니다(소유자 사본 `variable_table_Li.md`, `variable_table_Ln.md`, `variable_table_Lo.md`, `variable_table_Lm.md`, `variable_table_Lp.md`, `variable_table_Lq.md`, `variable_table_Lr.md`, heat map과 그래프는 https://claude.ai/artifact/7U5voj1VdLQbR5w9n6UCbB).
 
 ## 8. 지금의 core 구조, best 모델, 두 core의 학습부터 평가까지 (2026-11-12)
 
@@ -479,7 +512,9 @@ step 끝에 q와 tcwv가 음수가 되지 않게 하는 보정(전구 질량 보
 x(t+1) = K(x) + w1 ⊙ ( C0(x) − K(x) ) + w2 ⊙ ( C1(x) − K(x) )
 ```
 
-K = rollout으로 미세조정한 KAI(kai_ro, 7.6절), C0와 C1 = 8.1절의 core를 seed만 달리해 따로 학습한 둘(초기 가중치와 표본 순서만 다름). w1, w2는 채널별 가중(0 이상, 합 1 이하; 검증 연도 2016년의 1일 예보에서 최소제곱으로 정함)이고, 섞은 상태를 매일 KAI와 두 core에 되먹입니다. 두 core의 기억은 각자 따로 있고 섞은 상태를 따라갑니다. 65채널 평균 가중은 KAI 0.23, core 둘 0.36(seed 0)과 0.41(seed 1)입니다. 근거는 7.9절입니다: core 하나 연결 대비 +1.7 / +1.3 / +1.0 / +0.6 / 0.0 %(1 / 3 / 5 / 7 / 10일), 미세조정 KAI 단독 대비 +21.5 / +7.8 / +4.7 / +3.0 / +2.1 %. 이득이 "평균 효과"인지 "parameter가 두 배라서"인지는 아직 가르지 못했습니다(같은 parameter 수의 넓은 core 하나와의 대조가 다음 채점입니다).
+K = rollout으로 미세조정한 KAI(kai_ro, 7.6절), C0와 C1 = 8.1절의 core를 seed만 달리해 따로 학습한 둘(초기 가중치와 표본 순서만 다름). w1, w2는 채널별 가중(0 이상, 합 1 이하; 검증 연도 2016년의 1일 예보에서 최소제곱으로 정함)이고, 섞은 상태를 매일 KAI와 두 core에 되먹입니다. 두 core의 기억은 각자 따로 있고 섞은 상태를 따라갑니다. 65채널 평균 가중은 KAI 0.23, core 둘 0.36(seed 0)과 0.41(seed 1)입니다. 근거는 7.9절입니다: core 하나 연결 대비 +1.7 / +1.3 / +1.0 / +0.6 / 0.0 %(1 / 3 / 5 / 7 / 10일), 미세조정 KAI 단독 대비 +21.5 / +7.8 / +4.7 / +3.0 / +2.1 %. 이득이 "평균 효과"인지 "parameter가 두 배라서"인지는 7.10절(score Lr)이 갈랐습니다.
+
+**2026-11-12 23:50 KST 갱신 (score Lr): 같은 parameter의 넓은 core 하나(core_gngmz8w, 8.3절 명령 3b)의 연결이 이 모델을 모든 선행일에서 넘습니다**(+3.0 / +1.8 / +1.1 / +0.9 / +0.9 %, 미세조정 KAI 단독 대비 +23.8 / +9.4 / +5.8 / +3.9 / +3.0 %). 지금 가장 좋은 궤적 모델은 `x(t+1) = K(x) + w ⊙ ( Cw(x) − K(x) )`, Cw = 넓은 core입니다(KAI의 가중 0.20). 넓은 core 둘은 시험하지 않았습니다. 10일의 RMSE만 보면 core 둘의 선행일별 혼합이 가장 작지만 그 몫은 감쇠입니다(7.10절).
 
 ### 8.3 두 core의 학습부터 평가까지 (5.625°, 이 문서의 수치를 낸 명령)
 
