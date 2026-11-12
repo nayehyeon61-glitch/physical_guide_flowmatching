@@ -11,7 +11,14 @@
 #   4. core+    the tendency core: physical terms G(x) + GRU memory + Mori-Zwanzig sequence loss (8-day sequences),
 #               SUBSTEPS Heun steps a day (4 at 1.5 deg: the same number of grid cells travelled per solver step as
 #               one step a day at 5.625 deg), gradient checkpointing per substep
-#   5. score    core+ alone, the coupled loop KAI + core+ on kai and on kai_ro, term split, per-variable table
+#   4b. twin    the same core+ trained again with another seed (TWIN=1, the default): the best model of
+#               docs/kai_tendency.md sec. 7.9 is KAI coupled with TWO separately trained cores (seed 0, 1)
+#   5. score    core+ alone, the coupled loop KAI + core+ on kai and on kai_ro, term split, per-variable table;
+#               TWIN=1: also the seed twin, the coupled loop KAI + both cores, and what the second core gives
+#               (two cores vs one, next to the seed difference of the one-core loop), files *_plus2.*
+#   4c. wide    WIDE=1: one wide core+ with the parameters of the two (hidden WIDE_HIDDEN = 72, memory WIDE_MEM_CH = 34
+#               channels: 520,966 vs 2 x 259,842) and its coupled loop: is the gain of two cores an ensemble effect or
+#               only twice the parameters? (docs/kai_tendency.md sec. 8.2), files *_plus2w.*
 # Every step is skipped when its checkpoint / marker exists; a training that was cut off resumes (--resume).
 #
 #   bash scripts/run_kai_plus.sh                                  # GRID=1.5, WB2 download, OUT=runs/kaiplus_1p5
@@ -25,6 +32,8 @@
 #                                                                 #   about 6 GB of activations per sample and rollout day at 1.5 deg
 #                                                                 #   (with it, the default: about 2 GB; CPU measurements, docs sec. 4)
 #   GFEAT=0 ...                                                   # core+ without the physical terms (GRU + MZ only)
+#   TWIN=0 ...                                                    # one core only (no seed twin, no two-core loop): files *_plus.*
+#   WIDE=1 ...                                                    # also the wide core + of the two cores' size (the same-size control)
 #   SMOKE=1 bash scripts/run_kai_plus.sh                          # a few iterations of every step on 24 days a year,
 #                                                                 #   in its own folders (data/era5_1p5_smoke, runs/kaiplus_1p5_smoke)
 #   KAI_ITERS=200 RO_ITERS=20 CORE_ITERS=40 LOGK=50 LOGC=10 OUT=runs/kaiplus_1p5_test bash scripts/run_kai_plus.sh
@@ -73,7 +82,11 @@ SCORE_BATCH=${SCORE_BATCH:-4}
 VAL_BATCH=${VAL_BATCH:-4}                # days per forward pass of the validation loss
 IC_STRIDE=${IC_STRIDE:-3}
 LEADS=${LEADS:-10}
-C=core_plus
+TWIN=${TWIN:-1}                        # 1 = train the core a second time with seed TWIN_SEED and score KAI coupled
+TWIN_SEED=${TWIN_SEED:-1}              #     with both cores (docs/kai_tendency.md sec. 7.9); 0 = one core
+WIDE=${WIDE:-0}                        # 1 = also one wide core with the parameters of the two (the same-size control)
+WIDE_HIDDEN=${WIDE_HIDDEN:-72}; WIDE_MEM_CH=${WIDE_MEM_CH:-34}   # 2 x the default core's parameters (hidden 48, 24)
+C=core_plus; C2=${C}_s$TWIN_SEED; M="$C+$C2"; CW=${C}_w
 LOGK=${LOGK:-500}; LOGC=${LOGC:-250}   # iterations between two log lines of the KAI / core training (each runs the validation loss)
 if [ "$SMOKE" = 1 ]; then
     KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; KAI_ITERS=4; KAI_BATCH=2; RO_ITERS=2; RO_BATCH=2; CORE_ITERS=2; CORE_BATCH=1
@@ -117,31 +130,73 @@ step kai_ro "$OUT/kai_ro.pt" $R --arm kai --tag kai_ro --init kai --rollout 2 3 
 
 # 4. the tendency core +
 G=""; [ "$GFEAT" = 1 ] && G="--core-gfeat"
-step $C "$OUT/$C.pt" $R --arm core --tag $C --core-norm gn $G --core-mem "$CORE_MEM" --core-mz \
-    --core-substeps "$SUBSTEPS" --core-ckpt --core-hidden "$PLUS_HIDDEN" --core-blocks $PLUS_BLOCKS \
-    --iters "$CORE_ITERS" --batch "$CORE_BATCH" --log-every $LOGC --resume
+CT="--arm core --core-norm gn $G --core-mem $CORE_MEM --core-mz --core-substeps $SUBSTEPS --core-ckpt"
+CT="$CT --core-blocks $PLUS_BLOCKS --iters $CORE_ITERS --batch $CORE_BATCH --log-every $LOGC --resume"
+step $C "$OUT/$C.pt" $R $CT --core-hidden "$PLUS_HIDDEN" --tag $C
+# 4b. its seed twin: the same core, the same training, another seed (initial weights and the order of the samples)
+if [ "$TWIN" = 1 ]; then step $C2 "$OUT/$C2.pt" $R $CT --core-hidden "$PLUS_HIDDEN" --tag $C2 --seed "$TWIN_SEED"; fi
+# 4c. one wide core of the two cores' size, the same training and seed as the first core
+if [ "$WIDE" = 1 ]; then
+    step $CW "$OUT/$CW.pt" $R $CT --core-hidden "$WIDE_HIDDEN" --core-mem-ch "$WIDE_MEM_CH" --tag $CW
+fi
 
-# 5. score: the core alone, the coupled loop on KAI and on the fine-tuned KAI; term split; per-variable table
-step score "$OUT/score_plus.json" bash -c "$R --score kai kai_ro --score-cores $C --mem-warm 0 1 \
-    --blend-bases kai kai_ro --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH \
-    --pairs $C:kai loop_$C:kai kai_ro:kai loop_$C@kai_ro:kai_ro loop_$C@kai_ro:loop_$C loop_$C@kai_ro:kai \
-        '$C~w0:$C' '$C~w1:$C' \
-    && cp $OUT/score.json $OUT/score_plus.json && cp $OUT/score_raw.npz $OUT/score_plus_raw.npz"
+# 5. score: the core alone, the coupled loop on KAI and on the fine-tuned KAI; term split; per-variable table.
+#    TWIN=1 (score_plus2.*): the same with both cores, KAI coupled with both (weights of KAI / core / twin per channel
+#    from the day-1 forecasts of the validation year, fed back every day) and the lead-wise mix of the three
+PAIRS="$C:kai loop_$C:kai kai_ro:kai loop_$C@kai_ro:kai_ro loop_$C@kai_ro:loop_$C loop_$C@kai_ro:kai"
+BP=("$C:kai=tendency core + alone vs KAI"
+    "loop_$C:kai=coupled loop(KAI, core +) vs KAI"
+    "kai_ro:kai=KAI with rollout fine-tuning vs KAI"
+    "loop_$C@kai_ro:kai_ro=coupled loop(KAI with rollout fine-tuning, core +) vs KAI with rollout fine-tuning"
+    "loop_$C@kai_ro:loop_$C=coupled loop on the fine-tuned KAI vs on KAI"
+    "$C~w0:$C=memory removed (0 days) vs $CORE_MEM days")
+VT=("kai=KAI" "kai_ro=KAI (rollout fine-tuned)" "$C=tendency core +" "loop_$C=KAI + core + loop"
+    "loop_$C@kai_ro=fine-tuned KAI + core + loop")
+VP=("loop_$C@kai_ro:kai_ro" "loop_$C:kai")
+if [ "$TWIN" = 1 ]; then
+    SC=plus2; SN=score2; CORES="$C $C2"; MULTI="--blend-multi $M --loop-multi $M"
+    PAIRS="$PAIRS $C2:$C loop_$C2:loop_$C loop_$C2@kai_ro:loop_$C@kai_ro loop_$M:loop_$C loop_$M@kai_ro:loop_$C@kai_ro"
+    PAIRS="$PAIRS loop_$M@kai_ro:kai_ro blend_$M@kai_ro:blend_$C@kai_ro"
+    BP+=("$C2:$C=seed difference, alone: core + trained with seed $TWIN_SEED vs seed 0"
+         "loop_$C2@kai_ro:loop_$C@kai_ro=seed difference of the one-core loop on the fine-tuned KAI: core of seed $TWIN_SEED vs seed 0"
+         "loop_$M:loop_$C=on KAI: coupled loop with two cores + (seed 0, $TWIN_SEED) vs with one"
+         "loop_$M@kai_ro:loop_$C@kai_ro=on the fine-tuned KAI: coupled loop with two cores + (seed 0, $TWIN_SEED) vs with one"
+         "loop_$M@kai_ro:kai_ro=coupled loop(fine-tuned KAI, two cores +) vs fine-tuned KAI"
+         "blend_$M@kai_ro:blend_$C@kai_ro=on the fine-tuned KAI: lead-wise mix with two cores + vs with one")
+    VT+=("$C2=tendency core + (seed $TWIN_SEED)" "loop_$M=KAI + two cores + loop"
+         "loop_$M@kai_ro=fine-tuned KAI + two cores + loop")
+    VP=("loop_$M@kai_ro:loop_$C@kai_ro" "loop_$M@kai_ro:kai_ro" "${VP[@]}")
+else
+    SC=plus; SN=score; CORES="$C"; MULTI=""
+fi
+if [ "$WIDE" = 1 ]; then  # the wide core: alone, in the loop, and against the two-core loop of the same parameters
+    SC=${SC}w; SN=${SN}w; CORES="$CORES $CW"
+    PAIRS="$PAIRS $CW:$C loop_$CW@kai_ro:loop_$C@kai_ro loop_$CW@kai_ro:kai_ro blend_$CW@kai_ro:blend_$C@kai_ro"
+    BP+=("$CW:$C=alone: the wide core + (parameters of two cores) vs core +"
+         "loop_$CW@kai_ro:loop_$C@kai_ro=on the fine-tuned KAI: coupled loop with the wide core + vs with core +"
+         "loop_$CW@kai_ro:kai_ro=coupled loop(fine-tuned KAI, wide core +) vs fine-tuned KAI")
+    VT+=("$CW=wide core +" "loop_$CW@kai_ro=fine-tuned KAI + wide core + loop")
+    if [ "$TWIN" = 1 ]; then
+        PAIRS="$PAIRS loop_$CW:loop_$M loop_$CW@kai_ro:loop_$M@kai_ro blend_$CW@kai_ro:blend_$M@kai_ro"
+        BP+=("loop_$CW:loop_$M=on KAI, same parameters: coupled loop with one wide core + vs with two cores + (seed 0, $TWIN_SEED)"
+             "loop_$CW@kai_ro:loop_$M@kai_ro=on the fine-tuned KAI, same parameters: coupled loop with one wide core + vs with two cores +"
+             "blend_$CW@kai_ro:blend_$M@kai_ro=on the fine-tuned KAI, same parameters: lead-wise mix with one wide core + vs with two cores +")
+        VP=("loop_$CW@kai_ro:loop_$M@kai_ro" "${VP[@]}")
+    else
+        VP=("loop_$CW@kai_ro:loop_$C@kai_ro" "${VP[@]}")
+    fi
+fi
+step $SN "$OUT/score_$SC.json" bash -c "$R --score kai kai_ro --score-cores $CORES --mem-warm 0 1 \
+    --blend-bases kai kai_ro --loop-blend $CORES $MULTI --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH \
+    --pairs $PAIRS '$C~w0:$C' '$C~w1:$C' \
+    && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"
 if [ "${DRYRUN:-0}" != 1 ]; then
     mkdir -p "$OUT/breakdown"
-    python scripts/eval_kai_breakdown.py --stats "$OUT/stats.npz" "$OUT/score_plus.json" "$OUT/score_plus_raw.npz" \
-        "$OUT/breakdown" \
-        "$C:kai=tendency core + alone vs KAI" \
-        "loop_$C:kai=coupled loop(KAI, core +) vs KAI" \
-        "kai_ro:kai=KAI with rollout fine-tuning vs KAI" \
-        "loop_$C@kai_ro:kai_ro=coupled loop(KAI with rollout fine-tuning, core +) vs KAI with rollout fine-tuning" \
-        "loop_$C@kai_ro:loop_$C=coupled loop on the fine-tuned KAI vs on KAI" \
-        "$C~w0:$C=memory removed (0 days) vs $CORE_MEM days" \
-        > "$OUT/breakdown/breakdown_plus.txt" 2>&1 || echo "[plus] breakdown failed, see $OUT/breakdown/breakdown_plus.txt"
-    python scripts/kai_variable_table.py "$OUT/score_plus.json" "$OUT/variable_table_plus.md" \
-        "kai=KAI" "kai_ro=KAI (rollout fine-tuned)" "$C=tendency core +" "loop_$C=KAI + core + loop" \
-        "loop_$C@kai_ro=fine-tuned KAI + core + loop" --base kai_ro --grid "$GRID" \
-        --pairs "loop_$C@kai_ro:kai_ro" "loop_$C:kai" > "$OUT/variable_table_plus.log" 2>&1 \
-        || echo "[plus] variable table failed, see $OUT/variable_table_plus.log"
-    echo "[plus] done: $OUT/score.log, $OUT/breakdown/breakdown_plus.txt, $OUT/variable_table_plus.md"
+    python scripts/eval_kai_breakdown.py --stats "$OUT/stats.npz" "$OUT/score_$SC.json" "$OUT/score_${SC}_raw.npz" \
+        "$OUT/breakdown" "${BP[@]}" \
+        > "$OUT/breakdown/breakdown_$SC.txt" 2>&1 || echo "[plus] breakdown failed, see $OUT/breakdown/breakdown_$SC.txt"
+    python scripts/kai_variable_table.py "$OUT/score_$SC.json" "$OUT/variable_table_$SC.md" "${VT[@]}" \
+        --base kai_ro --grid "$GRID" --pairs "${VP[@]}" > "$OUT/variable_table_$SC.log" 2>&1 \
+        || echo "[plus] variable table failed, see $OUT/variable_table_$SC.log"
+    echo "[plus] done: $OUT/$SN.log, $OUT/breakdown/breakdown_$SC.txt, $OUT/variable_table_$SC.md"
 fi

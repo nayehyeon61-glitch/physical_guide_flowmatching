@@ -445,6 +445,97 @@ nRMSE(kai_ro 위): core_gngmz8 둘 연결 0.175 / 0.310 / 0.403 / 0.468 / 0.527,
 
 변수별 RMSE(물리 단위)는 `scripts/kai_variable_table.py`로 만듭니다(소유자 사본 `variable_table_Li.md`, `variable_table_Ln.md`, `variable_table_Lo.md`, `variable_table_Lm.md`, `variable_table_Lp.md`, `variable_table_Lq.md`, heat map과 그래프는 https://claude.ai/artifact/7U5voj1VdLQbR5w9n6UCbB).
 
+## 8. 지금의 core 구조, best 모델, 두 core의 학습부터 평가까지 (2026-11-12)
+
+소유자 요청(2026-11-12 13:38 KST "현재 tendency core의 구조는?", 14:21 KST "이것도 git에 올려주시고, 이후 이 두 개 core에 대한 학습 평가까지의 명령어 제공")에 따라, 지금 쓰는 구조와 명령을 한곳에 모았습니다.
+
+### 8.1 tendency core의 구조 (8일 기준 core `core_gngmz8`, parameter 259,842개)
+
+하루 tendency를 내는 residual CNN에 물리항 48개와 ConvGRU 기억항을 입력으로 넣고, Mori-Zwanzig 형태의 8일 sequence loss로 학습한 것입니다.
+
+```
+dx/dt = f( x, G(x), m, 위치, 시간 )          하루 1 step, Heun 적분 (f를 두 번 계산)
+m_t   = ConvGRU( m_(t-1), enc[ x_t, 추세_t, e_t, G(x_t), G(x_(t-1)) ] )
+```
+
+- **x**: 정규화한 상태 66채널(z, t, q, u, v 각 12층 60개 + 지표 t2m, sp, tcwv, msl, skt, tisr). tisr는 예측하지 않고 다음 날 값을 자료에서 넣습니다.
+- **G(x)**: 원시방정식 이산 연산자가 계산한 u, v, T, q의 tendency 48채널(4변수 × 12층). 적분하지 않고 입력으로만 씁니다(gradient 없음, 채널별 RMS로 나누고 ±5에서 자름, 지면 아래는 0).
+- **m**: 기억항, 24채널 ConvGRU 상태. 매일 step 전에 갱신하고, 입력은 오늘 상태, 관측 추세 (x_t − x_(t−1)), 전날 예보가 놓친 오차 e_t(innovation), 오늘과 어제의 G(x)입니다. 초기 시각 전 8일로 채우고, 예보 중에는 예보한 상태로 이어 갑니다(그때 e = 0).
+
+| 부분 | 내용 | parameter |
+| --- | --- | --- |
+| trunk | ClimODE의 residual CNN. 입력 150채널(x 66 + m 24 + G 48 + 위치·지형 8 + 시간 4), residual block 4개(폭 48, 3×3 conv, 경도 순환 / 위도 반사 padding), BatchNorm 대신 GroupNorm, dropout 없음 | 218,352 |
+| head | 1×1 conv 48 → 66, 0으로 초기화(처음에는 persistence), 출력에 변수별 하루 증분 표준편차를 곱함 | 3,234 |
+| 기억 encoder | 1×1 conv 294 → 24 (x 66 + 추세 66 + e 66 + G 48 + 어제 G 48) | 7,080 |
+| ConvGRU | 3×3 conv gate와 후보, 24채널 | 31,176 |
+
+step 끝에 q와 tcwv가 음수가 되지 않게 하는 보정(전구 질량 보존, PositiveMass)이 붙습니다. 학습: 초기 시각 전 8일을 빈 기억에서 시작해 하루씩 예보하고(첫날은 Markov 항만), 그 8개 예보와 이어지는 1~4일 rollout을 함께 loss에 넣습니다(위도 가중 MSE, 하루 증분 표준편차 단위). 여기에 연속한 하루 예보 잔차의 lag 1, 2 상관의 제곱을 더합니다("잡음 항은 과거와 직교"). 2012~2015년, 3000 iteration, batch 8, AdamW 4e-4, cosine. 코드는 `pgcfm/kai_tend.py`(`MemCore`, `ConvGRUCell`), `pgcfm/dyncore.py`(`DynCore`, `OperatorFeatures`), 옵션은 `--core-norm gn --core-gfeat --core-mem 8 --core-mz`입니다.
+
+시험했지만 이 core를 넘지 못해 넣지 않은 것: 3·5일 고정 누적 기억(7.5절), 기억 kernel network(7.5절), 물리 tendency의 시간 누적(7.5절), 물리항을 뺀 기억 core(7.7절).
+
+### 8.2 best 모델: 미세조정 KAI + 8일 기준 core 둘(seed 0, 1)의 되먹임 연결
+
+```
+x(t+1) = K(x) + w1 ⊙ ( C0(x) − K(x) ) + w2 ⊙ ( C1(x) − K(x) )
+```
+
+K = rollout으로 미세조정한 KAI(kai_ro, 7.6절), C0와 C1 = 8.1절의 core를 seed만 달리해 따로 학습한 둘(초기 가중치와 표본 순서만 다름). w1, w2는 채널별 가중(0 이상, 합 1 이하; 검증 연도 2016년의 1일 예보에서 최소제곱으로 정함)이고, 섞은 상태를 매일 KAI와 두 core에 되먹입니다. 두 core의 기억은 각자 따로 있고 섞은 상태를 따라갑니다. 65채널 평균 가중은 KAI 0.23, core 둘 0.36(seed 0)과 0.41(seed 1)입니다. 근거는 7.9절입니다: core 하나 연결 대비 +1.7 / +1.3 / +1.0 / +0.6 / 0.0 %(1 / 3 / 5 / 7 / 10일), 미세조정 KAI 단독 대비 +21.5 / +7.8 / +4.7 / +3.0 / +2.1 %. 이득이 "평균 효과"인지 "parameter가 두 배라서"인지는 아직 가르지 못했습니다(같은 parameter 수의 넓은 core 하나와의 대조가 다음 채점입니다).
+
+### 8.3 두 core의 학습부터 평가까지 (5.625°, 이 문서의 수치를 낸 명령)
+
+```bash
+# 0. 코드와 환경 (한 번). 이미 clone이 있으면 그 폴더에서 git fetch origin && git checkout claude/project-thread-wjjayb && git pull --ff-only origin claude/project-thread-wjjayb
+git clone https://github.com/nayehyeon61-glitch/physical_guide_flowmatching.git && cd physical_guide_flowmatching
+git checkout claude/project-thread-wjjayb
+pip install torch && pip install -r requirements.txt
+pip install git+https://github.com/patrick-kidger/torchcubicspline.git
+
+# 1. 자료: ERA5 5.625° 2012~2017 (WeatherBench2에서 내려받음)
+python scripts/wb2_to_kai.py --out data/era5_5p625 --all-hours --years 2012 2013 2014 2015 2016 2017
+R="python scripts/run_kai_tendency.py --out runs/kaitend"        # GPU라면 끝에 --device cuda
+
+# 2. KAI(시험 크기 0.43 M)와 rollout 미세조정 KAI
+$R --arm kai --tag kai
+$R --arm kai --tag kai_ro --init kai --rollout 2 3 --lr 3e-4 --iters 1000
+
+# 3. core 둘: 같은 구조, 같은 학습, seed만 다름 (끊기면 같은 명령으로 이어서 함)
+C="--arm core --core-norm gn --iters 3000 --log-every 250 --core-gfeat --core-mem 8 --core-mz --resume"
+$R $C --tag core_gngmz8
+$R $C --tag core_gngmz8s1 --seed 1
+
+# 3b. (대조, 선택) 두 core와 parameter 수가 같은 넓은 core 하나: hidden 72, 기억 34채널 (520,966개), seed 0
+$R $C --tag core_gngmz8w --core-hidden 72 --core-mem-ch 34
+
+# 4. 평가 (2017년 초기장 119개, 선행 1~10일): core 단독, core 하나 연결, core 둘 연결, kai와 kai_ro 위에서
+#    3b를 했다면 --score-cores와 --loop-blend 끝에 core_gngmz8w를, --pairs에 "loop_core_gngmz8w@kai_ro:loop_$M@kai_ro"를 더합니다
+A=core_gngmz8; B=core_gngmz8s1; M="$B+$A"
+$R --score kai kai_ro --score-cores $A $B --blend-bases kai kai_ro --loop-blend $A $B \
+   --blend-multi $M --loop-multi $M \
+   --pairs "loop_$M@kai_ro:loop_$A@kai_ro" "loop_$M@kai_ro:kai_ro" "loop_$B@kai_ro:loop_$A@kai_ro" "$B:$A" \
+   2>&1 | tee runs/kaitend/score_two.log
+
+# 5. 항별 분해(전체 / 정보 / 진폭, 변수군, 규모, 지역, 계절)와 변수별 표(물리 단위)
+python scripts/eval_kai_breakdown.py --stats runs/kaitend/stats.npz runs/kaitend/score.json runs/kaitend/score_raw.npz \
+   runs/kaitend/breakdown_two \
+   "loop_$M@kai_ro:loop_$A@kai_ro=fine-tuned KAI: coupled loop with two cores (seed 0, 1) vs with one" \
+   "loop_$M@kai_ro:kai_ro=coupled loop(fine-tuned KAI, two cores) vs fine-tuned KAI" \
+   "loop_$B@kai_ro:loop_$A@kai_ro=seed difference of the one-core loop" \
+   2>&1 | tee runs/kaitend/breakdown_two.txt
+python scripts/kai_variable_table.py runs/kaitend/score.json runs/kaitend/variable_table_two.md \
+   "kai=KAI" "kai_ro=KAI (rollout fine-tuned)" "$A=core (seed 0)" "$B=core (seed 1)" \
+   "loop_$A@kai_ro=fine-tuned KAI + core loop" "loop_$M@kai_ro=fine-tuned KAI + two cores loop" \
+   --base kai_ro --pairs "loop_$M@kai_ro:loop_$A@kai_ro" "loop_$M@kai_ro:kai_ro"
+```
+
+- 시간(CPU 4코어): KAI 10분, 미세조정 13분, core 하나에 2시간 45분(넓은 core는 약 6시간), 평가 약 25분. 메모리는 14 GB 안에서 한 번에 학습 하나만 돌려야 합니다.
+- 결과: `runs/kaitend/score_two.log`(모델별 nRMSE, ACC, 쌍별 차이), `score.json`과 `score_raw.npz`(전체 수치), `breakdown_two.txt`와 `breakdown_two/`(항별 표와 그림), `variable_table_two.md`.
+- **부호**: `score_two.log`의 `pairs` 줄은 "a의 b 대비 nRMSE 변화"라서 음수가 좋아진 것입니다. 항별 분해와 변수별 표, 이 문서의 표는 모두 이득(+ = 좋아짐)으로 적습니다.
+- 같은 seed로 다시 학습해도 기계와 thread 수에 따라 끝자리가 달라질 수 있습니다. seed만 바꾼 차이는 65채널 평균으로 0.1~0.4 %, 변수 하나로는 1~1.5 %였습니다(7.9절). 그보다 작은 차이는 읽지 않는 것이 맞습니다.
+
+### 8.4 KAI의 해상도(1.5°, GPU)에서
+
+같은 일을 `scripts/run_kai_plus.sh`가 한 번에 합니다(자료, KAI, 미세조정 KAI, core +, seed가 다른 둘째 core +, 평가, 항별 분해, 변수별 표; `WIDE=1`이면 넓은 core 대조까지). 명령은 `docs/kai_tendency_plus.md` 5.2절에 있습니다. 1.5°에서는 아직 학습해 본 적이 없으므로 그 해상도의 성능 수치는 없습니다.
+
 ## 재현
 
 ```bash

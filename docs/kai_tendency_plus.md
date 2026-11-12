@@ -50,7 +50,7 @@ x(t + 1일) = PositiveMass( x_n, 다음 날의 일사 )
 | `scripts/run_kai_tendency.py` | `--device`, `--lazy`, `--core-ckpt`, `--kai-ckpt`, `--score-batch`, `--score-chunk`, `--val-batch`. 한 해가 1 GB를 넘으면 자료를 디스크에 둠(`ZYear`, `Lazy`, `stats_stream`). 채점을 초기장 묶음으로 나눔. GPU에서는 학습 log에 그때까지의 최대 GPU 메모리(`gpu_gb`)를 적음 |
 | `scripts/wb2_to_kai.py` | `--grid 240x121`(WeatherBench2의 1.5° 극 포함 격자), `--daily-mean`, `--days` |
 | `scripts/local_era5_to_kai.py` | `--grid 1.5`(극 포함), `--daily-mean`, `--days`. 0.25° 시간별 archive에서 면적 보존 평균. `--src-daily`: 이미 일평균인 archive(`ERA5_0p25_DAILY`)를 그대로 읽음. 파일 배치를 첫날에서 스스로 찾고, `--check --src-daily`가 찾은 것과 값의 범위를 보여 줌 |
-| `scripts/run_kai_plus.sh` | 자료, KAI, rollout 미세조정 KAI, core +, 채점, 항별 분해, 변수별 표를 차례로 실행. 끝난 단계는 건너뛰고, 끊긴 학습은 이어서 함 |
+| `scripts/run_kai_plus.sh` | 자료, KAI, rollout 미세조정 KAI, core +, seed가 다른 둘째 core +(`TWIN=1`, 기본), 채점(core 하나 연결과 core 둘 연결), 항별 분해, 변수별 표를 차례로 실행. 끝난 단계는 건너뛰고, 끊긴 학습은 이어서 함 |
 | `scripts/kai_step_memory.py` | KAI 학습 step 하나의 메모리, 시간, 기울기를 재는 작은 도구(4.4절) |
 | `scripts/eval_kai_breakdown.py`, `scripts/kai_variable_table.py` | 촘촘한 격자의 규모 분해: 작은 규모를 k10~32(5.625°도 푸는 규모)와 k33 이상(촘촘한 격자에만 있는 규모)으로 나눔. 선행일이 짧은 채점도 처리. 5.625° 출력은 그대로 |
 
@@ -180,7 +180,66 @@ SRC=daily nohup bash scripts/run_kai_plus.sh > runs/kaiplus_1p5_daily.log 2>&1 &
 - 변환 시간은 이 기계에서 하루에 약 5초였습니다(한 해 약 30분, 연도마다 process 하나라서 여섯 해가 함께 돕니다. `WORKERS`). lustre의 읽기 속도에 따라 달라집니다.
 - 실제 `ERA5_0p25_DAILY`로는 확인하지 못했습니다. 일평균의 정의(24시간 평균인지 00/06/12/18 UTC 평균인지)가 내려받은 자료와 다를 수 있고, 그러면 점수가 소수점에서 달라집니다. 학습 연도는 `TRAIN_YEARS="2008 2009 ... 2015"`처럼 늘릴 수 있습니다.
 
-기본값: 학습 2012~15, 검증 2016, 시험 2017(5.625° 시험과 같은 해), KAI는 원래 크기 (3, 3, 15, 3) / (48, 96, 192, 288). 결과는 `runs/kaiplus_1p5/`에 쌓입니다: `score.log`, `score_plus.json`, `breakdown/breakdown_plus.txt`, `variable_table_plus.md`, 단계별 log `kai.log`, `kai_ro.log`, `core_plus.log`.
+### 5.2 두 core(seed 0, 1)의 학습부터 평가까지
+
+5.625°에서 지금 가장 좋은 모델은 미세조정 KAI에 **같은 구조의 core를 seed만 달리해 따로 학습한 둘**을 함께 되먹임 연결한 것입니다(`docs/kai_tendency.md` 7.9절과 8절: core 하나 연결 대비 +1.7 / +1.3 / +1.0 / +0.6 / 0.0 %). driver는 기본값(`TWIN=1`)으로 둘째 core까지 학습하고 두 core 연결을 평가합니다. 1.5°에서의 수치는 아직 없고, 아래 명령이 그것을 내는 명령입니다.
+
+```bash
+# 0. 코드 받기 (clone이 이미 있는 경우; 처음이면 5절의 1번)
+cd physical_guide_flowmatching
+git fetch origin && git checkout claude/project-thread-wjjayb && git pull --ff-only origin claude/project-thread-wjjayb
+source .venv/bin/activate
+
+# 1. 점검 (몇 분): 모든 단계를 작은 망으로 몇 iteration씩. core 둘과 두 core 연결의 채점까지 지나갑니다
+SRC=daily SMOKE=1 bash scripts/run_kai_plus.sh
+
+# 2. 본 학습과 평가: 자료, KAI, 미세조정 KAI, core + (seed 0), core + (seed 1), 평가, 항별 분해, 변수별 표
+SRC=daily nohup bash scripts/run_kai_plus.sh > runs/kaiplus_1p5_daily.log 2>&1 &
+tail -f runs/kaiplus_1p5_daily.log
+
+# 3. 결과 읽기
+O=runs/kaiplus_1p5_daily
+grep -h '"it"' $O/core_plus.log $O/core_plus_s1.log | tail -4     # 두 core의 학습 log (val = 검증 loss, sec, gpu_gb)
+sed -n '/^pairs/,$p' $O/score2.log                                # 쌍별 차이와 모델별 nRMSE, ACC
+cat $O/variable_table_plus2.md                                    # 변수별 표 (물리 단위, 이득 %)
+less $O/breakdown/breakdown_plus2.txt                             # 항별 분해 (전체 / 정보 / 진폭, 규모, 지역, 계절)
+```
+
+- `SRC=daily`는 lustre의 0.25° 일평균을 쓰는 경우입니다(5.1절의 (a) 점검이 OK일 때). WeatherBench2에서 내려받아 쓰려면 `SRC=daily`를 빼면 되고, 그때 폴더는 `runs/kaiplus_1p5`입니다.
+- **이미 돌린 폴더가 있으면 이어서 합니다.** `kai.pt`, `kai_ro.pt`, `core_plus.pt`가 있으면 그 단계는 건너뛰고 둘째 core(`core_plus_s1`)의 학습과 두 core 평가만 합니다. 실행 전에 명령만 보려면 앞에 `DRYRUN=1`을 붙입니다.
+- 둘째 core는 첫째와 옵션이 모두 같고 `--seed 1`만 다릅니다(초기 가중치와 표본 순서). 학습 시간과 메모리는 첫째와 같으므로 core 학습 시간이 두 배가 됩니다. core 하나만 원하면 `TWIN=0`입니다.
+- 평가가 내는 것(2017년, 선행 1~10일): core 둘 각각의 단독 예보, KAI와 core 하나의 되먹임 연결(`loop_core_plus`, `loop_core_plus_s1`), **KAI와 core 둘의 되먹임 연결(`loop_core_plus+core_plus_s1`)**, 선행일별 혼합. 모두 KAI 위와 미세조정 KAI 위(`@kai_ro`)에서 냅니다. 두 core의 가중은 검증 연도의 1일 예보에서 채널별로 정합니다.
+- 읽을 쌍: `loop_core_plus+core_plus_s1@kai_ro` 대 `loop_core_plus@kai_ro`가 "core 둘 대 core 하나"이고, `loop_core_plus_s1@kai_ro` 대 `loop_core_plus@kai_ro`가 seed만 바꾼 차이(잡음의 크기)입니다. 앞의 것이 뒤의 것보다 뚜렷이 커야 이득입니다.
+- **부호**: `score2.log`의 `pairs` 줄은 "a의 b 대비 nRMSE 변화"라서 음수가 좋아진 것입니다. 항별 분해와 변수별 표는 이득(+ = 좋아짐)으로 적습니다.
+**넓은 core 대조(`WIDE=1`)**: core 둘의 이득이 "따로 학습한 둘의 평균"에서 오는지 "parameter가 두 배라서"인지를 가르는 대조입니다(5.625°에서 같은 대조를 돌리고 있습니다, `docs/kai_tendency.md` 8.2절). 위의 2번에 `WIDE=1`만 붙이면 core 둘에 더해 넓은 core 하나(hidden 72, 기억 34채널, seed 0)를 학습하고 셋을 함께 평가합니다. 이미 core 둘까지 돌린 폴더라면 넓은 core의 학습과 평가만 더 합니다.
+
+```bash
+SRC=daily WIDE=1 nohup bash scripts/run_kai_plus.sh > runs/kaiplus_1p5_daily_wide.log 2>&1 &
+O=runs/kaiplus_1p5_daily
+grep -h '"it"' $O/core_plus_w.log | tail -2                      # 넓은 core의 학습 log
+sed -n '/^pairs/,$p' $O/score2w.log                               # 쌍별 차이와 모델별 nRMSE, ACC
+cat $O/variable_table_plus2w.md
+less $O/breakdown/breakdown_plus2w.txt
+```
+
+- 읽을 쌍: `loop_core_plus_w@kai_ro` 대 `loop_core_plus+core_plus_s1@kai_ro`(같은 parameter 수, 넓은 core 하나 대 core 둘)와 `loop_core_plus_w@kai_ro` 대 `loop_core_plus@kai_ro`(넓힌 것만의 몫).
+- 넓은 core는 표본당 activation이 기본 core의 약 1.5배입니다(어림 약 2.4 GB, batch 8에 약 19 GB). 메모리가 모자라면 `CORE_BATCH=4`로 셋 모두를 같은 batch로 돌려야 비교가 공정합니다. 5.625° CPU에서는 기본 core보다 iteration당 2.2배 느렸습니다.
+- 넓은 core의 크기(72, 34)는 기본 core(`PLUS_HIDDEN=48`, 기억 24채널, 블록 (2, 2))의 두 배에 맞춘 값입니다. `PLUS_HIDDEN`이나 `PLUS_BLOCKS`를 바꾸면 `WIDE_HIDDEN`, `WIDE_MEM_CH`도 다시 맞춰야 합니다.
+
+- driver가 실행하는 core 학습과 평가 명령(직접 돌릴 때; `$D` = 자료와 출력 폴더, 장치 옵션. `DRYRUN=1`이 전체를 보여 줍니다):
+
+```bash
+R="python scripts/run_kai_tendency.py $D --depths 3 3 15 3 --dims 48 96 192 288"
+CT="--arm core --core-norm gn --core-gfeat --core-mem 8 --core-mz --core-substeps 4 --core-ckpt --core-hidden 48 --core-blocks 2 2 --iters 3000 --batch 8 --log-every 250 --resume"
+$R $CT --tag core_plus
+$R $CT --tag core_plus_s1 --seed 1
+$R $CT --tag core_plus_w --core-hidden 72 --core-mem-ch 34          # WIDE=1
+$R --score kai kai_ro --score-cores core_plus core_plus_s1 --mem-warm 0 1 --blend-bases kai kai_ro \
+   --loop-blend core_plus core_plus_s1 --blend-multi core_plus+core_plus_s1 --loop-multi core_plus+core_plus_s1 \
+   --leads 10 --ic-stride 3 --score-batch 4 --pairs "loop_core_plus+core_plus_s1@kai_ro:loop_core_plus@kai_ro" ...
+```
+
+기본값: 학습 2012~15, 검증 2016, 시험 2017(5.625° 시험과 같은 해), KAI는 원래 크기 (3, 3, 15, 3) / (48, 96, 192, 288). 결과는 `runs/kaiplus_1p5/`에 쌓입니다: `score2.log`, `score_plus2.json`, `breakdown/breakdown_plus2.txt`, `variable_table_plus2.md`, 단계별 log `kai.log`, `kai_ro.log`, `core_plus.log`, `core_plus_s1.log`(`TWIN=0`이면 `score.log`, `score_plus.json`, `breakdown_plus.txt`, `variable_table_plus.md`).
 
 | 환경 변수 | 기본 | 뜻 |
 | --- | --- | --- |
@@ -192,6 +251,8 @@ SRC=daily nohup bash scripts/run_kai_plus.sh > runs/kaiplus_1p5_daily.log 2>&1 &
 | `PLUS_HIDDEN`, `PLUS_BLOCKS` | 48, "2 2" | core +의 폭과 깊이 |
 | `CORE_BATCH`, `CORE_ITERS`, `CORE_MEM` | 8, 3000, 8 | core +의 batch, iteration, sequence 길이(일) |
 | `GFEAT` | 1 | 0이면 물리항 없이 GRU + MZ만 |
+| `TWIN`, `TWIN_SEED` | 1, 1 | 1이면 core +를 seed만 바꿔 한 번 더 학습하고(`core_plus_s1`) KAI와 두 core의 되먹임 연결까지 평가. 0이면 core 하나만 |
+| `WIDE`, `WIDE_HIDDEN`, `WIDE_MEM_CH` | 0, 72, 34 | 1이면 두 core와 parameter 수가 같은 넓은 core 하나(`core_plus_w`, 520,966개)도 학습하고 그 연결을 두 core 연결과 비교. 파일 이름에 `w`가 붙음(`score2w.log`, `score_plus2w.json`, `breakdown_plus2w.txt`, `variable_table_plus2w.md`) |
 | `LOGK`, `LOGC` | 500, 250 | KAI / core 학습의 log 간격(iteration). log마다 검증 loss를 계산 |
 | `TRAIN_YEARS` | "2012 2013 2014 2015" | 학습 연도 |
 
@@ -214,10 +275,11 @@ GPU에서의 iteration당 시간은 재지 못했습니다(CPU 2 thread에서는
 
 1. **GPU에서 실행해 보지 못했습니다.** 장치 처리는 GPU에서 돌린 적이 있는 `scripts/run_step16_dynpinn.py`의 방식을 따랐지만, 이 코드 자체는 CPU에서만 확인했습니다. 먼저 `SMOKE=1 bash scripts/run_kai_plus.sh`를 돌려 보시기를 권합니다. 장치가 섞이는 오류가 있다면 여기서 바로 드러납니다. 메모리의 어림(5절)도 CPU에서 작은 격자로 잰 값을 환산한 것이라, 원래 크기의 첫 log(`gpu_gb`)로 확인해야 합니다.
 2. **substep 4는 계산에서 나온 설계값이고, 성능으로 확인한 값이 아닙니다.** `SUBSTEPS=1`, `2`, `4`를 같은 조건으로 학습해서 비교해야 합니다. 4가 2보다 낫지 않으면 2가 시간이 절반입니다.
-3. **망의 크기.** 격자점이 14배인데 기본 망은 5.625°와 같습니다. 선행 1~3일의 작은 규모(k10 이상)에서 모자랄 수 있습니다. `PLUS_HIDDEN=96 PLUS_BLOCKS="2 2 2"`와 비교가 필요합니다.
-4. **극.** 극 행의 물리항은 0이고, 85° 바깥의 G는 clamp만 되어 들어갑니다. 고위도의 오차를 따로 봐야 합니다. `eval_kai_breakdown.py`의 지역 분해에 극 지역(70° 바깥)을 더하는 것이 다음 일입니다.
-5. **1.5°와 1.40625°.** 1.5°는 KAI가 원래 쓰는 격자입니다. 1.40625°는 5.625° 한 칸에 4 × 4칸이 정확히 들어맞아 5.625° 결과와 비교하기 쉽지만 KAI의 격자가 아닙니다. 기본은 1.5°이고, 두 격자 모두 같은 코드로 돕니다.
-6. **5.625° 결과와의 비교.** 1.5° 채점은 1.5° 격자에서 합니다. 5.625°의 수치와 나란히 놓으려면 예측을 5.625°로 평균한 뒤 채점하는 단계가 필요하고, 아직 없습니다.
+3. **core 둘과 넓은 core 하나.** 5.625°에서 core 둘의 이득(약 1~2 %)이 "따로 학습한 둘의 평균"에서 오는지 "parameter가 두 배라서"인지는 아직 가르지 못했습니다. 같은 parameter 수의 넓은 core 하나와의 대조를 5.625°에서 돌리고 있습니다. 1.5°에서는 `WIDE=1`이 같은 대조입니다(5.2절).
+4. **망의 크기.** 격자점이 14배인데 기본 망은 5.625°와 같습니다. 선행 1~3일의 작은 규모(k10 이상)에서 모자랄 수 있습니다. `PLUS_HIDDEN=96 PLUS_BLOCKS="2 2 2"`와 비교가 필요합니다.
+5. **극.** 극 행의 물리항은 0이고, 85° 바깥의 G는 clamp만 되어 들어갑니다. 고위도의 오차를 따로 봐야 합니다. `eval_kai_breakdown.py`의 지역 분해에 극 지역(70° 바깥)을 더하는 것이 다음 일입니다.
+6. **1.5°와 1.40625°.** 1.5°는 KAI가 원래 쓰는 격자입니다. 1.40625°는 5.625° 한 칸에 4 × 4칸이 정확히 들어맞아 5.625° 결과와 비교하기 쉽지만 KAI의 격자가 아닙니다. 기본은 1.5°이고, 두 격자 모두 같은 코드로 돕니다.
+7. **5.625° 결과와의 비교.** 1.5° 채점은 1.5° 격자에서 합니다. 5.625°의 수치와 나란히 놓으려면 예측을 5.625°로 평균한 뒤 채점하는 단계가 필요하고, 아직 없습니다.
 
 ## 재현 (이 문서의 시험)
 
@@ -225,8 +287,9 @@ GPU에서의 iteration당 시간은 재지 못했습니다(CPU 2 thread에서는
 # 5.625°: 바꾸기 전 코드와 같은지 (core 학습 4 iteration)
 python scripts/run_kai_tendency.py --out runs/eq_new --arm core --core-norm gn --core-gfeat --core-mem 8 --core-mz \
     --iters 4 --log-every 2 --batch 2 --curriculum 1 2 --train-years 2015 --threads 2 [--lazy] [--core-ckpt]
-# 1.5°: 해마다 24일을 내려받아 모든 단계를 몇 iteration씩 (CPU에서 약 25분)
+# 1.5°: 해마다 24일을 내려받아 모든 단계를 몇 iteration씩 (CPU에서 약 25분; core 둘과 넓은 core까지는 약 1시간)
 SMOKE=1 DEVICE=cpu bash scripts/run_kai_plus.sh
+WIDE=1 SMOKE=1 DEVICE=cpu bash scripts/run_kai_plus.sh     # 넓은 core 대조 (5.2절)
 # KAI 학습 step 하나의 메모리와 기울기 (4.4절): checkpoint 없음 / 있음, 경우마다 따로 실행
 python scripts/kai_step_memory.py --grid 61 120 --ckpt 0 --save g0.pt
 python scripts/kai_step_memory.py --grid 61 120 --ckpt 1 --save g1.pt
