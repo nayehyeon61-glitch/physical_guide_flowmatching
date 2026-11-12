@@ -672,6 +672,15 @@ def score(a, tags):
     res["persistence"] = metrics(Lazy(lambda c: np.repeat(te[ics[c]][:, None], L, 1), len(ics)))
     res["climatology"] = metrics(Lazy(lambda c: cl[c].astype(np.float32), len(ics)))
     fns, models = {}, {}  # tag -> forecast function (x0, doy, tisr) -> (B, L, 67, H, W); tag -> KAIPos
+    if "climatology" in a.blend_with:
+        # the damping control of the blends: --blend-with climatology mixes every --blend-bases KAI with the daily
+        # climatology by lead and channel, weights from the validation year exactly like the core blends
+        # (blend_climatology[@base]): what the core adds beyond damping KAI toward the climatology
+        def clim_fn(x0, doy, tis, pv=None):
+            d = np.minimum(doy.cpu().numpy()[:, None] + np.arange(1, L + 1)[None], nc_)
+            return torch.from_numpy((clim[d] - mn[0]) / sd[0]).to(x0.device)
+        fns["climatology"] = clim_fn
+        keep["climatology"] = cl
     core_tags = a.score_cores if a.score_cores is not None else [a.core_tag]
     for ct in core_tags:
         assert get_core(ct).stride == 1, f"{ct}: a long-scale core is scored through --hier"

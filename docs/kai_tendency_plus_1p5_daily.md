@@ -218,7 +218,7 @@ nRMSE 이득을 패턴(정보)과 진폭 비용으로 나눈 값입니다. 선�
 | --- | --- | --- | --- | --- | --- |
 | 1.5° 최종 대 5.625° 최종 | +28.7 | +24.8 | +15.0 | +6.4 | −1.2 |
 | 1.5° KAI 대 5.625° KAI | +43.9 | +32.0 | +20.8 | +11.5 | +4.1 |
-| 1.5° 최종 대 1.5° KAI | +0.7 | +3.7 | +5.9 | +6.6 | +6.5 |
+| 1.5° 최종 대 1.5° KAI | +0.7 | +3.7 | +5.9 | +6.4 | +6.5 |
 
 - 1.5° 격자는 작은 규모의 변동이 더 있어서 같은 지표가 조금 더 어렵습니다(persistence의 nRMSE가 1일 0.381 대 0.407). 그래서 위의 해상도 간 이득은 1.5°에 불리한 쪽으로 잰 값입니다.
 - 10일의 nRMSE가 비슷한 것(−1.2 %)은 5.625° 최종 모델이 더 매끄럽기 때문이기도 합니다. 진폭에 영향을 받지 않는 ACC는 10일에도 0.248 대 0.366으로 1.5°가 높습니다.
@@ -417,6 +417,24 @@ python scripts/eval_kai_breakdown.py --stats $O/stats.npz $O/score_plus.json $O/
     "blend_core_plus:kai=blend vs KAI" "blend_core_plus@kai_ro:kai_ro=blend on fine-tuned KAI vs fine-tuned KAI" \
     "blend_core_plus:loop_core_plus=blend vs loop" "blend_core_plus@kai_ro:loop_core_plus@kai_ro=blend vs loop (fine-tuned)"
 ```
+
+단순 감쇠와의 비교와 미세조정 KAI 대비 구간까지 한 번에 내려면 아래 명령을 씁니다. 아무것도 학습하지 않고(이미 있는 단계는 건너뜀), KAI와 미세조정 KAI를 기후값과 같은 방식으로 섞은 감쇠 대조(가중은 2016년, 선행일과 채널마다)를 더해 다시 채점합니다. 결과는 `score_plusc.json`, `scoreclim.log`의 pairs 줄(부트스트랩 구간), `breakdown_clim/breakdown_plusc.txt`(정확한 분해)입니다. `TWIN=0`이 없으면 twin core 학습(약 12시간)이 먼저 돕니다.
+
+```bash
+TWIN=0 CLIM=1 CORE_ITERS=6000 SRC=daily bash scripts/run_kai_plus.sh
+```
+
+### 8.10 단순 감쇠와의 비교 (근사, 2026-11-12)
+
+혼합의 진폭 몫은 KAI를 기후값 쪽으로 줄이기만 해도 얻을 수 있습니다. 채널마다 정보 RMSE(최적 감쇠 때의 RMSE, 편향 제외)를 요약 통계로 근사해 견주면(정규화 RMSE 이득 %, 1 / 3 / 5 / 7 / 10일):
+
+| 비교 | 이득 % |
+| --- | --- |
+| KAI를 최적 감쇠 대 KAI | 0.0 / +1.3 / +5.0 / +10.1 / +17.1 |
+| 혼합(미세조정 KAI 위) 대 감쇠한 KAI | +0.7 / +2.3 / +2.3 / +0.1 / −5.9 |
+| 혼합(미세조정 KAI 위) 대 감쇠한 미세조정 KAI | +1.7 / +1.1 / +0.9 / −0.9 / −6.6 |
+
+감쇠는 시험 연도로 맞춘 값이라 감쇠 쪽에 유리합니다. 1~5일의 혼합 이득은 감쇠로 설명되지 않는 core의 몫이고, 7~10일의 RMSE 이득은 감쇠로도 얻는 수준입니다. 위 명령의 `blend_climatology` 대조가 이 근사를 정확한 값으로 바꿉니다.
 
 ## 파일
 

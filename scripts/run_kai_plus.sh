@@ -39,6 +39,9 @@
 #   KAI_ITERS=200 RO_ITERS=20 CORE_ITERS=40 LOGK=50 LOGC=10 OUT=runs/kaiplus_1p5_test bash scripts/run_kai_plus.sh
 #                                                                 # a short training test at the real size on the real data: the
 #                                                                 #   logs give seconds per iteration ("sec") and GPU memory ("gpu_gb")
+#   TWIN=0 CLIM=1 CORE_ITERS=6000 SRC=daily bash scripts/run_kai_plus.sh
+#                                                                 # after a one-core run: the exact controls of the blend (KAI mixed
+#                                                                 #   with the climatology, bootstrap, exact term split), step 6
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -199,4 +202,31 @@ if [ "${DRYRUN:-0}" != 1 ]; then
         --base kai_ro --grid "$GRID" --pairs "${VP[@]}" > "$OUT/variable_table_$SC.log" 2>&1 \
         || echo "[plus] variable table failed, see $OUT/variable_table_$SC.log"
     echo "[plus] done: $OUT/$SN.log, $OUT/breakdown/breakdown_$SC.txt, $OUT/variable_table_$SC.md"
+fi
+
+# 6. CLIM=1: the exact controls of the lead-wise blend (docs/kai_tendency_plus_1p5_daily.md sec. 8.9). KAI and the
+#    fine-tuned KAI mixed with the daily climatology in the same way as with the core (weights per lead and channel
+#    from the validation year): how much of the blend's gain is only damping toward the climatology? Also the paired
+#    bootstrap of the blend against KAI, the fine-tuned KAI and these damping controls, and the exact term split of
+#    every pair. Nothing is trained; files *_${SC}c.*, $OUT/breakdown_clim.
+if [ "${CLIM:-0}" = 1 ]; then
+    SCC=${SC}c; B1="blend_$C"; B2="blend_$C@kai_ro"
+    CP="$B1:kai $B2:kai $B2:kai_ro blend_climatology:kai blend_climatology@kai_ro:kai_ro"
+    CP="$CP $B1:blend_climatology $B2:blend_climatology@kai_ro"
+    step scoreclim "$OUT/score_$SCC.json" bash -c "$R --score kai kai_ro --score-cores $CORES --mem-warm \
+        --blend-bases kai kai_ro --blend-with climatology --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH \
+        --pairs $CP && cp $OUT/score.json $OUT/score_$SCC.json && cp $OUT/score_raw.npz $OUT/score_${SCC}_raw.npz"
+    if [ "${DRYRUN:-0}" != 1 ]; then
+        mkdir -p "$OUT/breakdown_clim"
+        python scripts/eval_kai_breakdown.py --stats "$OUT/stats.npz" "$OUT/score_$SCC.json" "$OUT/score_${SCC}_raw.npz" \
+            "$OUT/breakdown_clim" "$B1:kai=blend vs KAI" "$B2:kai=blend on the fine-tuned KAI vs KAI" \
+            "$B2:kai_ro=blend on the fine-tuned KAI vs the fine-tuned KAI" \
+            "blend_climatology:kai=KAI damped toward the climatology vs KAI" \
+            "blend_climatology@kai_ro:kai_ro=fine-tuned KAI damped toward the climatology vs the fine-tuned KAI" \
+            "$B1:blend_climatology=blend vs KAI damped toward the climatology" \
+            "$B2:blend_climatology@kai_ro=blend on the fine-tuned KAI vs the fine-tuned KAI damped toward the climatology" \
+            > "$OUT/breakdown_clim/breakdown_$SCC.txt" 2>&1 \
+            || echo "[plus] breakdown failed, see $OUT/breakdown_clim/breakdown_$SCC.txt"
+        echo "[plus] done: $OUT/scoreclim.log, $OUT/breakdown_clim/breakdown_$SCC.txt"
+    fi
 fi
