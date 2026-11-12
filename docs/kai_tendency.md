@@ -534,7 +534,9 @@ python scripts/kai_variable_table.py runs/kaitend/score.json runs/kaitend/variab
 
 ### 8.4 KAI의 해상도(1.5°, GPU)에서
 
-같은 일을 `scripts/run_kai_plus.sh`가 한 번에 합니다(자료, KAI, 미세조정 KAI, core +, seed가 다른 둘째 core +, 평가, 항별 분해, 변수별 표; `WIDE=1`이면 넓은 core 대조까지). 명령은 `docs/kai_tendency_plus.md` 5.2절에 있습니다. 1.5°에서는 아직 학습해 본 적이 없으므로 그 해상도의 성능 수치는 없습니다.
+같은 일을 `scripts/run_kai_plus.sh`가 한 번에 합니다(자료, KAI, 미세조정 KAI, core +, seed가 다른 둘째 core +, 평가, 항별 분해, 변수별 표; `WIDE=1`이면 넓은 core 대조까지). 명령은 `docs/kai_tendency_plus.md` 5.2절에 있습니다.
+
+1.5° 일평균 본 학습(GPU, core 하나, 6,000 iteration)의 결과는 `docs/kai_tendency_plus_1p5_daily.md`에 있습니다. 미세조정 KAI + core 연결이 5.625°의 최종 모델보다 정규화 RMSE가 1 / 3 / 5 / 7 / 10일에 +28.7 / +24.8 / +15.0 / +6.4 / −1.2 % 좋고, ACC는 모든 선행일에서 높습니다. 그 대부분은 KAI가 커진(0.43 M → 7.57 M) 몫이고, core 하나가 미세조정 KAI에 보태는 몫은 +1.7 / +1.8 / +3.2 / +3.7 / +3.5 %로 5.625°(+20.1 / +6.6 / +3.7 / +2.5 / +2.1 %)보다 짧은 선행일에서 훨씬 작습니다. 5일 이후의 정보 이득은 두 해상도에서 비슷합니다. 비교와 취약점(1일 이득이 하루 변화가 작은 sp, skt, z50에 몰리는 loss 가중의 차이)은 그 문서의 8절에 있습니다.
 
 ## 재현
 
