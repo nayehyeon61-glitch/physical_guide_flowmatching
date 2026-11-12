@@ -10,7 +10,7 @@
 4. "기억의 문제인 것 같다. Mori-Zwanzig를 GRU로 구현하고, 시간 예측 전에 과거의 시간 적분을 입력으로 넣는다." 이어서 "기억 loss는 단항이 아니라 sequence에 대한 Mori-Zwanzig 형태여야 한다."
 5. "tendency core는 G(x)로 48개의 물리항인데, 이 물리항에 추가로 기억항도 만들어야 하지 않나."
 6. "최종에서 좋은 결과를 확인하고 최종 보완 모델을 설계한다." (원문의 "보안"을 "보완"으로 읽었습니다.)
-7. (2026-11-11) "분리했던 Mori-Zwanzig의 form들을 전부 합쳐 보면", "memory 구조로 장기적인 기억(3~5일)을 확실히, 그 효과를 memory 구조와 loss 구조로", 그리고 "kernel 식을 memory 항에 녹이고, 물리 tendency를 시간 누적해서 memory 항으로 넣는다." 7절이 이 요청입니다(학습과 채점은 끝났습니다, 7.1 ~ 7.8).
+7. (2026-11-11) "분리했던 Mori-Zwanzig의 form들을 전부 합쳐 보면", "memory 구조로 장기적인 기억(3~5일)을 확실히, 그 효과를 memory 구조와 loss 구조로", 그리고 "kernel 식을 memory 항에 녹이고, 물리 tendency를 시간 누적해서 memory 항으로 넣는다." 7절이 이 요청입니다(학습과 채점은 끝났습니다, 7.1 ~ 7.9).
 
 평가에 대한 요청도 둘 있었습니다: 좋아지고 나빠지는 정도를 항별로 나눌 것, 그리고 좋아지면 +, 나빠지면 −로 일관되게 쓸 것. 이 문서의 모든 변화량은 **이득**입니다(RMSE 이득 = RMSE 감소율 %, ACC 이득 = 증가량, + = 좋아짐).
 
@@ -399,9 +399,9 @@ core_gngmzP가 소유자의 마지막 안입니다. tendency core는 물리항�
 nRMSE(kai_ro 위): 두 core 연결 0.177 / 0.311 / 0.404 / 0.470 / 0.529, core_gngmz8만 0.178 / 0.314 / 0.407 / 0.471 / 0.527, 대조 0.178 / 0.313 / 0.405 / 0.469 / 0.526, RMSE용 출력 0.177 / 0.311 / 0.396 / 0.449 / 0.490. ACC: 두 core 연결 0.929 / 0.764 / 0.584 / 0.418 / 0.243, core_gngmz8만 0.928 / 0.758 / 0.575 / 0.411 / 0.239. 선행일 전체(kai_ro 위, 두 core 대 한 core): +0.6 / +0.8 / +1.0 / +1.0 / +0.8 / +0.6 / +0.2 / −0.1 / −0.3 / −0.5. 가중치(KAI / core_gnmz8 / core_gngmz8, 변수 평균): 0.24 / 0.25 / 0.51, 대조(KAI / core_gngmz / core_gngmz8) 0.26 / 0.19 / 0.55; 변수군별로 z 0.12 / 0.35 / 0.53, 지표 0.02 / 0.62 / 0.36, v 0.47 / 0.13 / 0.40.
 
 - **두 core를 함께 되먹이면 선행 1~7일에 0.2 ~ 1.0 % 좋아지고, 정보는 모든 선행일에서 늡니다**(kai_ro 위 유의한 칸 477개 이득, 81개 손실). 선행 9~10일의 손실은 진폭입니다(활동도 0.76 → 0.77; z, u, v의 진폭 항 −0.9 / −0.6 / −1.3).
-- **이득의 3분의 1에서 절반은 "core가 하나 더 있어서"입니다**(대조 +0.2 / +0.4 / +0.4 / +0.3 / +0.1). 나머지(+0.5 / +0.7 / +0.4, 정보 +0.5 / +0.6 / +0.4)가 두 번째 core가 물리항 없는 기억 core라서 생기는 몫이고, z(+2.3 / +1.2 / +0.7)와 지표 변수(+1.4 / +1.2 / +0.9)에 몰려 있습니다. 두 core가 서로 다른 정보를 갖는다고 읽습니다.
+- **이득의 3분의 1에서 절반은 "core가 하나 더 있어서"입니다**(대조 +0.2 / +0.4 / +0.4 / +0.3 / +0.1). 나머지(+0.5 / +0.7 / +0.4, 정보 +0.5 / +0.6 / +0.4)가 두 번째 core가 물리항 없는 기억 core라서 생기는 몫이고, z(+2.3 / +1.2 / +0.7)와 지표 변수(+1.4 / +1.2 / +0.9)에 몰려 있습니다. 두 core가 서로 다른 정보를 갖는다고 읽습니다. **(이 해석은 7.9의 같은 조건 대조에서 기각됐습니다: 대조의 core_gngmz가 3일 학습의 약한 core여서 "core 하나 더"의 몫을 작게 쟀습니다.)**
 - **7.7의 혼합 이득도 같은 방식으로 갈립니다.** 선행 5~10일의 절반 이상(+1.1 / +1.5 / +2.2)은 같은 구조의 core를 하나 더 섞어도 나오고 대부분 진폭입니다. 물리항 없는 core의 몫은 +0.5 / +0.8 / +1.2 / +1.3 / +1.3(정보 +0.5 / +0.7 / +0.8 / +0.6 / +0.3)입니다.
-- **궤적 모델**: loop(kai_ro, 두 core)가 선행 1~7일에서 loop(kai_ro, core_gngmz8)를 조금 넘고 9~10일은 집니다. 차이가 1 % 이하이고 core 계산이 두 배(parameter 43.3만 + 49.4만)라서, 가장 좋은 조합을 바꿀지는 정하지 않았습니다.
+- **궤적 모델**: loop(kai_ro, 두 core)가 선행 1~7일에서 loop(kai_ro, core_gngmz8)를 조금 넘고 9~10일은 집니다. 차이가 1 % 이하이고 core 계산이 두 배(parameter 43.3만 + 49.4만)라서, 가장 좋은 조합을 바꿀지는 정하지 않았습니다. **(7.9: 가장 좋은 조합은 loop(kai_ro, core_gngmz8 둘)입니다.)**
 - **RMSE용 출력**: 두 core 연결의 것이 선행 1~5일에 지금까지 가장 낮고(0.177 / 0.311 / 0.396), 7~10일은 7.6의 것과 같습니다.
 - 한계: core의 학습 seed가 하나입니다(초기장에 대한 신뢰구간은 좁습니다: 선행 3일 +1.0, +0.9 ~ +1.1). 대조의 두 번째 core는 3일 sequence, core_gnmz8은 8일 sequence로 학습해서 "물리항이 없어서"와 "sequence 길이가 달라서"를 완전히 가르지 못합니다. 가중치를 선행일에 따라 바꾸는 연결은 시험하지 않았습니다.
 
@@ -409,7 +409,41 @@ nRMSE(kai_ro 위): 두 core 연결 0.177 / 0.311 / 0.404 / 0.470 / 0.529, core_g
 
 ![kai_ro 위의 연결: 두 번째 core가 물리항 없는 기억 core인 것 대 물리항 core인 것(대조)](kai_tendency/breakdown_loop_core_gnmz8_core_gngmz8-kai_ro__vs__loop_core_gngmz_core_gngmz8-kai_ro.png)
 
-변수별 RMSE(물리 단위)는 `scripts/kai_variable_table.py`로 만듭니다(소유자 사본 `variable_table_Li.md`, `variable_table_Ln.md`, `variable_table_Lo.md`, `variable_table_Lm.md`, `variable_table_Lp.md`, heat map과 그래프는 https://claude.ai/artifact/7U5voj1VdLQbR5w9n6UCbB).
+### 7.9 seed 대조: 두 core 연결의 이득은 "따로 학습한 core 둘의 평균"의 것 (score Lq)
+
+소유자(2026-11-12): "현재 가장 best가 그럼 두 core 되먹임 연결인가요?" 7.8의 차이가 1 % 이하인데 학습 seed가 하나였고, 대조의 두 번째 core가 3일 학습이었습니다. core_gngmz8을 seed만 바꿔 하나 더 학습했습니다(core_gngmz8s1, `--seed 1`, 같은 설정, 259,842, 한 step 검증 loss 0.2372 대 0.2379).
+
+| 비교 | 전체 | 정보 항 | 진폭 항 |
+|---|---|---|---|
+| seed 차이: core_gngmz8s1 대 core_gngmz8 (단독) | +0.1 / −0.1 / +0.2 / +0.2 / +0.1 | +0.2 / −0.2 / 0.0 / +0.1 / +0.1 | 0.0 / +0.1 / +0.2 / +0.1 / 0.0 |
+| seed 차이: loop(KAI, core_gngmz8s1) 대 loop(KAI, core_gngmz8) | +0.1 / 0.0 / +0.3 / +0.2 / −0.1 | +0.1 / 0.0 / +0.2 / +0.1 / +0.1 | 0.0 / 0.0 / +0.1 / +0.1 / −0.2 |
+| seed 차이: loop(kai_ro, core_gngmz8s1) 대 loop(kai_ro, core_gngmz8) | +0.1 / 0.0 / +0.4 / +0.3 / −0.1 | +0.1 / 0.0 / +0.2 / +0.1 / 0.0 | 0.0 / 0.0 / +0.1 / +0.1 / −0.2 |
+| 같은 조건의 대조: loop(KAI, core_gngmz8 둘) 대 loop(KAI, core_gngmz8) | +1.7 / +1.5 / +1.3 / +0.9 / +0.3 | +1.7 / +1.3 / +0.9 / +0.5 / +0.1 | 0.0 / +0.2 / +0.4 / +0.3 / +0.1 |
+| 같은 조건의 대조: loop(kai_ro, core_gngmz8 둘) 대 loop(kai_ro, core_gngmz8) | +1.7 / +1.3 / +1.0 / +0.6 / 0.0 | +1.6 / +1.1 / +0.8 / +0.4 / +0.1 | 0.0 / +0.1 / +0.2 / +0.1 / −0.2 |
+| loop(KAI, core_gnmz8 + core_gngmz8) 대 loop(KAI, core_gngmz8 둘) | −1.0 / −0.3 / −0.3 / −0.4 / −0.6 | −1.0 / −0.3 / −0.2 / −0.2 / 0.0 | 0.0 / 0.0 / −0.1 / −0.2 / −0.5 |
+| loop(kai_ro, core_gnmz8 + core_gngmz8) 대 loop(kai_ro, core_gngmz8 둘) | −1.0 / −0.3 / −0.2 / −0.3 / −0.5 | −1.0 / −0.2 / −0.2 / −0.2 / 0.0 | 0.0 / 0.0 / 0.0 / −0.1 / −0.4 |
+| 재현: loop(kai_ro, core_gnmz8 + core_gngmz8s1) 대 loop(kai_ro, core_gngmz8s1) | +0.6 / +1.0 / +0.7 / +0.2 / −0.5 | +0.6 / +0.9 / +0.6 / +0.2 / +0.1 | 0.0 / +0.1 / +0.1 / −0.1 / −0.6 |
+| loop(kai_ro, core_gngmz8 둘) 대 kai_ro | +21.5 / +7.8 / +4.7 / +3.0 / +2.1 | +19.4 / +5.9 / +2.8 / +1.3 / +0.4 | +1.4 / +1.5 / +1.7 / +1.5 / +1.4 |
+| blend(KAI, core_gngmz8 둘) 대 blend(KAI, core_gngmz8) | +1.7 / +1.3 / +1.8 / +2.2 / +2.9 | +1.7 / +1.1 / +0.9 / +0.7 / +0.3 | 0.0 / +0.2 / +0.9 / +1.6 / +2.6 |
+| blend(KAI, core_gnmz8 + core_gngmz8) 대 blend(KAI, core_gngmz8 둘) | −1.0 / 0.0 / +0.4 / +0.5 / +0.6 | −1.0 / 0.0 / +0.3 / +0.3 / +0.2 | 0.0 / 0.0 / +0.1 / +0.2 / +0.4 |
+| blend(kai_ro, core_gnmz8 + core_gngmz8) 대 blend(kai_ro, core_gngmz8 둘) | −1.0 / −0.1 / +0.1 / +0.2 / +0.2 | −1.0 / −0.1 / +0.2 / +0.2 / +0.1 | 0.0 / 0.0 / 0.0 / 0.0 / +0.1 |
+
+nRMSE(kai_ro 위): core_gngmz8 둘 연결 0.175 / 0.310 / 0.403 / 0.468 / 0.527, core_gnmz8 + core_gngmz8 연결 0.177 / 0.311 / 0.404 / 0.470 / 0.529, core_gngmz8만 0.178 / 0.314 / 0.407 / 0.471 / 0.527. ACC 0.931 / 0.766 / 0.587 / 0.424 / 0.248 대 0.929 / 0.764 / 0.584 / 0.418 / 0.243 대 0.928 / 0.758 / 0.575 / 0.411 / 0.239. 가중치(KAI / seed 1 / seed 0, 변수 평균) 0.23 / 0.41 / 0.36; core_gnmz8 + core_gngmz8은 0.24 / 0.25 / 0.51.
+
+- **가장 좋은 궤적 모델은 loop(kai_ro, core_gngmz8 둘)입니다.** 한 core 연결보다 선행 1~7일에 +1.7 / +1.3 / +1.0 / +0.6 좋고 10일은 같습니다(유의한 칸 505개 이득, 25개 손실). 7.8의 두 core 연결보다 모든 선행일에서 좋습니다(18칸 대 340칸).
+- **7.8의 해석을 고칩니다.** 이득은 "서로 다른 구조의 core"의 것이 아니라 "따로 학습한 core 둘을 평균하는 효과"입니다. 물리항 없는 기억 core는 두 번째 core로서 seed만 다른 물리항 core보다 못합니다(선행 1일 −1.0은 분명하고, 3~7일의 −0.2 ~ −0.3은 seed 차이와 같은 크기). 7.8의 대조는 약한 core(3일 학습, 단독 선행 1일 nRMSE 0.195 대 0.190)여서 "core 하나 더"의 몫을 작게 쟀습니다.
+- **seed 차이는 65채널 nRMSE로 0.1 ~ 0.4 %**이고, 변수 하나로는 더 큽니다(t2m 연결에서 +0.6 ~ +1.6 %). 7.5 ~ 7.8의 0.5 % 아래 차이는 이 크기 안입니다.
+- 기억 core를 더한 이득 자체는 다른 seed의 core 위에서 그대로 재현됩니다(+0.6 / +1.0 / +0.7 / +0.2 / −0.5). 7.8의 수는 우연이 아니었고 해석이 틀렸습니다.
+- 혼합(되먹임 없음)의 선행 5~10일에는 기억 core 쪽의 몫이 조금 남습니다(KAI 위 +0.4 / +0.5 / +0.6, 작은 규모; kai_ro 위에서는 seed 차이 안).
+- 한계: seed는 둘뿐입니다. core를 셋 이상으로 늘린 것, 같은 계산량의 넓은 core 하나(평균의 효과인지 크기의 효과인지), KAI의 seed 둘은 시험하지 않았습니다.
+
+![kai_ro 위의 연결: 8일 기준 core 둘(seed 0, 1) 대 하나](kai_tendency/breakdown_loop_core_gngmz8s1_core_gngmz8-kai_ro__vs__loop_core_gngmz8-kai_ro.png)
+
+![kai_ro 위의 연결: 두 번째 core가 물리항 없는 기억 core인 것 대 seed만 다른 8일 기준 core인 것](kai_tendency/breakdown_loop_core_gnmz8_core_gngmz8-kai_ro__vs__loop_core_gngmz8s1_core_gngmz8-kai_ro.png)
+
+![seed 차이: kai_ro 위의 한 core 연결, seed 1 대 seed 0](kai_tendency/breakdown_loop_core_gngmz8s1-kai_ro__vs__loop_core_gngmz8-kai_ro.png)
+
+변수별 RMSE(물리 단위)는 `scripts/kai_variable_table.py`로 만듭니다(소유자 사본 `variable_table_Li.md`, `variable_table_Ln.md`, `variable_table_Lo.md`, `variable_table_Lm.md`, `variable_table_Lp.md`, `variable_table_Lq.md`, heat map과 그래프는 https://claude.ai/artifact/7U5voj1VdLQbR5w9n6UCbB).
 
 ## 재현
 
@@ -453,6 +487,12 @@ $R --score kai kai_ro --score-cores core_gnmz8 core_gngmz8 core_gngmz core_gnk8 
    --loop-blend core_gngmz8 --blend-multi core_gnmz8+core_gngmz8 core_gngmz+core_gngmz8 \
    --loop-multi core_gnmz8+core_gngmz8 core_gngmz+core_gngmz8 \
    --blend-loop "loop_core_gnmz8+core_gngmz8@kai_ro+core_gnk8" "loop_core_gngmz8@kai_ro+core_gnk8"
+# 7.9: seed 대조. 8일 기준 core를 seed만 바꿔 학습하고 같은 조건의 대조를 채점
+$R $C --tag core_gngmz8s1 --core-gfeat --core-mem 8 --core-mz --seed 1
+$R --score kai kai_ro --score-cores core_gnmz8 core_gngmz8 core_gngmz8s1 --blend-bases kai kai_ro \
+   --loop-blend core_gngmz8 core_gngmz8s1 \
+   --blend-multi core_gnmz8+core_gngmz8 core_gngmz8s1+core_gngmz8 core_gnmz8+core_gngmz8s1 \
+   --loop-multi core_gnmz8+core_gngmz8 core_gngmz8s1+core_gngmz8 core_gnmz8+core_gngmz8s1
 # 항별 평가 (A:B = A의 B 대비 이득), 진단
 python scripts/eval_kai_breakdown.py runs/kaitend/score.json runs/kaitend/score_raw.npz out \
    "loop_core_gngmz:kai" "loop_core_gngmz:blend_core_gngmz" "core_gngmz:core_gng" "core_gngmz:core_gnmz"
