@@ -80,6 +80,8 @@ x(t + 1일) = PositiveMass( x_n, 다음 날의 일사 )
 
 GPU용 실행 script(`run_kai_plus.sh`)도 같은 자료로 처음부터 끝까지 돌렸습니다(`SMOKE=1 DEVICE=cpu`): KAI, rollout 미세조정 KAI, core +, 채점(KAI와 미세조정 KAI 위의 연결, 기억 0일과 1일), 항별 분해 그림 6장, 변수별 표가 모두 만들어졌습니다.
 
+2026-11-12에 두 core와 넓은 core(5.2절)를 같은 자료로 이어서 돌렸습니다(`SMOKE=1 DEVICE=cpu`, 그리고 `WIDE=1`): seed 1 core + 학습, 넓은 core + 학습(parameter 520,966개 = 기본 core의 두 배), core 셋의 단독 예보, KAI와 미세조정 KAI 위의 core 하나 연결, core 둘 연결과 혼합, 넓은 core 연결, 항별 분해 그림 15장, 변수별 표가 모두 통과했습니다. 최대 메모리는 3.6 GB(core 둘), 4.1 GB(넓은 core까지)였고, 넓은 core의 학습 iteration은 기본 core의 약 1.6배 시간이 걸렸습니다(다른 학습과 CPU를 나눠 쓴 상태).
+
 2 iteration은 학습이 아니라 경로의 시험입니다. core의 출력층은 0에서 시작하므로 core +의 점수는 지속성과 같아야 하고, 실제로 그렇습니다(nRMSE 1 / 3일 0.411 / 0.591, 지속성 0.412 / 0.594). 극 행을 포함해 모든 값이 유한했습니다. 4 iteration의 KAI는 학습되지 않은 상태입니다(0.921 / 0.988).
 
 core + 학습의 메모리를 단계별로 쟀습니다(batch 1, 자료와 모형을 올린 상태 1.2 GB 포함).
