@@ -4,7 +4,7 @@
 
 fig_ratio.png, four panels by lead: the RMSE gain of every variant over the static blend R0, the information part of
 that gain (scripts/eval_kai_breakdown.py), the activity, and the core's ratio per zonal-wavenumber group (static
-R1k dashed, the SFNO ratio router NOk solid).  fig_ratio_lambda.png: the label as soft constraint, from the pure
+R1k dashed, the SFNO ratio router NOks solid).  fig_ratio_lambda.png: the label as soft constraint, from the pure
 ratio router (lam = 0, NOm) to the pure label router (NO used as weight): gain by lam, and the ratio by lead.
 Static variants are dashed, learned ones solid; the colour follows the domain the ratio is given for. + = better.
 """
@@ -89,13 +89,14 @@ def main(run, stats, out):
     p = ax[1, 1]
     wk = sw["R1k"]                                      # (L, C, H, M): constant inside a wavenumber group
     first = [0, 1, 4, 10]
+    shown = next((k for k in ("NOks", "NOk") if k in info["variants"]), None)  # the ratio map without the forecasts first
     for gi, (name, c) in enumerate(zip(GROUPS, (CAT[0], CAT[2], CAT[3], CAT[5]))):
         p.plot(x, (wk[:, sc][:, :, :, first[gi]] * wl).mean((1, 2)), color=c, lw=1.6, ls="--")
-        if "NOk" in info["variants"]:
-            p.plot(x, info["variants"]["NOk"]["core_weight_by_group"][gi], color=c, lw=2, marker="o", ms=4, label=name)
+        if shown:
+            p.plot(x, info["variants"][shown]["core_weight_by_group"][gi], color=c, lw=2, marker="o", ms=4, label=name)
     p.plot([], [], color=MUTED, lw=1.6, ls="--", label="static R1k")
     p.axhline(0.5, color=INK, lw=1)
-    p.set_title("core's ratio by zonal wavenumber k (rest = KAI): SFNO ratio router NOk", fontsize=10.5, loc="left")
+    p.set_title(f"core's ratio by zonal wavenumber k (rest = KAI): SFNO ratio router {shown}", fontsize=10.5, loc="left")
     p.set_xlabel("lead (days)")
     p.set_ylim(0, 1)
     p.grid(axis="y", color=GRID, lw=0.8)
@@ -126,7 +127,7 @@ def main(run, stats, out):
     p.set_xlabel("lam: weight of the label constraint on the ratio")
     p.set_title("RMSE gain over the static blend R0 (%)", fontsize=10.5, loc="left")
     p.grid(axis="y", color=GRID, lw=0.8)
-    p.legend(frameon=False, fontsize=8.5)
+    p.legend(frameon=False, fontsize=8.5, loc="lower left", bbox_to_anchor=(0.0, 0.05), ncol=4)
     p = ax[1]
     p.plot(x, (sw["R0"][:, sc, 0, 0]).mean(1), color=MUTED, lw=1.6, ls="--", label="static blend R0")
     cols = [CAT[0], CAT[1], CAT[2], CAT[3], CAT[4], CAT[5]]
