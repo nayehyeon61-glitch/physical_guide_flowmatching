@@ -26,6 +26,20 @@ Compared:
   CN            a convolutional router with the same inputs and labels (what the neural operator adds)
   NOm           the SFNO router trained by the MSE of the blended forecast, started at R0 (what the labels add)
 
+Owner's correction (2026-11-13 23:05 KST): not one side or the other. The router has to find in what ratio the
+two domains are mixed for every variable, with the label as a soft constraint at most. Ratio routers: the output
+is the core's ratio, the loss is the MSE of the blended forecast (which is the regression of the pointwise best
+ratio (truth - KAI) / (core - KAI) with the weight (core - KAI)^2):
+  NOc<lam>      NOm + lam x the cross-entropy of the label on the ratio itself (label as soft constraint;
+                lam = 0 is NOm, lam -> infinity is NO used as weight)
+  NOa<lam>      NOm + a second output that predicts the label, lam x its cross-entropy (the label constrains the
+                shared network, not the ratio)
+  NOk           one ratio per variable, zonal-wavenumber group and grid point, started at R1k: the blend is
+                KAI + sum_g ratio_g x (core - KAI)_g with the band-passed difference of group g
+  NOks          NOk that sees the place and the lead only (what the forecasts add to the ratios)
+  NOkc<lam>     NOk + lam x the cross-entropy of the label of every wavenumber group (which expert is closer
+                to the truth in that group)
+
     python scripts/kai_place_router.py --dump runs/kaitend/dump_router --cache data/era5_5p625/kaiday \
         --stats runs/kaitend/stats.npz --kai kai_ro --core core_gngmz8w --out runs/kaitend/place_A
 """
@@ -54,14 +68,16 @@ KGROUPS = [(0, 1), (1, 4), (4, 10), (10, 10 ** 6)]  # zonal wavenumber groups of
 
 # ------------------------------------------------------------------------------------------------ routers
 class Router(nn.Module):
-    """One logit per channel and grid point: > 0 = the core's domain. ``body`` maps the input channels to C maps;
-    its last layer starts at zero, so the untrained router gives the table b0 (lead, channel)."""
+    """One logit per channel and grid point: > 0 = the core's domain. ``body`` maps the input channels to the
+    maps of b0 (C of them, or more: ratios per wavenumber group, a second head); its last layer starts at
+    zero, so the untrained router gives the table b0 (lead, map) or (lead, map, row, 1)."""
 
     def __init__(self, body, last, C, L, static, b0, see):
         super().__init__()
         self.body, self.C, self.L, self.see = body, C, L, see
         self.register_buffer("static", static)           # (S, H, W)
-        self.b0 = nn.Parameter(torch.as_tensor(b0, dtype=torch.float32).clone())  # (L, C)
+        b0 = torch.as_tensor(b0, dtype=torch.float32).clone()
+        self.b0 = nn.Parameter(b0[:, :, None, None] if b0.ndim == 2 else b0)  # (L, maps, 1 or H, 1 or W)
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
 
@@ -75,7 +91,7 @@ class Router(nn.Module):
         x = [self.static[None].expand(B, -1, -1, -1), Fn.one_hot(lead, self.L).float()[:, :, None, None].expand(-1, -1, H, W)]
         if self.see:
             x = [kai, core, core - kai, cl] + x
-        return self.body(torch.cat(x, 1)) + self.b0[lead][:, :, None, None]
+        return self.body(torch.cat(x, 1)) + self.b0[lead]
 
 
 def sfno_router(C, L, static, b0, see, hidden, layers, grid):
@@ -84,7 +100,7 @@ def sfno_router(C, L, static, b0, see, hidden, layers, grid):
     from neuralop.layers.spherical_convolution import SphericalConv
     from neuralop.models import SFNO
     H, W = static.shape[-2:]
-    body = SFNO(n_modes=(H, W), in_channels=Router.n_in(C, L, static.shape[0], see), out_channels=C,
+    body = SFNO(n_modes=(H, W), in_channels=Router.n_in(C, L, static.shape[0], see), out_channels=np.shape(b0)[1],
                 hidden_channels=hidden, n_layers=layers, positional_embedding=None,
                 conv_module=partial(SphericalConv, sht_grids=grid))
     return Router(body, body.projection.fcs[-1], C, L, static, b0, see)
@@ -108,7 +124,7 @@ class CNNBody(nn.Module):
 
 
 def cnn_router(C, L, static, b0, see, hidden, layers):
-    body = CNNBody(Router.n_in(C, L, static.shape[0], see), C, hidden, layers)
+    body = CNNBody(Router.n_in(C, L, static.shape[0], see), np.shape(b0)[1], hidden, layers)
     return Router(body, body.out, C, L, static, b0, see)
 
 
@@ -130,7 +146,10 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--band", type=int, default=4, help="latitude rows per band")
     p.add_argument("--label-win", type=int, default=0, help="r: labels from squared errors averaged over (2r+1)^2 points")
-    p.add_argument("--routers", nargs="*", default=["NO", "NOs", "CN", "NOm"])
+    p.add_argument("--routers", nargs="*", default=["NO", "NOs", "CN", "NOm"],
+                   help="NO NOs CN NOm, and the ratio routers NOc<lam> NOa<lam> NOk NOks NOkc<lam>")
+    p.add_argument("--carry", nargs="*", default=[], help="RUN_DIR:NAME[=NEW]: scores of another run of this "
+                   "script on the same forecasts, taken over for the pairs")
     p.add_argument("--hidden", type=int, default=48, help="width of the SFNO")
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--cnn-hidden", type=int, default=96)
@@ -382,29 +401,67 @@ def main(argv=None):
     logit = lambda q, e=0.02: np.log(np.clip(q, e, 1 - e) / (1 - np.clip(q, e, 1 - e)))  # noqa: E731
     qtr = torch.tensor(np.clip(freq_tr, 0.02, 0.98), dtype=torch.float32)
 
-    def router(name, arch, see, target):
-        """target 'label': cross-entropy of the label; 'mse': the MSE of the blended forecast, started at R0."""
-        b0 = logit(amean(freq)) if target == "label" else logit(w0[:, :, 0, 0], 1e-3)
+    gmask = torch.zeros(len(groups), M)
+    for i, g in enumerate(groups):
+        gmask[i, g] = 1.0
+
+    def bands_of(x):  # (B, C, H, W) -> (B, C, G, H, W): the zonal-wavenumber groups of x (their sum is x)
+        return torch.fft.irfft(torch.fft.rfft(x, dim=-1)[:, :, None] * gmask[:, None, :], n=W, dim=-1)
+
+    def bce(lg, y):   # area-weighted cross-entropy, mean over the scored channels (and the groups)
+        return (Fn.binary_cross_entropy_with_logits(lg, y, reduction="none") * wt).mean((-2, -1))[:, sc].mean()
+
+    def router(name, arch, see, target, lam=0.0, scale=False, aux=False):
+        """target 'label': cross-entropy of the label, the answer p is placed or used as the weight.
+        target 'mse': the output is the core's ratio, trained by the MSE of the blended forecast, started at the
+        static blend (R0, or R1k with scale = one ratio per wavenumber group); lam > 0 adds lam x the
+        cross-entropy of the label as a soft constraint, on the ratio itself or (aux) on a second output."""
+        G = len(groups) if scale else 1
+        if target == "label":
+            b0 = logit(amean(freq))
+        elif scale:
+            b0 = logit(np.stack([stat["R1k"][..., g[0]] for g in groups], 2), 1e-3).reshape(L, C * G, H, 1)
+        else:
+            b0 = logit(w0[:, :, 0, 0], 1e-3)
+            if aux:
+                b0 = np.concatenate([b0, logit(amean(freq))], 1)
 
         def make():
             if arch == "sfno":
                 return sfno_router(C, L, static, b0, see, a.hidden, a.layers, a.sht_grid)
             return cnn_router(C, L, static, b0, see, a.cnn_hidden, a.cnn_layers)
 
-        def loss_of(m, n, l):
+        def blend(m, k, o, cl, ld):  # -> the blended forecast, the ratio logits, the label logits, (core - KAI) by group
+            lg = m(k, o, cl, ld)
+            if scale:
+                dg = bands_of(o - k)
+                lg = lg.view(len(k), C, G, H, W)
+                return k + (torch.sigmoid(lg) * dg).sum(2), lg, lg, dg
+            return k + torch.sigmoid(lg[:, :C]) * (o - k), lg[:, :C], lg[:, C:] if aux else lg, None
+
+        def loss_of(m, n, l, constraint=True):
             g = lambda X: torch.from_numpy(f32(X[n, l]))   # noqa: E731
             k, o, ld = g(Kva), g(Ova), torch.as_tensor(l)
-            lg = m(k, o, g(Cva), ld)
             if target == "label":
-                y = labels(Kva, Ova, Tva, n, l)
-                return (Fn.binary_cross_entropy_with_logits(lg, y, reduction="none") * wt).mean((-2, -1))[:, sc].mean()
-            mse = (((k + torch.sigmoid(lg) * (o - k) - g(Tva)) ** 2) * wt).mean((-2, -1))
-            return (mse[:, sc] / s0t[ld][:, sc]).mean()
+                return bce(m(k, o, g(Cva), ld), labels(Kva, Ova, Tva, n, l))
+            pred, _, ll, dg = blend(m, k, o, g(Cva), ld)
+            t = g(Tva)
+            mse = (((pred - t) ** 2) * wt).mean((-2, -1))
+            out = (mse[:, sc] / s0t[ld][:, sc]).mean()
+            if lam > 0 and constraint:
+                if scale:  # the label of a wavenumber group: the expert whose band-passed forecast is closer
+                    rg = bands_of(t - k)
+                    y = (box(((rg - dg) ** 2).flatten(1, 2), a.label_win)
+                         < box((rg ** 2).flatten(1, 2), a.label_win)).float().view_as(ll)
+                else:
+                    y = labels(Kva, Ova, Tva, n, l)
+                out = out + lam * bce(ll, y)
+            return out
 
-        def ev_loss(m, ics):
+        def ev_loss(m, ics):  # held-out loss: for the ratio routers the forecast part only
             ev = np.array([(n, l) for n in ics for l in range(L)])
             with torch.no_grad():
-                return sum(float(loss_of(m, ev[i:i + 64, 0], ev[i:i + 64, 1])) * len(ev[i:i + 64])
+                return sum(float(loss_of(m, ev[i:i + 64, 0], ev[i:i + 64, 1], False)) * len(ev[i:i + 64])
                            for i in range(0, len(ev), 64)) / len(ev)
 
         def run(train_ics, epochs, eval_ics=None):
@@ -436,38 +493,98 @@ def main(argv=None):
             base = sum(float((Fn.binary_cross_entropy(qtr[ev[i:i + 64, 1]], labels(Kva, Ova, Tva, ev[i:i + 64, 0], ev[i:i + 64, 1]),
                                                       reduction="none") * wt).mean((-2, -1))[:, sc].mean()) * len(ev[i:i + 64])
                        for i in range(0, len(ev), 64)) / len(ev)
-        else:                  # reference: the untrained router = the static blend R0
+        else:                  # reference: the untrained router = the static blend it starts from
             base = ev_loss(make().eval(), ho_ics)
         best = int(np.argmin(curve)) + 1
         use = best if (target == "label" or curve[best - 1] < base) else 0
         m, _ = run(np.arange(Nv), use)
         m.eval()
-        P = np.empty((Nt, L, C, H, W), dtype=np.float16)
-        with torch.no_grad():
-            for l in range(L):
-                for i in range(0, Nt, 32):
-                    n = np.arange(i, min(Nt, i + 32))
-                    g = lambda X: torch.from_numpy(f32(X[n, l]))  # noqa: E731
-                    P[n, l] = torch.sigmoid(m(g(Kte), g(Ote), g(Cte), torch.full((len(n),), l))).numpy()
-        Ps = f32(P[:, :, SCORED])
-        v = {"arch": arch, "sees_forecasts": see, "target": target, "holdout_curve": curve, "holdout_reference": base,
-             "epochs_used": use, "params": sum(q.numel() for q in m.parameters()),
-             "spread_space": float(Ps.mean(0).std((-2, -1)).mean()), "spread_time": float(Ps.std(0).mean()),
-             "agrees_with_Pclim": [ytf((P[:, l] > 0.5) == pc[:, l], SCORED) for l in range(L)]}
+        v = {"arch": arch, "sees_forecasts": see, "target": target, "lam": lam, "scale": scale, "aux": aux,
+             "holdout_curve": curve, "holdout_reference": base, "epochs_used": use,
+             "params": sum(q.numel() for q in m.parameters())}
+        bygrp = lambda X: {g: amean(X[:, cs]).mean(1).tolist() for g, cs in grp.items()}  # noqa: E731  X (L, C, H, W)
+        if scale:              # the blend needs the band-passed difference: score it here, keep the moments of the ratios
+            pz = np.empty((Nt, L, C, H, W), dtype=np.float32)
+            m1, m2 = np.zeros((L, C, G, H, W)), np.zeros((L, C, G, H, W))
+            with torch.no_grad():
+                for l in range(L):
+                    for i in range(0, Nt, 32):
+                        n = np.arange(i, min(Nt, i + 32))
+                        g = lambda X: torch.from_numpy(f32(X[n, l]))  # noqa: E731
+                        pred, lg, _, _ = blend(m, g(Kte), g(Ote), g(Cte), torch.full((len(n),), l))
+                        pz[n, l] = pred.numpy()
+                        q = torch.sigmoid(lg).double()
+                        m1[l] += q.sum(0).numpy()
+                        m2[l] += (q ** 2).sum(0).numpy()
+            m1 /= Nt
+            sdt = np.sqrt(np.maximum(m2 / Nt - m1 ** 2, 0))
+            v.update({"core_weight_by_group": [amean(m1[:, SCORED, gi]).mean(1).tolist() for gi in range(G)],
+                      "core_weight_by_var_group": [bygrp(m1[:, :, gi]) for gi in range(G)],
+                      "spread_space": float(m1[:, SCORED].std((-2, -1)).mean()),
+                      "spread_lon": float(m1[:, SCORED].std(-1).mean()),
+                      "spread_time": float(sdt[:, SCORED].mean())})
+            np.save(os.path.join(a.out, f"ratio_{name}.npy"), m1.astype(np.float16))
+        else:
+            P = np.empty((Nt, L, C, H, W), dtype=np.float16)
+            with torch.no_grad():
+                for l in range(L):
+                    for i in range(0, Nt, 32):
+                        n = np.arange(i, min(Nt, i + 32))
+                        g = lambda X: torch.from_numpy(f32(X[n, l]))  # noqa: E731
+                        P[n, l] = torch.sigmoid(m(g(Kte), g(Ote), g(Cte), torch.full((len(n),), l))[:, :C]).numpy()
+            Ps = f32(P[:, :, SCORED])
+            m1 = f32(P).mean(0)
+            v.update({"spread_space": float(Ps.mean(0).std((-2, -1)).mean()), "spread_lon": float(Ps.mean(0).std(-1).mean()),
+                      "spread_time": float(Ps.std(0).mean()),
+                      "core_weight": amean(m1[:, SCORED]).mean(1).tolist(), "core_weight_by_var": bygrp(m1),
+                      "agrees_with_Pclim": [ytf((P[:, l] > 0.5) == pc[:, l], SCORED) for l in range(L)]})
+            del Ps
+            if target != "label":
+                np.save(os.path.join(a.out, f"ratio_{name}.npy"), m1.astype(np.float16))
         info["variants"][name] = v
         print(f"  {name}: held-out {'cross-entropy' if target == 'label' else 'relative MSE'} reference {base:.4f}, best "
-              f"{min(curve):.4f} at epoch {best}, used {use}; {v['params']} parameters; spread of p over the grid "
+              f"{min(curve):.4f} at epoch {best}, used {use}; {v['params']} parameters; spread of the ratio over the grid "
               f"{v['spread_space']:.3f}, over the forecasts {v['spread_time']:.3f}", flush=True)
-        del Ps
-        if target == "label":
+        if scale:
+            print("    core's ratio by wavenumber group (k 0 / 1-3 / 4-9 / 10+), day 1/5/10: "
+                  + "  ".join("/".join(f"{x[q]:.2f}" for q in (0, 4, 9) if q < L) for x in v["core_weight_by_group"]), flush=True)
+            score(name, pz)
+        elif target == "label":
             placed(name, P, soft=True)
         else:
+            print("    core's ratio, day 1/3/5/7/10: " + "/".join(f"{v['core_weight'][q]:.2f}" for q in (0, 2, 4, 6, 9) if q < L),
+                  flush=True)
             score(name, mix(f32(P)))
 
-    for name, arch, see, target in (("NOs", "sfno", False, "label"), ("NO", "sfno", True, "label"),
-                                    ("CN", "cnn", True, "label"), ("NOm", "sfno", True, "mse")):
-        if name in a.routers:
-            router(name, arch, see, target)
+    lam_of = lambda nm, pre: float(nm[len(pre):])          # noqa: E731
+    for name in a.routers:
+        if name in ("NOs", "NO", "CN"):
+            router(name, "cnn" if name == "CN" else "sfno", name != "NOs", "label")
+        elif name == "NOm":
+            router(name, "sfno", True, "mse")
+        elif name in ("NOk", "NOks"):
+            router(name, "sfno", name == "NOk", "mse", scale=True)
+        elif name.startswith("NOkc"):
+            router(name, "sfno", True, "mse", lam=lam_of(name, "NOkc"), scale=True)
+        elif name.startswith("NOc"):
+            router(name, "sfno", True, "mse", lam=lam_of(name, "NOc"))
+        elif name.startswith("NOa"):
+            router(name, "sfno", True, "mse", lam=lam_of(name, "NOa"), aux=True)
+        else:
+            raise SystemExit(f"unknown router {name}")
+
+    for c in a.carry:          # scores of another run on the same forecasts (same dump, same test ICs)
+        rdir, nm = c.rsplit(":", 1)
+        old, new = nm.split("=") if "=" in nm else (nm, nm)
+        rawc = np.load(os.path.join(rdir, "score_place_raw.npz"))
+        res[new] = {k[len(old) + 2:]: rawc[k] for k in rawc.files if k.startswith(old + "__")}
+        assert res[new]["mse"].shape == res["R0"]["mse"].shape, c
+        vi = json.load(open(os.path.join(rdir, "place_info.json")))["variants"]
+        for sfx in ("", "_soft", "_hard"):                 # NO_soft and NO_hard share the record of NO
+            if old.endswith(sfx) and old[:len(old) - len(sfx)] in vi:
+                info["variants"].setdefault(new[:len(new) - len(sfx)] if new.endswith(sfx) else new, vi[old[:len(old) - len(sfx)]])
+                break
+        print(f"carried {new} from {rdir}", flush=True)
 
     np.savez_compressed(os.path.join(a.out, "score_place_raw.npz"),
                         **{f"{k}__{q}": v for k, d in res.items() for q, v in d.items() if isinstance(v, np.ndarray)})
@@ -479,6 +596,8 @@ def main(argv=None):
             ("NO_hard", "NOs_hard"), ("NO_soft", "NOs_soft"), ("NO_hard", "CN_hard"), ("NO_soft", "CN_soft"),
             ("NO_hard", a.kai), ("NO_hard", a.core), ("NOm", "R0"), ("NO_soft", "NOm"))
             if x in res and y in res]
+        ratio = [x for x in res if x[:3] in ("NOc", "NOa", "NOk")]
+        a.pairs += [f"{x}:{y}" for x in ratio for y in ("R0", "R1g", "R1k", "NOm", "NOk") if y in res and y != x]
     ns = argparse.Namespace(out=a.out, leads=L, pairs=a.pairs)
     summarize(ns, res, std, ics_te)
     os.replace(os.path.join(a.out, "score.json"), os.path.join(a.out, "score_place.json"))
