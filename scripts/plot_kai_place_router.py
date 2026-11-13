@@ -57,7 +57,7 @@ def main(run, stats, out):
         p.grid(axis="y", color=GRID, lw=0.8)
         p.set_xticks(x)
         p.set_ylim(lim)
-    ax[0, 0].legend(frameon=False, fontsize=8.5, loc="lower left", ncol=1)
+    ax[0, 1].legend(*ax[0, 0].get_legend_handles_labels(), frameon=False, fontsize=8.5, loc="lower right")
 
     p = ax[1, 0]
     extra = [("R0", "static blend R0", MUTED, False), (info["kai"], "KAI alone", INK, True), (info["core"], "core alone", INK, False)]
@@ -84,7 +84,8 @@ def main(run, stats, out):
     p.set_xlabel("lead (days)")
     p.grid(axis="y", color=GRID, lw=0.8)
     p.set_xticks(x)
-    p.legend(frameon=False, fontsize=8.5)
+    p.set_ylim(49, 72)
+    p.legend(frameon=False, fontsize=8.5, loc="upper center", ncol=2)
     fig.suptitle(f"Placement router test, 5.625 deg: {info['kai']} or {info['core']} (labels and routers fitted on 2016, "
                  f"{S['ics']} ICs of 2017)", fontsize=11, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
