@@ -787,6 +787,28 @@ def score(a, tags):
             print("scored", name, flush=True)
 
     run_cascades()
+    if a.dump:
+        # the forecasts themselves, for experiments on the blend (scripts/kai_blend_router.py): every kept model on
+        # the test year (the scored ICs) and on the validation year. z-scored float16: its rounding adds about 1e-7
+        # of the forecast error's variance. Nothing else is written (score.json stays as it is).
+        assert not big, "--dump: small grids only"
+        os.makedirs(a.dump, exist_ok=True)
+        va = load_years(a, [a.val_year])[a.val_year]
+        vics = np.arange(0, len(va) - L, a.dump_val_stride)
+        vaz = zscore(va, mean, std)
+        z16 = lambda x: ((x - mn) / sd).astype(np.float16)  # noqa: E731
+        tags_d = [t for t in keep if t != "climatology"]
+        for t in tags_d:
+            np.save(os.path.join(a.dump, f"{t}__test.npy"), z16(keep[t]))
+            np.save(os.path.join(a.dump, f"{t}__val.npy"), z16(rollout(fns[t], vaz, vics)))
+            print("dumped", t, flush=True)
+        np.savez(os.path.join(a.dump, "meta.npz"), tags=np.array(tags_d), test_ics=ics, val_ics=vics, lat=lat,
+                 mean=mean, std=std, leads=L, test_year=a.test_year, val_year=a.val_year,
+                 nrmse=np.stack([(np.sqrt(res[t]["mse"].mean(0))[:, [c for c in range(contract.N_CHANNELS)
+                                                                      if c not in (OROG, TISR)]]
+                                  / std[[c for c in range(contract.N_CHANNELS) if c not in (OROG, TISR)]]).mean(1)
+                                 for t in tags_d]))
+        return
     # output-level position without training: lead-wise blend of a KAI (``--blend-bases``) with a core or another
     # scored tag, weights from the validation year. Names: blend / blend_<other>, with @<base> if base != kai.
     bases = [b for b in a.blend_bases if b in keep]
@@ -1179,6 +1201,12 @@ def parser():
     p.add_argument("--val-batch", type=int, default=16, help="days per forward pass of the validation loss")
     p.add_argument("--score-chunk", type=int, default=0,
                    help="ICs per chunk of the metrics (0 = all at once; a fine grid: about 0.8 GB a chunk)")
+    p.add_argument("--dump", default=None,
+                   help="score: write the forecasts of the kept models (--score-cores, --blend-bases) to this folder "
+                        "and stop: <tag>__test.npy (the scored ICs of the test year) and <tag>__val.npy (the "
+                        "validation year, ICs every --dump-val-stride days), z-scored float16, and meta.npz. "
+                        "For experiments on the blend (scripts/kai_blend_router.py); small grids only")
+    p.add_argument("--dump-val-stride", type=int, default=2)
     return p
 
 
