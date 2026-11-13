@@ -39,6 +39,11 @@
 #   KAI_ITERS=200 RO_ITERS=20 CORE_ITERS=40 LOGK=50 LOGC=10 OUT=runs/kaiplus_1p5_test bash scripts/run_kai_plus.sh
 #                                                                 # a short training test at the real size on the real data: the
 #                                                                 #   logs give seconds per iteration ("sec") and GPU memory ("gpu_gb")
+#   CORE=0 TRAIN_YEARS="$(seq -s ' ' 1980 2011)" KAI_ITERS=160000 OUT=runs/kaiplus_1p5_daily_32y SRC=daily bash scripts/run_kai_plus.sh
+#                                                                 # only steps 1 to 3 (data, KAI, fine-tuned KAI) in a new
+#                                                                 #   folder, here for another training period: no core + is
+#                                                                 #   trained and nothing is scored; the cores of the ++ version
+#                                                                 #   follow with PLUS=0 bash scripts/run_kai_plusplus.sh
 #   TWIN=0 CLIM=1 CORE_ITERS=6000 SRC=daily bash scripts/run_kai_plus.sh
 #                                                                 # after a one-core run: the exact controls of the blend (KAI mixed
 #                                                                 #   with the climatology, bootstrap, exact term split), step 6
@@ -89,6 +94,7 @@ TWIN=${TWIN:-1}                        # 1 = train the core a second time with s
 TWIN_SEED=${TWIN_SEED:-1}              #     with both cores (docs/kai_tendency.md sec. 7.9); 0 = one core
 WIDE=${WIDE:-0}                        # 1 = also one wide core with the parameters of the two (the same-size control)
 WIDE_HIDDEN=${WIDE_HIDDEN:-72}; WIDE_MEM_CH=${WIDE_MEM_CH:-34}   # 2 x the default core's parameters (hidden 48, 24)
+CORE=${CORE:-1}                        # 0 = stop after the fine-tuned KAI (steps 1 to 3): no core +, no score
 C=core_plus; C2=${C}_s$TWIN_SEED; M="$C+$C2"; CW=${C}_w
 LOGK=${LOGK:-500}; LOGC=${LOGC:-250}   # iterations between two log lines of the KAI / core training (each runs the validation loss)
 if [ "$SMOKE" = 1 ]; then
@@ -130,6 +136,11 @@ KC=""; [ "$KAI_CKPT" = 1 ] && KC="--kai-ckpt"
 step kai "$OUT/kai.pt" $R --arm kai --tag kai --iters "$KAI_ITERS" --batch "$KAI_BATCH" --log-every $LOGK --resume $KC
 step kai_ro "$OUT/kai_ro.pt" $R --arm kai --tag kai_ro --init kai --rollout 2 3 --lr 3e-4 --iters "$RO_ITERS" \
     --batch "$RO_BATCH" --log-every $LOGK --resume $KC
+
+if [ "$CORE" != 1 ]; then
+    echo "[plus] CORE=0: data, KAI and the fine-tuned KAI are in $OUT; no core + is trained and nothing is scored"
+    exit 0
+fi
 
 # 4. the tendency core +
 G=""; [ "$GFEAT" = 1 ] && G="--core-gfeat"

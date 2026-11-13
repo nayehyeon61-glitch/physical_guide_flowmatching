@@ -25,6 +25,11 @@
 #   TRAIN=0 WAIT=1 bash scripts/run_kai_plusplus.sh               # only score, after waiting for the checkpoints
 #                                                                 #   (the trainings run elsewhere, one per GPU)
 #   SCORE=0 bash scripts/run_kai_plusplus.sh                      # only train
+#   PLUS=0 OUT=runs/kaiplus_1p5_daily_32y CORE_ITERS=48000 bash scripts/run_kai_plusplus.sh
+#                                                                 # a folder without core + (another training period, made
+#                                                                 #   by CORE=0 bash scripts/run_kai_plus.sh): the two extended
+#                                                                 #   cores on the years of the folder's KAI, the score without
+#                                                                 #   the rows of the + version (docs sec. 7)
 #   SMOKE=1 OUT=... DATA=... DEVICE=cpu bash ...                  # a few iterations of small variants (CPU test)
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
@@ -34,6 +39,7 @@ OUT=${OUT:-runs/kaiplus_1p5_daily}
 DATA=${DATA:-data/era5_1p5_daily}
 DEVICE=${DEVICE:-cuda}
 THREADS=${THREADS:-8}
+YEARS_GIVEN=${TRAIN_YEARS:+1}          # not given: the training years of the folder's KAI (kai.pt), see below
 TRAIN_YEARS=${TRAIN_YEARS:-"2012 2013 2014 2015"}
 VAL_YEAR=${VAL_YEAR:-2016}
 TEST_YEAR=${TEST_YEAR:-2017}
@@ -50,6 +56,9 @@ ARCH2=${ARCH2:-}                       # empty: the second core is the seed twin
 SEED2=${SEED2:-1}
 TRAIN=${TRAIN:-1}; SCORE=${SCORE:-1}; WAIT=${WAIT:-0}
 SC=${SC:-pp}                           # the name of the score: score_$SC.json, breakdown_$SC/, variable_table_$SC.md
+PLUS=${PLUS:-1}                        # 1 = the folder holds core + (core_plus.pt) and the score compares with the +
+                                       #     version; 0 = a folder without core + (CORE=0 bash scripts/run_kai_plus.sh,
+                                       #     e.g. another training period): the ++ rows against KAI and the fine-tuned KAI
 SCORE_BATCH=${SCORE_BATCH:-4}; IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}
 BUSY_MIN=${BUSY_MIN:-120}              # a .part / .log that changed in the last BUSY_MIN minutes = a training is alive
 POLL=${POLL:-600}                      # seconds between two looks at a checkpoint that is waited for
@@ -57,6 +66,7 @@ MEM="--core-mem-ch 48 --core-mem-enc 128"
 if [ "$SMOKE" = 1 ]; then  # small variants of the same kinds, a few iterations: does every step run?
     TRAIN_YEARS=2015; KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; CORE_ITERS=2; CORE_BATCH=1; LOGC=2; VAL_BATCH=1
     SCORE_BATCH=2; IC_STRIDE=6; LEADS=4; THREADS=${THREADS_SMOKE:-2}; MEM="--core-mem-ch 12 --core-mem-enc 24"
+    YEARS_GIVEN=1
 fi
 opts_of() {  # the variants of scripts/run_kai_plus_arch.sh (the same tags give the same cores)
     if [ "$SMOKE" = 1 ]; then
@@ -107,9 +117,24 @@ wait_for() {  # two trainings of one tag in one folder would overwrite each othe
         sleep "$POLL"
     done
 }
-for f in kai.pt kai_ro.pt core_plus.pt; do
-    [ -e "$OUT/$f" ] || [ "${DRYRUN:-0}" = 1 ] || { echo "$OUT/$f is missing: run scripts/run_kai_plus.sh first"; exit 1; }
+NEED="kai.pt kai_ro.pt"; [ "$PLUS" = 1 ] && NEED="$NEED core_plus.pt"
+for f in $NEED; do
+    [ -e "$OUT/$f" ] || [ "${DRYRUN:-0}" = 1 ] || {
+        echo "$OUT/$f is missing: run scripts/run_kai_plus.sh first (a folder without core +: CORE=0 there, PLUS=0 here)"; exit 1; }
 done
+# The cores belong to the folder's KAI: the same training years (the normalization stats.npz and the climatology are
+# theirs). Not given: taken from kai.pt; given and different: stop before a training of days on the wrong years.
+if [ "${DRYRUN:-0}" != 1 ]; then
+    KY=$(python -c "import sys, torch; print(*torch.load(sys.argv[1], map_location='cpu', weights_only=False)['args']['train_years'])" "$OUT/kai.pt")
+    TRAIN_YEARS=$(echo $TRAIN_YEARS)
+    if [ -z "$YEARS_GIVEN" ]; then
+        TRAIN_YEARS=$KY
+    elif [ "$TRAIN_YEARS" != "$KY" ]; then
+        echo "TRAIN_YEARS ($TRAIN_YEARS) are not the training years of $OUT/kai.pt ($KY):"
+        echo "leave TRAIN_YEARS out (the cores then take the years of the folder's KAI) or give another OUT"; exit 1
+    fi
+    echo "[++] folder $OUT, training years $(echo $TRAIN_YEARS | awk '{print $1 " to " $NF " (" NF ")"}'), validation $VAL_YEAR, test $TEST_YEAR"
+fi
 D="--data $DATA/kai6h --cache $DATA/kaiday --era5 $DATA/era5_data --out $OUT --train-years $TRAIN_YEARS"
 D="$D --val-year $VAL_YEAR --test-year $TEST_YEAR --device $DEVICE --threads $THREADS --val-batch $VAL_BATCH"
 R="python scripts/run_kai_tendency.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS"
@@ -144,6 +169,7 @@ if [ "$WAIT" = 1 ] && [ "${DRYRUN:-0}" != 1 ]; then
 fi
 
 # 2. score. The ++ model = loop_$M@kai_ro (trajectory) and blend_$M@kai_ro (lowest RMSE).
+if [ "$PLUS" = 1 ]; then
 CORES="$C $A $B"; MULTI="$M"
 PAIRS="loop_$M@kai_ro:kai_ro loop_$M@kai_ro:kai loop_$M@kai_ro:loop_$C@kai_ro loop_$M@kai_ro:loop_$A@kai_ro"
 PAIRS="$PAIRS loop_$A@kai_ro:loop_$C@kai_ro loop_$B@kai_ro:loop_$A@kai_ro $A:$C $B:$A"
@@ -167,8 +193,33 @@ VT=("kai=KAI" "kai_ro=KAI (rollout fine-tuned)" "loop_$C@kai_ro=+ loop: fine-tun
     "loop_$A@kai_ro=fine-tuned KAI + $NA loop" "loop_$M@kai_ro=++ loop: fine-tuned KAI + two extended cores"
     "blend_$C@kai_ro=+ blend" "blend_$M@kai_ro=++ blend" "blend_climatology@kai_ro=fine-tuned KAI damped to climatology")
 VP=("loop_$M@kai_ro:loop_$C@kai_ro" "loop_$M@kai_ro:kai_ro" "blend_$M@kai_ro:blend_$C@kai_ro" "blend_$M@kai_ro:kai_ro")
+else  # PLUS=0, a folder without core +: the ++ rows against KAI, the fine-tuned KAI and the one-core models
+CORES="$A $B"; MULTI="$M"
+PAIRS="loop_$M@kai_ro:kai_ro loop_$M@kai_ro:kai loop_$M@kai_ro:loop_$A@kai_ro loop_$A@kai_ro:kai_ro"
+PAIRS="$PAIRS loop_$B@kai_ro:loop_$A@kai_ro $A:kai $B:$A kai_ro:kai"
+PAIRS="$PAIRS blend_$M@kai_ro:kai_ro blend_$M@kai_ro:kai blend_$M@kai_ro:blend_$A@kai_ro blend_$A@kai_ro:kai_ro"
+PAIRS="$PAIRS blend_$M@kai_ro:loop_$M@kai_ro blend_$M@kai_ro:blend_climatology@kai_ro"
+PAIRS="$PAIRS blend_climatology@kai_ro:kai_ro blend_climatology:kai"
+BP=("loop_$M@kai_ro:kai_ro=++ loop (fine-tuned KAI, $WHAT) vs the fine-tuned KAI"
+    "loop_$M@kai_ro:kai=++ loop vs KAI"
+    "loop_$A@kai_ro:kai_ro=one extended core in the loop on the fine-tuned KAI ($NA) vs the fine-tuned KAI"
+    "loop_$M@kai_ro:loop_$A@kai_ro=two extended cores vs one in the loop on the fine-tuned KAI"
+    "loop_$B@kai_ro:loop_$A@kai_ro=the second extended core vs the first, each in the one-core loop"
+    "$A:kai=alone: $NA vs KAI"
+    "kai_ro:kai=KAI with rollout fine-tuning vs KAI"
+    "blend_$M@kai_ro:kai_ro=++ blend (fine-tuned KAI mixed with both extended cores) vs the fine-tuned KAI"
+    "blend_$M@kai_ro:kai=++ blend vs KAI"
+    "blend_$M@kai_ro:blend_$A@kai_ro=blend with two extended cores vs with one"
+    "blend_$M@kai_ro:loop_$M@kai_ro=++ blend vs ++ loop"
+    "blend_$M@kai_ro:blend_climatology@kai_ro=++ blend vs the fine-tuned KAI damped toward the climatology"
+    "blend_climatology@kai_ro:kai_ro=fine-tuned KAI damped toward the climatology vs the fine-tuned KAI")
+VT=("kai=KAI" "kai_ro=KAI (rollout fine-tuned)" "$A=$NA alone" "loop_$A@kai_ro=fine-tuned KAI + $NA loop"
+    "loop_$M@kai_ro=++ loop: fine-tuned KAI + two extended cores" "blend_$A@kai_ro=blend with one extended core"
+    "blend_$M@kai_ro=++ blend" "blend_climatology@kai_ro=fine-tuned KAI damped to climatology")
+VP=("loop_$M@kai_ro:kai_ro" "loop_$M@kai_ro:loop_$A@kai_ro" "blend_$M@kai_ro:kai_ro" "blend_$M@kai_ro:kai")
+fi
 C2=${C}_s1
-if [ -e "$OUT/$C2.pt" ] && [ "$B" != "$C2" ]; then  # the + two-core model (seed 0, 1): the same-structure baseline
+if [ "$PLUS" = 1 ] && [ -e "$OUT/$C2.pt" ] && [ "$B" != "$C2" ]; then  # the + two-core model (seed 0, 1): the same-structure baseline
     MB="$C+$C2"; CORES="$CORES $C2"; MULTI="$MULTI $MB"
     PAIRS="$PAIRS loop_$M@kai_ro:loop_$MB@kai_ro blend_$M@kai_ro:blend_$MB@kai_ro loop_$MB@kai_ro:loop_$C@kai_ro"
     BP+=("loop_$M@kai_ro:loop_$MB@kai_ro=++ loop vs the + two-core loop (fine-tuned KAI, two cores +)"
