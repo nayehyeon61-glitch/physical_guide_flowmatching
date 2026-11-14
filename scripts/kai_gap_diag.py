@@ -13,7 +13,12 @@ period can give: more years help the first kind directly, the second kind only w
 Every day of a year is used (``--days 64``: the 64 days of the training log, to reproduce its number). The
 training years of a core are read from its checkpoint. ``--gap-leads K``: the same for every day of the model's own
 K-day rollout. Also printed: the normalized RMSE of the 65 scored channels (area weighted, in units of the
-training std), whose square is additive over days.
+training std), whose square is additive over days, and a reading of the day-1 gap. The years are normalized on
+access (a fine grid stays on disk) and ``--device cuda`` runs the models on the GPU, so the same call works in a
+1.5 deg run folder (scripts/run_kai_plusplus.sh, step gap).
+
+Reading (docs/kai_time_extension.md, 5.625 deg): the 4-year KAI with a gap of 2 % gained 0.3-0.9 % from 8 x the
+years; the same KAI with 8 x the iterations had a gap of 6.8 % and gained 1.3-2.5 % from 8 x the years.
 """
 
 import json
@@ -26,7 +31,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 from pgcfm.kai_tend import DYN, OROG, TISR, LpLoss, core_rollout  # noqa: E402
-from run_kai_tendency import build, build_core, lat_of, load_years, parser, stats, zscore  # noqa: E402
+from run_kai_tendency import ZYear, build, build_core, lat_of, load_years, parser, stats  # noqa: E402
 
 
 def main(argv=None):
@@ -40,14 +45,16 @@ def main(argv=None):
     a = p.parse_args(argv)
     K = a.gap_leads
     torch.set_num_threads(a.threads)
+    dev = torch.device(a.device)
     mean, std, inc, _ = stats(a)
-    data = {y: torch.from_numpy(zscore(np.asarray(x), mean, std)) for y, x in load_years(a, a.years).items()}
-    H = next(iter(data.values())).shape[-2]
+    raw = load_years(a, a.years)
+    data = {y: ZYear(x, mean, std, as_torch=True) for y, x in raw.items()}  # normalized on access
+    H = next(iter(raw.values())).shape[-2]
     lat = lat_of(os.path.join(a.data, f"{a.val_year}.nc"), H, a.era5)
     w = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32)
-    w = (w / w.mean()).view(1, 1, -1, 1)
-    dyn = torch.tensor(DYN)
-    sc = torch.tensor([c for c in DYN if c not in (TISR, OROG)])
+    w = (w / w.mean()).view(1, 1, -1, 1).to(dev)
+    dyn = torch.tensor(DYN, device=dev)
+    sc = torch.tensor([c for c in DYN if c not in (TISR, OROG)], device=dev)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     out = {}
     for tag in list(a.cores) + list(a.kai):
@@ -56,7 +63,7 @@ def main(argv=None):
         if tag in a.kai:
             core = build(a, "kai", inc, None)
             core.load_state_dict(ck["state"], strict=False)
-            core.eval()
+            core.to(dev).eval()
             W, hist = 0, False
         else:
             core = build_core(a, mean, std, inc, lat, tag=tag)
@@ -70,29 +77,29 @@ def main(argv=None):
                 idx = np.arange(1 if hist else 0, last, max(1, (last - 1) // a.days))[:a.days]
             else:
                 idx = np.arange(1 if hist else 0, last)
-            rel, se = [], torch.zeros(K, len(sc))
+            rel, se = [], torch.zeros(K, len(sc), device=dev)
             with torch.no_grad():
                 for i in range(0, len(idx), a.val_batch):
                     j = idx[i:i + a.val_batch]
-                    x = z[j]
-                    tgt = torch.stack([z[j + k] for k in range(1, K + 1)], 1)             # (B, K, 67, H, W)
-                    pv = z[j - 1] if hist else None
+                    x, jd = z[j].to(dev), torch.tensor(j, device=dev)
+                    tgt = torch.stack([z[j + k] for k in range(1, K + 1)], 1).to(dev)     # (B, K, 67, H, W)
+                    pv = z[j - 1].to(dev) if hist else None
                     if W:  # as in the training's val: before the first day of the year that day itself
-                        pv = torch.stack([z[np.maximum(j - k, 0)] for k in range(W, 0, -1)], 1)
+                        pv = torch.stack([z[np.maximum(j - k, 0)] for k in range(W, 0, -1)], 1).to(dev)
                     if tag in a.kai:
-                        pred = core.rollout(x, torch.tensor(j), K, tgt[:, :, TISR])
+                        pred = core.rollout(x, jd, K, tgt[:, :, TISR])
                     else:
-                        yk = core_rollout(core, x[:, dyn], torch.tensor(j), K, tgt[:, :, TISR],
+                        yk = core_rollout(core, x[:, dyn], jd, K, tgt[:, :, TISR],
                                           prev=None if pv is None else pv.index_select(-3, dyn))
                         pred = tgt.index_copy(2, dyn, yk)                                 # the static channel: the truth's
                     d = (pred - tgt).flatten(2)
-                    rel.append(d.norm(dim=2) / tgt.flatten(2).norm(dim=2))                # (B, K)
+                    rel.append((d.norm(dim=2) / tgt.flatten(2).norm(dim=2)).cpu())        # (B, K)
                     if i == 0:
                         assert abs(float(lp(pred[:, 0], tgt[:, 0])) - float(rel[-1][:, 0].mean())) < 1e-5
                     se += (((pred - tgt)[:, :, sc] ** 2) * w).mean((3, 4)).sum(0)
             rel = torch.cat(rel).numpy()
             res[y] = dict(loss=rel.mean(0).tolist(), se=(rel.std(0, ddof=1) / np.sqrt(len(rel))).tolist(), n=len(rel),
-                          nrmse=torch.sqrt(se / len(rel)).mean(1).tolist(), trained=y in tr)
+                          nrmse=torch.sqrt(se / len(rel)).mean(1).cpu().tolist(), trained=y in tr)
         part = lambda key, seen: np.mean([v[key] for v in res.values() if v["trained"] == seen], 0)  # noqa: E731
         both = any(v["trained"] for v in res.values()) and not all(v["trained"] for v in res.values())
         gap = (part("loss", False) / part("loss", True) - 1) if both else np.full(K, np.nan)
@@ -107,7 +114,13 @@ def main(argv=None):
                   + f"   unseen / seen - 1: {100 * gap[k]:+.1f} %")
             print(f"  day {k + 1} nrmse  " + " ".join(f"{res[y]['nrmse'][k]:7.4f}" for y in a.years)
                   + f"   unseen / seen - 1: {100 * gap2[k]:+.1f} %")
-        print(f"  standard error of a year's day-1 loss about {np.mean([v['se'][0] for v in res.values()]):.4f}", flush=True)
+        print(f"  standard error of a year's day-1 loss about {np.mean([v['se'][0] for v in res.values()]):.4f}")
+        if both:
+            g = 100 * gap[0]
+            how = ("short of capacity or iterations: more years alone will give about this much at most" if g < 3 else
+                   "short of data: more training years help" if g > 5 else "between: both more years and more capacity can help")
+            print(f"  reading: day-1 gap {g:+.1f} % -> {how}", flush=True)
+            out[tag]["reading"] = how
     if a.json:
         with open(a.json, "w") as f:
             json.dump(out, f, indent=1)

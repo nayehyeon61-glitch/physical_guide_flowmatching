@@ -30,6 +30,13 @@
 #                                                                 #   by CORE=0 bash scripts/run_kai_plus.sh): the two extended
 #                                                                 #   cores on the years of the folder's KAI, the score without
 #                                                                 #   the rows of the + version (docs sec. 7)
+#   TIME=0 ...                                                    # time extension off: by default, with more than 4 training
+#                                                                 #   years in the folder's KAI, a CORE_ITERS that is not given
+#                                                                 #   grows with the years (x years / 4: the epochs of the 4-year
+#                                                                 #   run; docs/kai_time_extension.md: more years without more
+#                                                                 #   iterations gave nothing)
+#   GAP=0 ...                                                     # without step 3 (the generalization gap of KAI and of the two
+#                                                                 #   cores: short of data or short of capacity / iterations?)
 #   SMOKE=1 OUT=... DATA=... DEVICE=cpu bash ...                  # a few iterations of small variants (CPU test)
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
@@ -45,7 +52,12 @@ VAL_YEAR=${VAL_YEAR:-2016}
 TEST_YEAR=${TEST_YEAR:-2017}
 KAI_DEPTHS=${KAI_DEPTHS:-"3 3 15 3"}   # the KAI of the folder (kai.pt, kai_ro.pt)
 KAI_DIMS=${KAI_DIMS:-"48 96 192 288"}
-CORE_ITERS=${CORE_ITERS:-6000}         # the schedule of core_plus in this folder
+ITERS_GIVEN=${CORE_ITERS:+1}
+CORE_ITERS=${CORE_ITERS:-6000}         # the schedule of core_plus in this folder (4 training years)
+TIME=${TIME:-1}                        # 1 = time extension: more than 4 training years and no CORE_ITERS given ->
+                                       #     CORE_ITERS x years / 4 (the same epochs); 0 = the count above as it is
+GAP=${GAP:-1}                          # 1 = step 3: one-step loss of KAI and the two cores on training years against
+GAP_DAYS=${GAP_DAYS:-30}               #     the validation / test year (GAP_YEARS: other years), GAP_DAYS days a year
 CORE_BATCH=${CORE_BATCH:-8}
 CORE_MEM=${CORE_MEM:-8}
 SUBSTEPS=${SUBSTEPS:-4}
@@ -134,6 +146,13 @@ if [ "${DRYRUN:-0}" != 1 ]; then
         echo "leave TRAIN_YEARS out (the cores then take the years of the folder's KAI) or give another OUT"; exit 1
     fi
     echo "[++] folder $OUT, training years $(echo $TRAIN_YEARS | awk '{print $1 " to " $NF " (" NF ")"}'), validation $VAL_YEAR, test $TEST_YEAR"
+fi
+# Time extension (docs/kai_time_extension.md): a longer training period gave nothing at the iterations of the 4-year
+# run and its gain came with iterations in proportion to the years, so the count follows the years unless it is given.
+NY=$(echo $TRAIN_YEARS | wc -w)
+if [ "$TIME" = 1 ] && [ "$SMOKE" != 1 ] && [ -z "$ITERS_GIVEN" ] && [ "$NY" -gt 4 ]; then
+    CORE_ITERS=$(( CORE_ITERS * NY / 4 ))
+    echo "[++] time extension: $NY training years -> $CORE_ITERS core iterations (x $NY/4, the epochs of the 4-year run; CORE_ITERS=... or TIME=0 to set them by hand)"
 fi
 D="--data $DATA/kai6h --cache $DATA/kaiday --era5 $DATA/era5_data --out $OUT --train-years $TRAIN_YEARS"
 D="$D --val-year $VAL_YEAR --test-year $TEST_YEAR --device $DEVICE --threads $THREADS --val-batch $VAL_BATCH"
@@ -241,4 +260,19 @@ if [ "${DRYRUN:-0}" != 1 ]; then
         --base kai_ro --grid 1.5 --pairs "${VP[@]}" > "$OUT/variable_table_$SC.log" 2>&1 \
         || echo "[++] variable table failed, see $OUT/variable_table_$SC.log"
     echo "[++] done: $OUT/score_$SC.log, $OUT/breakdown_$SC/breakdown_$SC.txt, $OUT/variable_table_$SC.md"
+fi
+
+# 3. time extension: are KAI and the cores short of data or short of capacity / iterations? The one-step loss (and the
+#    loss of the model's own 3-day rollout) on years of the training period against years the model never saw. A gap
+#    of a few % = more years alone will not help (extend ARCH or the iterations); a large gap = more years help.
+if [ "$GAP" = 1 ]; then
+    if [ -z "${GAP_YEARS:-}" ]; then  # the first, the middle and the last training year, the validation and the test year
+        TY=($TRAIN_YEARS); n=${#TY[@]}
+        GAP_YEARS=$(echo "${TY[0]} ${TY[$(( (n - 1) / 2 ))]} ${TY[$(( n - 1 ))]} $VAL_YEAR $TEST_YEAR" | tr ' ' '\n' | awk '!s[$0]++' | tr '\n' ' ')
+    fi
+    step "gap_$SC" "$OUT/diag_gap_$SC.json" python scripts/kai_gap_diag.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS \
+        --kai kai kai_ro --cores $A $B --years $GAP_YEARS --days "$GAP_DAYS" --gap-leads 3 --json "$OUT/diag_gap_$SC.json"
+    if [ "${DRYRUN:-0}" != 1 ] && [ -e "$OUT/gap_$SC.log" ]; then
+        grep -E "trained on|day 1 loss|reading" "$OUT/gap_$SC.log" | sed 's/^/[++] gap  /'
+    fi
 fi

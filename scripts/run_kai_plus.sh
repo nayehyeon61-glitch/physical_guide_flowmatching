@@ -47,6 +47,10 @@
 #   TWIN=0 CLIM=1 CORE_ITERS=6000 SRC=daily bash scripts/run_kai_plus.sh
 #                                                                 # after a one-core run: the exact controls of the blend (KAI mixed
 #                                                                 #   with the climatology, bootstrap, exact term split), step 6
+#   TIME=0 ...                                                    # time extension off: by default, with more than 4 training
+#                                                                 #   years, KAI_ITERS and CORE_ITERS that are not given grow with
+#                                                                 #   the years (x years / 4: the epochs of the 4-year run;
+#                                                                 #   docs/kai_time_extension.md)
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -74,6 +78,9 @@ TEST_YEAR=${TEST_YEAR:-2017}
 THREADS=${THREADS:-8}
 KAI_DEPTHS=${KAI_DEPTHS:-"3 3 15 3"}
 KAI_DIMS=${KAI_DIMS:-"48 96 192 288"}
+KAI_ITERS_GIVEN=${KAI_ITERS:+1}; CORE_ITERS_GIVEN=${CORE_ITERS:+1}
+TIME=${TIME:-1}                        # 1 = time extension: with more than 4 training years the iteration counts below
+                                       #     that are not given are multiplied by years / 4 (the same epochs); 0 = off
 KAI_ITERS=${KAI_ITERS:-20000}
 KAI_BATCH=${KAI_BATCH:-8}
 KAI_CKPT=${KAI_CKPT:-1}                # gradient checkpointing per KAI block (KAI keeps the full grid in every stage)
@@ -100,6 +107,14 @@ LOGK=${LOGK:-500}; LOGC=${LOGC:-250}   # iterations between two log lines of the
 if [ "$SMOKE" = 1 ]; then
     KAI_DEPTHS="2 2 4 2"; KAI_DIMS="24 48 64 96"; KAI_ITERS=4; KAI_BATCH=2; RO_ITERS=2; RO_BATCH=2; CORE_ITERS=2; CORE_BATCH=1
     SCORE_BATCH=2; VAL_BATCH=1; IC_STRIDE=6; LEADS=4; LOGK=2; LOGC=1; THREADS=${THREADS_SMOKE:-2}
+fi
+# Time extension (docs/kai_time_extension.md): a longer training period gave nothing at the iterations of the 4-year
+# run (KAI +0.3 to +0.9 %) and its gain came with iterations in proportion to the years.
+NY=$(echo $TRAIN_YEARS | wc -w)
+if [ "$TIME" = 1 ] && [ "$SMOKE" != 1 ] && [ "$NY" -gt 4 ]; then
+    [ -n "$KAI_ITERS_GIVEN" ] || KAI_ITERS=$(( KAI_ITERS * NY / 4 ))
+    [ -n "$CORE_ITERS_GIVEN" ] || CORE_ITERS=$(( CORE_ITERS * NY / 4 ))
+    echo "[plus] time extension: $NY training years -> KAI $KAI_ITERS iterations, core $CORE_ITERS (x $NY/4 unless given, the epochs of the 4-year run; TIME=0 keeps the 4-year counts)"
 fi
 mkdir -p "$OUT"
 step() {  # step <name> <done file> <command...>: skipped when the done file exists, log to $OUT/<name>.log
