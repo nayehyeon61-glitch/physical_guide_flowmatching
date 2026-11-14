@@ -11,6 +11,9 @@ fig_T1.png     (when score_T1.json and breakdown_T1/breakdown.json are there) 2 
                the models; what years and iterations give KAI; what 32 years add at 8 x the iterations and what a
                recent-years adaptation stage adds; the core's share on each KAI. Solid = total gain, dashed = its
                information part (eval_kai_breakdown's second split).
+fig_T3.png     (when breakdown_T3a/breakdown.json is there; takes score_T3.json / breakdown_T3 with the 4-year control
+               of iterations x 2 once they exist) 2 x 2 by lead: the cores alone; each core's gain over the 4-year
+               core of 3000 iterations, alone and in the coupled loop on the 32-year KAI; the core's share there.
 """
 
 import json
@@ -206,6 +209,69 @@ def fig_T1(run, out):
     plt.close(fig)
 
 
+def fig_T3(run, out):
+    """The core's side of the time extension: years (T2), years and iterations (T3a), iterations alone (T3)."""
+    full = os.path.exists(os.path.join(run, "breakdown_T3", "breakdown.json"))
+    S = json.load(open(os.path.join(run, "score_T3.json" if full else "score_T3a.json")))
+    B = {}
+    for n in ("T2", "T3a") + (("T3",) if full else ()):
+        B.update(json.load(open(os.path.join(run, f"breakdown_{n}", "breakdown.json"))))
+    L = np.arange(1, S["leads"] + 1)
+    K = "kai_y32x8ro"
+    cores = [("core_gngmz8", CAT[0], "4 years, 3000 it", "o"), ("core_gngmz8_y32", CAT[1], "32 years, 3000 it", "s")]
+    if full:
+        cores.append(("core_gngmz8_x2", CAT[3], "4 years, 6000 it", "D"))
+    cores += [("core_gngmz8_y32x2", CAT[2], "32 years, 6000 it", "^"), ("core_gngmz8w", CAT[5], "wide core, 4 years, 3000 it", "v")]
+    n = lambda tag: np.array(S["arms"][tag]["nrmse"])
+    fig, ax = plt.subplots(2, 2, figsize=(13.0, 9.2))
+
+    def gain(p, a, b, c, label, mk):
+        p.plot(L, 100 * (1 - n(a) / n(b)), color=c, lw=2, marker=mk, ms=4, label=label)
+        if f"{a}:{b}" in B:
+            p.plot(L, np.array(B[f"{a}:{b}"]["dterm2_pct"])[:, 1], color=c, lw=1.4, ls="--")
+
+    def finish(p, title, loc="upper right"):
+        p.axhline(0, color=INK, lw=1)
+        p.set_xticks(L)
+        p.set_xlabel("lead (days)")
+        p.set_title(title, fontsize=10.5, loc="left")
+        p.grid(axis="y", color=GRID, lw=0.8)
+        p.legend(frameon=False, fontsize=8.5, loc=loc, title="solid: total gain, dashed: information part", title_fontsize=8.5)
+
+    p = ax[0, 0]
+    p.plot(L, n("persistence"), color=MUTED, lw=1.4, ls=":", label="persistence")
+    for tag, c, name, mk in cores:
+        p.plot(L, n(tag), color=c, lw=2, marker=mk, ms=4, label=f"core alone, {name}")
+    p.plot(L, n(K), color=INK, lw=1.6, ls="--", marker="o", ms=3.5, mfc=SURFACE, label="fine-tuned KAI, 32 years, 16,000 it")
+    p.plot(L, n(f"loop_core_gngmz8_y32x2@{K}"), color=INK, lw=2, marker="o", ms=4, label="loop: that KAI + the core of 32 years, 6000 it")
+    p.set_xticks(L)
+    p.set_ylim(0, 0.75)
+    p.set_xlabel("lead (days)")
+    p.set_title("normalized RMSE of the 65 scored channels (lower = better)", fontsize=10.5, loc="left")
+    p.grid(axis="y", color=GRID, lw=0.8)
+    p.legend(frameon=False, fontsize=8, loc="lower right")
+
+    p = ax[0, 1]
+    for tag, c, name, mk in cores[1:]:
+        gain(p, tag, cores[0][0], c, name, mk)
+    finish(p, "core alone: gain over the 4-year core, 3000 it (%)")
+
+    p = ax[1, 0]
+    for tag, c, name, mk in cores[1:]:
+        gain(p, f"loop_{tag}@{K}", f"loop_{cores[0][0]}@{K}", c, name, mk)
+    finish(p, "loop on the 32-year KAI: gain over the loop with the 4-year core, 3000 it (%)")
+
+    p = ax[1, 1]
+    for tag, c, name, mk in cores:
+        gain(p, f"loop_{tag}@{K}", K, c, name, mk)
+    finish(p, "the core's share: loop over the 32-year fine-tuned KAI alone (%)")
+    fig.suptitle("Time-extension test T2 / T3: the tendency core on 32 years and with twice the iterations "
+                 "(5.625 deg, 119 forecasts of 2017)", fontsize=11, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(os.path.join(out, "fig_T3.png"), dpi=150)
+    plt.close(fig)
+
+
 def main(run, out):
     style()
     os.makedirs(out, exist_ok=True)
@@ -213,6 +279,8 @@ def main(run, out):
     fig_clim(run, out)
     if os.path.exists(os.path.join(run, "breakdown_T1", "breakdown.json")):
         fig_T1(run, out)
+    if os.path.exists(os.path.join(run, "breakdown_T3a", "breakdown.json")):
+        fig_T3(run, out)
 
 
 if __name__ == "__main__":
