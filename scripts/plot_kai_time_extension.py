@@ -7,7 +7,10 @@ fig_gap.png    the generalization gap of the 4-year models (scripts/kai_gap_diag
 fig_clim.png   the climatology's trend (scripts/kai_clim_trend.py: diag_clim_trend.json): the global mean of t2m
                and t50 by year, the climatologies as forecasts of 2016 / 2017, the ACC of stored forecasts with the
                4-year and the 32-year climatology as reference.
-fig_T<n>.png   (when score_T<n>.json is there) 2 x 2 by lead: gains of the time-extended models, + = better.
+fig_T1.png     (when score_T1.json and breakdown_T1/breakdown.json are there) 2 x 2 by lead, + = better: the nRMSE of
+               the models; what years and iterations give KAI; what 32 years add at 8 x the iterations and what a
+               recent-years adaptation stage adds; the core's share on each KAI. Solid = total gain, dashed = its
+               information part (eval_kai_breakdown's second split).
 """
 
 import json
@@ -138,12 +141,78 @@ def fig_clim(run, out):
     fig.savefig(os.path.join(out, "fig_clim.png"), dpi=150)
     plt.close(fig)
 
+def fig_T1(run, out):
+    S = json.load(open(os.path.join(run, "score_T1.json")))
+    B = json.load(open(os.path.join(run, "breakdown_T1", "breakdown.json")))
+    L = np.arange(1, S["leads"] + 1)
+    W = "core_gngmz8w"
+    fig, ax = plt.subplots(2, 2, figsize=(13.0, 9.2))
+
+    def pair(p, key, c, label, mk="o", info=True):
+        b = B[key]
+        tot = 100 * (1 - np.array(b["nrmse"][b["a"]]) / np.array(b["nrmse"][b["b"]]))
+        p.plot(L, tot, color=c, lw=2, marker=mk, ms=4, label=label)
+        if info:
+            p.plot(L, np.array(b["dterm2_pct"])[:, 1], color=c, lw=1.4, ls="--")
+
+    def finish(p, title, loc="upper right", note=True):
+        p.axhline(0, color=INK, lw=1)
+        p.set_xticks(L)
+        p.set_xlabel("lead (days)")
+        p.set_title(title, fontsize=10.5, loc="left")
+        p.grid(axis="y", color=GRID, lw=0.8)
+        p.legend(frameon=False, fontsize=8.5, loc=loc, title="solid: total gain, dashed: information part" if note else None,
+                 title_fontsize=8.5)
+
+    p = ax[0, 0]
+    kai = [("kai_ro", CAT[0], "4 years, 2000 it"), ("kai_x8ro", CAT[1], "4 years, 16,000 it"),
+           ("kai_y32x8ro", CAT[2], "32 years, 16,000 it")]
+    p.plot(L, S["arms"]["persistence"]["nrmse"], color=MUTED, lw=1.4, ls=":", label="persistence")
+    for k, c, n in kai:
+        p.plot(L, S["arms"][k]["nrmse"], color=c, lw=1.6, ls="--", marker="o", ms=3.5, mfc=SURFACE, label=f"fine-tuned KAI, {n}")
+        p.plot(L, S["arms"][f"loop_{W}@{k}"]["nrmse"], color=c, lw=2, marker="o", ms=4, label=f"loop with the wide core, KAI {n}")
+    p.plot(L, S["arms"][f"blend_{W}@kai_y32x8ro"]["nrmse"], color=CAT[5], lw=2, marker="s", ms=4, label="blend, KAI 32 years, 16,000 it")
+    p.set_xticks(L)
+    p.set_ylim(0, None)
+    p.set_xlabel("lead (days)")
+    p.set_title("normalized RMSE of the 65 scored channels (lower = better)", fontsize=10.5, loc="left")
+    p.grid(axis="y", color=GRID, lw=0.8)
+    p.legend(frameon=False, fontsize=8, loc="lower right")
+
+    p = ax[0, 1]
+    for key, c, n in (("kai_y8:kai", CAT[3], "8 years, 2000 it (years x 2)"), ("kai_y32:kai", CAT[4], "32 years, 2000 it (years x 8)"),
+                      ("kai_y8x2:kai", CAT[5], "8 years, 4000 it (both x 2)"), ("kai_x8:kai", CAT[1], "4 years, 16,000 it (iterations x 8)"),
+                      ("kai_y32x8:kai", CAT[2], "32 years, 16,000 it (both x 8)")):
+        pair(p, key, c, n)
+    finish(p, "KAI: gain over the 4-year KAI of 2000 iterations (%)")
+
+    p = ax[1, 0]
+    pair(p, "kai_y32x8:kai_x8", CAT[2], "32 years over 4 years: KAI", "o")
+    pair(p, "kai_y32x8ro:kai_x8ro", CAT[0], "32 years over 4 years: fine-tuned KAI", "s")
+    pair(p, f"loop_{W}@kai_y32x8ro:loop_{W}@kai_x8ro", CAT[5], "32 years over 4 years: loop with the wide core", "^")
+    pair(p, "kai_y32x8ro4:kai_y32x8ro", CAT[1], "adaptation stage (last 4 years) over none: fine-tuned KAI", "s")
+    pair(p, f"loop_{W}@kai_y32x8ro4:loop_{W}@kai_y32x8ro", CAT[3], "adaptation stage over none: loop", "^")
+    p.set_ylim(-1.0, 5.4)  # room for the legend above the lines
+    finish(p, "at 16,000 iterations: what 32 years add, what a recent-years adaptation adds (%)", loc="upper left")
+
+    p = ax[1, 1]
+    for k, c, n in kai:
+        pair(p, f"loop_{W}@{k}:{k}", c, f"on the KAI of {n}")
+    finish(p, "the core's share: loop with the wide core over the fine-tuned KAI alone (%)")
+    fig.suptitle("Time-extension test T1: training years x iterations of KAI, and the core on a long-trained KAI "
+                 "(5.625 deg, 119 forecasts of 2017)", fontsize=11, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(os.path.join(out, "fig_T1.png"), dpi=150)
+    plt.close(fig)
+
 
 def main(run, out):
     style()
     os.makedirs(out, exist_ok=True)
     fig_gap(run, out)
     fig_clim(run, out)
+    if os.path.exists(os.path.join(run, "breakdown_T1", "breakdown.json")):
+        fig_T1(run, out)
 
 
 if __name__ == "__main__":
