@@ -317,12 +317,16 @@ def _mem_core_class():
         hist = True  # the caller has to hand over the past
 
         def __init__(self, cfg, static, t6, mean, std, lat_deg, mem=8, mem_ch=24, mz=False, nomem=False,
-                     acc=(), acc_ch=12, kern=0, kern_ch=24, pacc=(), mem_enc=0):
+                     acc=(), acc_ch=12, kern=0, kern_ch=24, pacc=(), mem_enc=0, era=False):
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
             self.nomem = bool(nomem)  # control: the same sequence training, the memory state stays zero
             ng = N_GFEAT if cfg.gfeat else 0
-            self.net = Net(N_DYN + mem_ch + static.shape[0] + 4 + ng, N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
+            # ``era``: the time coordinate of the training period as one more input channel (see make_core);
+            # the caller sets ``self.era`` (B,) for a training batch, None = the end of the period (a forecast)
+            self.era_in, self.era = bool(era), None
+            self.net = Net(N_DYN + mem_ch + static.shape[0] + 4 + ng + int(self.era_in), N_DYN,
+                           _NetCfg(cfg.hidden, cfg.blocks))
             self.pacc, self.PD, self.pacc_off = tuple(float(t) for t in pacc), None, False
             if self.pacc:  # the physical tendency accumulated in time, a kernel per physical term, in the memory
                 if nomem or not ng:
@@ -444,6 +448,9 @@ def _mem_core_class():
             parts = [x, self.m, self.static.expand(B, -1, -1, -1), time_features(hours, H, W)]
             if self.cfg.gfeat:
                 parts.append(self.features(x) if g is None else g)
+            if self.era_in:
+                e = x.new_ones(B) if self.era is None else self.era.to(x)
+                parts.append(e.view(B, 1, 1, 1).expand(B, 1, H, W))
             return self.net.trunk(torch.cat(parts, 1))
 
         def tendency(self, x, hours, g=None):
@@ -495,7 +502,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
               nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
-              trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0):
+              trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -516,7 +523,12 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     ``core.features`` (operator_features) and fills ``core.gscale``. With ``mem`` the memory integrates G as well.
     ``trunk`` "unet" = the multi-scale trunk (UNetTrunk) with the widths ``unet_dims`` (fine to coarse) and
     ``blocks[0]`` residual blocks per level, instead of the plain ``hidden`` x ``blocks`` ResNet.
-    ``mem_enc`` (with mem) = hidden channels of a two-layer encoder of the memory's inputs (0 = one linear map)."""
+    ``mem_enc`` (with mem) = hidden channels of a two-layer encoder of the memory's inputs (0 = one linear map).
+    ``era`` (with mem; the time extension) = the time coordinate of the training period as one more input channel
+    of the trunk, -1 at the start of the period and +1 at its end (``core.era`` (B,), set by the training for
+    every batch; None = +1, the end of the period, which is what every forecast uses). A core trained on a long
+    period can then hold what changed over the period (the trend, the changes of the reanalysis) apart from the
+    dynamics instead of averaging over it."""
     from .dyncore import DynCore, DynCoreConfig
     if gfeat and hist and not mem:
         raise ValueError("the history core has no G(x) input; use mem for a memory of the physical terms")
@@ -524,6 +536,8 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
         raise ValueError("the accumulated memory and the memory kernel belong to the memory core (mem > 0)")
     if mem_enc and not mem:
         raise ValueError("the memory encoder belongs to the memory core (mem > 0)")
+    if era and not mem:
+        raise ValueError("the era input is built into the memory core (mem > 0)")
     if trunk not in ("res", "unet"):
         raise ValueError(trunk)
     if trunk == "unet":
@@ -533,7 +547,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
         core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch,
-                                 kern=kern, kern_ch=kern_ch, pacc=tuple(pacc), mem_enc=mem_enc)
+                                 kern=kern, kern_ch=kern_ch, pacc=tuple(pacc), mem_enc=mem_enc, era=era)
     else:
         core = (_hist_core_class() if hist else DynCore)(*args)
     if trunk == "unet":  # the same inputs and head, the multi-scale trunk in place of the plain ResNet

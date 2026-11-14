@@ -254,6 +254,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         opts.update(trunk=a.core_trunk, unet_dims=list(a.core_unet_dims))
     if a.core_mem_enc:
         opts["mem_enc"] = a.core_mem_enc
+    if a.core_era:  # only when asked for, as above
+        opts["era"] = True
     ck = None
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
@@ -331,6 +333,10 @@ def train(a, arm):
             inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
             inc = np.where(inc > 0, inc, 1.0)
         m = build_core(a, mean, std, inc, lat, load=False)
+        if a.init:  # fine-tuning of a trained core with the same options (its scale of the physical terms is kept)
+            ck0 = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location=dev, weights_only=False)
+            assert ck0["core_opts"] == m.opts, (ck0["core_opts"], m.opts)
+            m.load_state_dict(ck0["state"])
         m.grad_ckpt = bool(a.core_ckpt)  # the activations of a day are recomputed in the backward pass
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
@@ -356,6 +362,7 @@ def train(a, arm):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     years = sorted(trz)
+    era_in = is_core and getattr(m, "era_in", False)
     log, t0 = [], time.time()
 
     def batch(K):
@@ -369,6 +376,9 @@ def train(a, arm):
             doy.append(d)
         prev.clear()
         prev.append(torch.stack(pv).to(dev) if hist else None)
+        if era_in:  # the time coordinate of the training period: -1 at its start, +1 at its end
+            m.era = torch.tensor([2 * (int(y) + d / 365.25 - years[0]) / (years[-1] + 1 - years[0]) - 1
+                                  for y, d in zip(ys, doy)], dtype=torch.float32, device=dev)
         return torch.stack(xs).to(dev), torch.stack(tg).to(dev), torch.tensor(doy, device=dev)
 
     prev = [None]  # history cores: the state one step before the batch's start (memory cores: W steps, oldest first)
@@ -383,6 +393,8 @@ def train(a, arm):
 
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
+        if era_in:
+            m.era = None  # a forecast: the end of the training period
         with torch.no_grad():
             idx = np.arange(st if hist else 0, len(vaz) - st, max(1, (len(vaz) - st) // 64))[:64]
             tot = 0.0
@@ -1072,7 +1084,13 @@ def parser():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--rollout", type=int, nargs="+", default=[1],
                    help="position arms: rollout days of the training loss, a curriculum over the iterations")
-    p.add_argument("--init", default=None, help="position arms: start from this checkpoint tag (fine-tuning)")
+    p.add_argument("--init", default=None,
+                   help="start from this checkpoint tag (fine-tuning): position arms, or arm core with the same core "
+                        "options (e.g. the adaptation of a core trained on a long period to its last years)")
+    p.add_argument("--core-era", action="store_true",
+                   help="--core-mem: the core also gets the time coordinate of the training period as an input "
+                        "(-1 at its start, +1 at its end; forecasts use +1), so that a long period is not learned as "
+                        "one stationary climate")
     p.add_argument("--gate-lr", type=float, default=1e-2, help="arm gate: learning rate of the 67 mixing weights")
     p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
     p.add_argument("--blend-multi", nargs="*", default=[],
