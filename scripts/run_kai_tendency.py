@@ -252,6 +252,10 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         opts["gfeat"] = True
         if a.core_gsplit:  # only when asked for: the options of the cores trained before stay as they were
             opts["gsplit"] = True
+        if a.core_gboth:
+            opts["gsource"] = "both"
+        if a.core_nz:
+            opts["nz"] = a.core_nz
         if a.core_gdycore:  # only when asked for, as above
             opts["gsource"] = "dycore"
             if a.core_gbase:
@@ -281,7 +285,20 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         y = a.train_years[-1]
         yx = load_years(a, [y])[y]
         H, W = yx.shape[-2:]
-        if opts.get("gsource") == "dycore":
+        if opts.get("gsource") == "both" or opts.get("nz"):
+            from pgcfm.dycore_day import ComboFeatures, DycoreFeatures
+            xz = torch.from_numpy(zscore(yx[:1] if load else yx[::4], mean, std))
+            op = dy = None
+            if opts.get("gsource", "op") in ("op", "both"):
+                op = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN])
+            if opts.get("gsource", "op") in ("dycore", "both"):
+                dy = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64))
+                if not load:
+                    dy.scale = dy.estimate_scale(xz[:, DYN])
+            feats = ComboFeatures(op, dy, opts.get("nz", 0), seed=a.seed)
+            if not load:
+                feats.scale = feats.scale_buffer()
+        elif opts.get("gsource") == "dycore":
             from pgcfm.dycore_day import DycoreFeatures
             feats = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64))
             if not load:
@@ -299,8 +316,12 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             core.gscale.copy_(feats.scale)
         core.to(a.device)
         feats.to(a.device)
-        feats.scale = core.gscale  # after the move: the buffer the core now holds
-        core.features = feats if opts.get("gsource") == "dycore" else CachedFeatures(feats)  # dycore: own cache
+        if hasattr(feats, "set_scale"):  # the combined inputs: each part reads its slice of the core's buffer
+            feats.set_scale(core.gscale)
+        else:
+            feats.scale = core.gscale  # after the move: the buffer the core now holds
+        own_cache = opts.get("gsource") in ("dycore", "both") or opts.get("nz")
+        core.features = feats if own_cache else CachedFeatures(feats)
     return core.to(a.device)
 
 
@@ -387,9 +408,11 @@ def train(a, arm):
     sb_on = is_core and a.sb_members > 1
     sb_log = None
     if sb_on:
-        if getattr(m, "noise_head", None) is None:
-            raise ValueError("--sb-members needs the noise core (--core-gbase --core-noise)")
+        if getattr(m, "noise_head", None) is None and not getattr(m, "nz", 0):
+            raise ValueError("--sb-members needs a noise core (--core-gbase --core-noise, or --core-nz)")
         m.noise_on = True
+        if getattr(m, "nz", 0):
+            m.features.noise_on = True
     log, t0 = [], time.time()
 
     def batch(K):
@@ -422,6 +445,8 @@ def train(a, arm):
         m.eval()
         if sb_on:
             m.noise_on = False  # the validation loss is the deterministic step (dycore + correction)
+            if getattr(m, "nz", 0):
+                m.features.noise_on = False
         if era_in:
             m.era = None  # a forecast: the end of the training period
         with torch.no_grad():
@@ -439,6 +464,8 @@ def train(a, arm):
         m.train()
         if sb_on:
             m.noise_on = True
+            if getattr(m, "nz", 0):
+                m.features.noise_on = True
         return tot / len(idx)
 
     # --resume: the state of the training is saved at every log step (<tag>.part) and a training that was cut
@@ -516,19 +543,22 @@ def train(a, arm):
                 e2 = ((ym[:, :, None] - ym[:, None]).abs() / s_dyn[:, None, None]).sum((1, 2)) / (Mm * (Mm - 1))
                 crps = e1 - 0.5 * e2                                   # fair CRPS (B, K, 66, H, W)
                 loss = (crps * wl * keep_dyn).mean() * (66.0 / 65.0)
-                u = torch.stack([c[0] for c in m.ctrl_log], 1)
-                sg = torch.stack([c[1] for c in m.ctrl_log], 1)
+                has_ctrl = bool(m.ctrl_log)  # the dycore-base form: control u and noise scale sigma of every day
+                if has_ctrl:
+                    u = torch.stack([c[0] for c in m.ctrl_log], 1)
+                    sg = torch.stack([c[1] for c in m.ctrl_log], 1)
+                    kl_k = ((0.5 * u ** 2 / (sg ** 2 + (1e-3 * s_dyn) ** 2)) * wl * keep_dyn).mean((0, 2, 3, 4)) * (66.0 / 65.0)
                 m.ctrl_log = None
-                kl_k = ((0.5 * u ** 2 / (sg ** 2 + (1e-3 * s_dyn) ** 2)) * wl * keep_dyn).mean((0, 2, 3, 4)) * (66.0 / 65.0)
                 mu = ym.mean(1)
                 err2 = (((mu - tt) / s_dyn) ** 2 * wl * keep_dyn).mean((0, 2, 3, 4))
                 spr2 = ((ym.var(1, unbiased=True) / s_dyn ** 2) * wl * keep_dyn).mean((0, 2, 3, 4))
-                ssr = torch.sqrt((1 + 1 / Mm) * spr2 / (err2 + 1e-12))  # (K,)
-                sb_log = dict(crps=round(float(loss.detach()), 4), kl=[round(float(v), 3) for v in kl_k.detach()],
-                              ssr=[round(float(v), 3) for v in ssr.detach()],
-                              sigma=round(float((sg / s_dyn).detach()[:, :, scd].mean()), 3),
-                              ctrl=round(float((u / s_dyn).detach()[:, :, scd].abs().mean()), 3))
-                if a.sb_kl > 0:
+                ssr = torch.sqrt((1 + 1 / Mm) * spr2 / (err2 + 1e-12) + 1e-6)  # (K,); + eps: zero spread at the start
+                sb_log = dict(crps=round(float(loss.detach()), 4), ssr=[round(float(v), 3) for v in ssr.detach()])
+                if has_ctrl:
+                    sb_log.update(kl=[round(float(v), 3) for v in kl_k.detach()],
+                                  sigma=round(float((sg / s_dyn).detach()[:, :, scd].mean()), 3),
+                                  ctrl=round(float((u / s_dyn).detach()[:, :, scd].abs().mean()), 3))
+                if a.sb_kl > 0 and has_ctrl:
                     loss = loss + a.sb_lam * torch.relu(kl_k - a.sb_kl).mean()
                 if a.sb_ssr:
                     lo, hi = a.sb_ssr
@@ -1252,6 +1282,11 @@ def parser():
                    help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
     p.add_argument("--mem-freeze", action="store_true",
                    help="score: memory cores again without updating the memory after the IC")
+    p.add_argument("--core-gboth", action="store_true",
+                   help="--core-gfeat: G(x) AND the dycore's integrated hint as inputs (96 physical terms)")
+    p.add_argument("--core-nz", type=int, default=0,
+                   help="--core-gfeat: noise input channels next to the physical terms (new every day and member); train with "
+                        "--sb-members 2 (CRPS)")
     p.add_argument("--core-gdycore", action="store_true",
                    help="--core-gfeat: the 48 physical terms = the 24 h INTEGRATED increment of u, v, T, q by NeuralGCM's "
                         "dycore (dinosaur, T21 on the data grid) instead of the instantaneous operator tendency G(x)")

@@ -174,6 +174,7 @@ class DycoreFeatures:
         self.scale, self.clamp, self.inc_clamp = scale, clamp, inc_clamp
         self.key, self.val = None, None
         self.store, self.hits, self.pad = {}, 0, 8
+        self.noise_scale, self.noise_gen = None, None  # (1, 66, 1, 1) normalized amplitude of the input noise
         ci = contract.CHANNEL_INDEX
         self.full_of = {v: contract.level_slice(v) for v in ("z", "q", "t", "u", "v")}
         self.sp, self.msl = ci["sp"], ci["msl"]
@@ -184,7 +185,15 @@ class DycoreFeatures:
 
     def _integrate(self, x):
         """x (B, 66, H, W) torch normalized -> (raw48 SI per day (B, 48, H, W) numpy, inc66 normalized numpy)."""
-        xn = x.detach().cpu().double().numpy()
+        x = x.detach().cpu()
+        if self.noise_scale is not None:
+            # noise BEFORE the equations (owner 2026-11-15): the dycore integrates x + a xi, so the hint carries what
+            # the equations make of the perturbation in a day (unbalanced parts radiate away, unstable flow grows it)
+            F = self.torch.nn.functional
+            xi = self.torch.randn(x.shape, generator=self.noise_gen)
+            xi = F.avg_pool2d(F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect"), 3, 1) * 3.0
+            x = x + self.noise_scale * xi
+        xn = x.double().numpy()
         B = xn.shape[0]
         full = np.zeros((B, len(self.mean)) + xn.shape[-2:])
         full[:, self.dyn] = xn
@@ -257,3 +266,49 @@ class DycoreFeatures:
     def increment(self, x):
         _, inc = self._get(x)
         return self.torch.from_numpy(inc).to(x.dtype)
+
+
+class ComboFeatures:
+    """The core's feature inputs side by side: [G(x) (instantaneous operator, optional), the integrated hint
+    (dycore, optional), ``nz`` noise channels]. Noise: white N(0, 1) per channel and grid point, new at every call
+    (= every day and member) while ``noise_on``; zeros otherwise (a deterministic run of the same core)."""
+
+    def __init__(self, op=None, dy=None, nz: int = 0, seed: int = 0):
+        import torch
+        self.torch, self.op, self.dy, self.nz, self.noise_on = torch, op, dy, int(nz), False
+        self.gen = torch.Generator().manual_seed(seed)
+        self.key, self.val = None, None
+
+    @property
+    def n_nan(self):
+        return 0 if self.dy is None else self.dy.n_nan
+
+    def to(self, device):
+        if self.op is not None:
+            self.op.to(device)
+        return self
+
+    def set_scale(self, gscale):
+        """Split the core's buffer (1, C, 1, 1) back to the parts (a loaded core brings its own scales)."""
+        i = 0
+        for f in (self.op, self.dy):
+            if f is not None:
+                n = 48 if f is self.dy else gscale.shape[1] - self.nz - (48 if self.dy is not None else 0)
+                f.scale = gscale[:, i:i + n]
+                i += n
+
+    def scale_buffer(self):
+        parts = [f.scale for f in (self.op, self.dy) if f is not None]
+        if self.nz:
+            parts.append(self.torch.ones(1, self.nz, 1, 1))
+        return self.torch.cat([q.cpu().float() for q in parts], 1)
+
+    def __call__(self, x):
+        if self.key is not x:
+            parts = [f(x) for f in (self.op, self.dy) if f is not None]
+            if self.nz:
+                z = (self.torch.randn((x.shape[0], self.nz) + tuple(x.shape[-2:]), generator=self.gen)
+                     if self.noise_on else self.torch.zeros((x.shape[0], self.nz) + tuple(x.shape[-2:])))
+                parts.append(z.to(x.dtype).to(x.device))
+            self.key, self.val = x, self.torch.cat(parts, 1)
+        return self.val

@@ -52,6 +52,7 @@ class DynCoreConfig:
     bal_detach: bool = False  # the solver starts from x + c.detach(): c learns from the hydrostatic loss only
     gfeat: bool = False       # step 18: the discrete operator's tendency G(x) = -R0(x) as 48 extra input channels
     gsplit: bool = False      # gfeat: the 48 terms in two parts each (advection | forces, horizontal | vertical): 96
+    gextra: int = 0           # gfeat: further feature channels (the integrated hint next to G: 48; noise channels)
 
 
 BAL_DYN = LEVEL_DYN["z"] + LEVEL_DYN["t"]  # the channels head 1 may correct (the hydrostatic pair)
@@ -64,7 +65,8 @@ def n_gfeat(cfg) -> int:
     """Input channels of the physical terms: 0, 48 (gfeat) or 96 (gfeat with gsplit)."""
     if not cfg.gfeat:
         return 0
-    return (len(G_PARTS) if getattr(cfg, "gsplit", False) else len(G_EQS)) * len(contract.LEVELS_HPA)
+    return ((len(G_PARTS) if getattr(cfg, "gsplit", False) else len(G_EQS)) * len(contract.LEVELS_HPA)
+            + int(getattr(cfg, "gextra", 0)))
 
 
 class DynCore(nn.Module):

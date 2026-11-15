@@ -505,7 +505,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
               nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
               trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False,
-              gsplit: bool = False, gsource: str = "op", gbase: bool = False, noise: bool = False):
+              gsplit: bool = False, gsource: str = "op", gbase: bool = False, noise: bool = False, nz: int = 0):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -548,7 +548,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     if trunk == "unet":
         hidden = int(unet_dims[0])  # the width the head (and a long-memory term) reads
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
-                        gfeat=gfeat, gsplit=gsplit)
+                        gfeat=gfeat, gsplit=gsplit, gextra=(48 if gsource == "both" else 0) + int(nz))
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
         core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch,
@@ -566,11 +566,16 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     # the source of the physical terms (docs/kai_dycore_integration.md): "op" = the instantaneous operator tendency
     # G(x); "dycore" = the 24 h integration of the dry primitive equations by dinosaur (pgcfm.dycore_day); ``gbase``
     # (with "dycore") = that integration is also the base of the forecast step
-    if gsource not in ("op", "dycore") or (gsource == "dycore" and not gfeat) or (gbase and gsource != "dycore"):
+    # "both" = G(x) AND the integrated hint (96 physical terms); ``nz`` = noise channels next to them (owner
+    # 2026-11-15: G + hint + noise as the core's inputs, trained together): new white noise every day and member,
+    # the core learns what to make of it (dycore_day.ComboFeatures)
+    if (nz or gsource == "both") and (mem or hist or not gfeat):
+        raise ValueError("G + hint (+ noise) inputs are built for the plain core with gfeat")
+    if gsource not in ("op", "dycore", "both") or (gsource == "dycore" and not gfeat) or (gbase and gsource != "dycore"):
         raise ValueError(f"gsource {gsource} gbase {gbase} (dycore needs gfeat; gbase needs dycore)")
     if gbase and (mem or hist or substeps != 1):
         raise ValueError("gbase is built for the plain core, one step a day")
-    core.gsource, core.gbase = gsource, bool(gbase)
+    core.gsource, core.gbase, core.nz = gsource, bool(gbase), int(nz)
     if noise:  # the noise term of the Schroedinger-bridge core: a 1 x 1 head sigma(x) on the trunk (starts at ~0.3)
         if not gbase:
             raise ValueError("the noise term belongs to the dycore-base core (gbase)")

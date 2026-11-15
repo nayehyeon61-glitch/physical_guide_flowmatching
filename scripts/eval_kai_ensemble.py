@@ -28,6 +28,9 @@ def main():
     p.add_argument("--members", type=int, default=8)
     p.add_argument("--chunk", type=int, default=4, help="ICs per batch (x members)")
     p.add_argument("--json", default=None)
+    p.add_argument("--hint-noise", type=float, default=0.0,
+                   help="--tags of dycore-hint cores: noise of this many daily-increment std added to the state the dycore "
+                        "integrates (the core itself sees the clean state), new every day and member")
     a = p.parse_args()
     torch.set_num_threads(a.threads) if getattr(a, "threads", 0) else None
     torch.manual_seed(a.seed)
@@ -53,6 +56,12 @@ def main():
     for tag, m_ in [(t, M) for t in a.tags] + [(t, 1) for t in a.det]:
         core = R.build_core(a, mean, std, inc, lat, load=True, tag=tag)
         core.noise_on = m_ > 1
+        if getattr(core, "nz", 0):
+            core.features.noise_on = m_ > 1
+        if a.hint_noise > 0 and m_ > 1:
+            keep = torch.ones(len(DYN)); keep[DYN.index(TISR)] = 0
+            core.features.noise_scale = (a.hint_noise * core.t6.cpu() * keep.view(1, -1, 1, 1)).float()
+            core.features.noise_gen = torch.Generator().manual_seed(a.seed)
         acc = {k: 0.0 for k in ("crps", "mse", "var", "acc_n", "acc_p", "acc_t", "act_m", "act_e", "act_t", "vmse", "vvar")}
         for i in range(0, len(ics), a.chunk):
             j = ics[i:i + a.chunk]
