@@ -254,6 +254,7 @@ def fig_T3(run, out):
     p = ax[0, 1]
     for tag, c, name, mk in cores[1:]:
         gain(p, tag, cores[0][0], c, name, mk)
+    p.set_ylim(None, 1.33 * p.get_ylim()[1])  # room for the legend above the lines
     finish(p, "core alone: gain over the 4-year core, 3000 it (%)")
 
     p = ax[1, 0]
