@@ -140,6 +140,8 @@ class DynCore(nn.Module):
             d = h * self.features.increment(x) * self.keep
             k1 = self.tendency(x, t, g)
             k2 = self.tendency(x + d + h * k1, t + HOURS_PER_STEP * h, g)
+            if getattr(self, "ctrl_log", None) is not None:  # the control of the step (the Schroedinger-bridge loss)
+                self.ctrl_log.append(0.5 * h * (k1 + k2))
             return x + d + 0.5 * h * (k1 + k2)
         if self.cfg.balance and i == 0:
             k1, xb = self.heads(x, t, g)

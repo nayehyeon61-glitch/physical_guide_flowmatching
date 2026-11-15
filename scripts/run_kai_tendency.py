@@ -323,7 +323,7 @@ def train(a, arm):
     rng = np.random.default_rng(a.seed)
     tr = load_years(a, a.train_years)
     va = load_years(a, [a.val_year])[a.val_year]
-    mean, std, inc, _ = stats(a, tr)
+    mean, std, inc, clim_phys = stats(a, tr)
     lat = lat_of(os.path.join(a.data, f"{a.val_year}.nc"), va.shape[-2], a.era5)
     dev = torch.device(a.device)
     if isinstance(va, np.memmap):  # a fine grid (or --lazy): the years stay on disk, normalized per batch
@@ -375,6 +375,12 @@ def train(a, arm):
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     years = sorted(trz)
     era_in = is_core and getattr(m, "era_in", False)
+    sb_on = is_core and (a.sb_eps > 0 or a.sb_act > 0 or a.sb_act_hi > 0)
+    sb_log = None
+    if sb_on:
+        if not getattr(m, "gbase", False):
+            raise ValueError("--sb-eps / --sb-act need the forecast-base core (--core-gbase): the control is its correction")
+        clim_z = torch.from_numpy(zscore(clim_phys, mean, std))[:, DYN].to(dev)  # (366, 66, H, W) normalized
     log, t0 = [], time.time()
 
     def batch(K):
@@ -438,6 +444,8 @@ def train(a, arm):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         x, tg, doy = batch(K)
         if is_core:
+            if sb_on:
+                m.ctrl_log = []
             y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
             if getattr(m, "mz", False):
@@ -480,6 +488,32 @@ def train(a, arm):
                         loss = loss + a.mz_acc_orth * (c[scd] ** 2).mean()
             else:
                 loss = ((err ** 2) * wl).mean()
+            if sb_on:
+                # the Schroedinger-bridge form with inequality constraints (docs/kai_dycore_integration.md, owner
+                # 2026-11-15): the dycore's day is the reference process, the core's correction u_k the control.
+                # SB = the path closest to the reference (KL = control energy) that meets the data's marginals; here
+                # deterministic: the marginals are the rollout MSE of days 1..K, and the KL enters as an INEQUALITY,
+                # the control energy of every day below the budget eps (hinge), plus the activity of every day above
+                # the floor (no damping toward climatology)
+                ctrl = torch.stack(m.ctrl_log, 1)  # (B, K, 66, H, W) normalized per day
+                m.ctrl_log = None
+                e_k = (((ctrl / s_dyn) ** 2) * wl * keep_dyn).mean((0, 2, 3, 4)) * (66.0 / 65.0)  # (K,)
+                sb_log = dict(ctrl_e=[round(float(v), 4) for v in e_k.detach()])
+                if a.sb_eps > 0:
+                    loss = loss + a.sb_lam * torch.relu(e_k - a.sb_eps).mean()
+                if a.sb_act > 0:
+                    cz = torch.stack([clim_z[(doy + (k + 1) * st) % len(clim_z)] for k in range(K)], 1)  # (B, K, 66, H, W)
+                    def _sd(z):  # area-weighted spatial std of the anomaly per (B, K, channel)
+                        mu = (z * wl).mean((-2, -1), keepdim=True)
+                        return torch.sqrt((((z - mu) ** 2) * wl).mean((-2, -1)) + 1e-12)
+                    act = (_sd(y - cz) / _sd(tg[:, :, dyn] - cz))[:, :, scd].mean((0, 2))  # (K,)
+                    sb_log["act"] = [round(float(v), 3) for v in act.detach()]
+                    # a band, both sides: the dycore base starts ABOVE the truth's activity (1.2-1.8 at days 1-3 in the
+                    # smoke test: the dry dycore keeps noise and waves that the real atmosphere damps)
+                    band = torch.relu(a.sb_act - act) ** 2
+                    if a.sb_act_hi > 0:
+                        band = band + torch.relu(act - a.sb_act_hi) ** 2
+                    loss = loss + a.sb_act_lam * band.mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
         elif K == 1:
@@ -494,6 +528,8 @@ def train(a, arm):
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
+            if sb_log is not None:  # control energy and activity per rollout day of the last batch
+                log[-1].update(sb_log)
             if dev.type == "cuda":  # peak GPU memory since the start (training step and validation)
                 log[-1]["gpu_gb"] = round(torch.cuda.max_memory_allocated(dev) / 2 ** 30, 2)
             if is_core and orth_log is not None:  # residual correlation at lag 1, 2 in the last batch's sequences
@@ -1216,6 +1252,14 @@ def parser():
                    help="JUMPS:DAILY, JUMPS = long-scale core tags joined by '+': every lead is made of the largest "
                         "steps first, DAILY (a core tag or a scored position tag) takes the single days; "
                         "scored as hier_JUMPS+DAILY")
+    p.add_argument("--sb-eps", type=float, default=0.0,
+                   help="--core-gbase: Schroedinger-bridge inequality, budget of the daily control energy (the core's correction "
+                        "in units of the daily increment std, squared, area mean); hinge on every rollout day; 0 = off")
+    p.add_argument("--sb-lam", type=float, default=1.0, help="weight of the control-energy hinge")
+    p.add_argument("--sb-act", type=float, default=0.0,
+                   help="--core-gbase: activity floor of every rollout day (spatial std of the forecast anomaly / the truth's); 0 = off")
+    p.add_argument("--sb-act-hi", type=float, default=0.0, help="activity ceiling of every rollout day; 0 = none")
+    p.add_argument("--sb-act-lam", type=float, default=1.0, help="weight of the activity hinge (squared)")
     p.add_argument("--core-zm", type=float, default=0.0, help="weight of a zonal-mean error term in the core loss")
     p.add_argument("--score-cores", nargs="*", default=None, help="core tags to score alone (default: --core-tag)")
     p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 3, 4], help="core rollout days")
