@@ -173,6 +173,7 @@ class DycoreFeatures:
         self.day = DinosaurDay(np.asarray(orog_geopot, np.float64), layers=layers, dt_minutes=dt_minutes, hours=hours)
         self.scale, self.clamp, self.inc_clamp = scale, clamp, inc_clamp
         self.key, self.val = None, None
+        self.store, self.hits, self.pad = {}, 0, 8
         ci = contract.CHANNEL_INDEX
         self.full_of = {v: contract.level_slice(v) for v in ("z", "q", "t", "u", "v")}
         self.sp, self.msl = ci["sp"], ci["msl"]
@@ -208,8 +209,37 @@ class DycoreFeatures:
 
     def _get(self, x):
         if self.key is not x:
-            self.key, self.val = x, self._integrate(x)
+            self.key, self.val = x, (self._lookup(x) if self.store else self._integrate(x))
         return self.val
+
+    # ---- a store of the integrated hint of DATA states (a memory core warms its memory up on the W days before
+    # the IC: data states, the same every time they are drawn; only the rollout's own states need a new integration)
+    @staticmethod
+    def _keys(x):
+        a = np.ascontiguousarray(x.detach().cpu().float().numpy())
+        return [hash(r.tobytes()) for r in a]
+
+    def prefill(self, states, chunk: int = 8):
+        """Integrate the data ``states`` (N, 66, H, W) once and keep their hint (48 channels, float32) by content."""
+        for i in range(0, states.shape[0], chunk):
+            xs = states[i:i + chunk]
+            raw, _ = self._integrate(xs)
+            for k, r in zip(self._keys(xs), raw):
+                self.store[k] = r.astype(np.float32)
+
+    def _lookup(self, x):
+        keys = self._keys(x)
+        miss = [i for i, k in enumerate(keys) if k not in self.store]
+        raw = np.zeros((len(keys), 48) + tuple(x.shape[-2:]))
+        for i, k in enumerate(keys):
+            if k in self.store:
+                raw[i] = self.store[k]
+        self.hits += len(keys) - len(miss)
+        if miss:
+            n, B = len(miss), self.pad
+            idx = miss + [miss[-1]] * ((-n) % B)  # fixed batch sizes: every new shape is a new JAX compilation
+            raw[miss] = self._integrate(x[idx])[0][:n]
+        return raw, None  # no increment from the store: the forecast-base form does not use it
 
     def estimate_scale(self, states, chunk: int = 8):
         sq, n = 0.0, 0

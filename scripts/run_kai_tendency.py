@@ -351,6 +351,13 @@ def train(a, arm):
             ck0 = torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location=dev, weights_only=False)
             assert ck0["core_opts"] == m.opts, (ck0["core_opts"], m.opts)
             m.load_state_dict(ck0["state"])
+        if a.core_mem and getattr(m, "gsource", "op") == "dycore" and not getattr(m, "gbase", False):
+            # a memory core draws W data days before every IC: their dycore integration is done once here
+            tp = time.time()
+            for y in trz:
+                m.features.prefill(trz[y][:, DYN])
+            m.features.prefill(vaz[:, DYN])
+            print(json.dumps(dict(dycore_prefill_states=len(m.features.store), sec=round(time.time() - tp))), flush=True)
         m.grad_ckpt = bool(a.core_ckpt)  # the activations of a day are recomputed in the backward pass
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
@@ -540,6 +547,8 @@ def train(a, arm):
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
+            if is_core and getattr(getattr(m, "features", None), "store", None):  # states served by the dycore store
+                log[-1]["dycore_hits"] = m.features.hits
             if sb_log is not None:  # control energy and activity per rollout day of the last batch
                 log[-1].update(sb_log)
             if dev.type == "cuda":  # peak GPU memory since the start (training step and validation)
