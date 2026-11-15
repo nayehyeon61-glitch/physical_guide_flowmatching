@@ -76,6 +76,16 @@ def boot_gain(ma, mb, n=400, seed=0):
     return gain, (hi < 0) | (lo > 0)
 
 
+def terms2(raw, k):
+    """(L, 67, 3): bias, s_o^2 (1 - r^2) (pattern = information), s_o^2 (a - r)^2 (amplitude cost) of arm k, mean
+    over the forecasts; the three add up to the MSE."""
+    so2 = raw["climatology__dec"][..., 1].astype(np.float64)  # the truth's pattern variance (s_f = 0 there)
+    d, am = raw[f"{k}__dec"].astype(np.float64), raw[f"{k}__act"].astype(np.float64)
+    cov = am * so2 - d[..., 2] / 2
+    info = so2 - np.where(am > 1e-6, cov ** 2 / (am ** 2 * so2 + 1e-30), 0.0)
+    return np.stack([d[..., 0], info, d[..., 1] + d[..., 2] - info], -1).mean(0)
+
+
 def breakdown(S, raw, std, a, b):
     names = S["channels"]
     L = S["leads"]
@@ -121,15 +131,7 @@ def breakdown(S, raw, std, a, b):
         return (t[:, c] / (r[:, c, None] * std[c, None])).mean(1) / (r[:, c] / std[c]).mean(1)[:, None]
 
     if all(f"{k}__{m}" in raw for k in (a, b) for m in ("dec", "act")) and "climatology__dec" in raw:
-        so2 = raw["climatology__dec"][..., 1].astype(np.float64)  # the truth's pattern variance (s_f = 0 there)
-
-        def split(k):  # (L, 67, 3): bias, s_o^2 (1 - r^2), s_o^2 (a - r)^2, mean over the forecasts
-            d, am = raw[f"{k}__dec"].astype(np.float64), raw[f"{k}__act"].astype(np.float64)
-            cov = am * so2 - d[..., 2] / 2
-            info = so2 - np.where(am > 1e-6, cov ** 2 / (am ** 2 * so2 + 1e-30), 0.0)
-            return np.stack([d[..., 0], info, d[..., 1] + d[..., 2] - info], -1).mean(0)
-
-        sa, sb = split(a), split(b)
+        sa, sb = terms2(raw, a), terms2(raw, b)
         out["dterm2_pct"] = contrib(sa, sb, sc)
         out["term2_share"] = {a: share(sa, ra, sc), b: share(sb, rb, sc)}
         out["dterm2_group_pct"] = {g: contrib(sa, sb, np.array(c)) for g, c in groups.items()}
