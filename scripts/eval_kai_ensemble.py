@@ -93,7 +93,7 @@ def main():
                          "crps": ((acc["crps"] / n)[:, vi[q]] * vstd[q]).tolist()} for q, v in enumerate(VARS)},
             "nan_states": int(getattr(core.features, "n_nan", 0)), "members": m_,
         }
-        res["arms"][tag] = out
+        res["arms"][tag if m_ > 1 else tag + "~det"] = out  # ~det: one run without noise
         print(tag, "crps", [round(v, 4) for v in out["crps"]], "\n  nrmse", [round(v, 3) for v in out["nrmse_mean"]],
               "\n  ssr", [round(v, 2) for v in out["ssr"]], "\n  acc", [round(v, 3) for v in out["acc_mean"]],
               "\n  act member", [round(v, 2) for v in out["activity_member"]], "mean", [round(v, 2) for v in out["activity_mean"]], flush=True)
