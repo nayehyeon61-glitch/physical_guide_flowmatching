@@ -50,11 +50,20 @@ class DynCoreConfig:
     balance: bool = False     # head 1: a correction c(x) of z and t (hydrostatic structure) before every step
     bal_detach: bool = False  # the solver starts from x + c.detach(): c learns from the hydrostatic loss only
     gfeat: bool = False       # step 18: the discrete operator's tendency G(x) = -R0(x) as 48 extra input channels
+    gsplit: bool = False      # gfeat: the 48 terms in two parts each (advection | forces, horizontal | vertical): 96
 
 
 BAL_DYN = LEVEL_DYN["z"] + LEVEL_DYN["t"]  # the channels head 1 may correct (the hydrostatic pair)
 G_EQS = ("u", "v", "T", "q")  # prognostic equations whose operator tendency becomes a feature
 N_GFEAT = len(G_EQS) * len(contract.LEVELS_HPA)  # 48
+G_PARTS = primitive.TENDENCY_PARTS  # cfg.gsplit: the same tendencies in two parts each (96 physical terms)
+
+
+def n_gfeat(cfg) -> int:
+    """Input channels of the physical terms: 0, 48 (gfeat) or 96 (gfeat with gsplit)."""
+    if not cfg.gfeat:
+        return 0
+    return (len(G_PARTS) if getattr(cfg, "gsplit", False) else len(G_EQS)) * len(contract.LEVELS_HPA)
 
 
 class DynCore(nn.Module):
@@ -77,12 +86,12 @@ class DynCore(nn.Module):
         keep = torch.ones(N_DYN)
         keep[TISR_DYN] = 0
         self.register_buffer("keep", keep.view(1, N_DYN, 1, 1))
-        self.net = Net(N_DYN + static.shape[0] + 4 + (N_GFEAT if cfg.gfeat else 0), N_DYN,
+        self.net = Net(N_DYN + static.shape[0] + 4 + n_gfeat(cfg), N_DYN,
                        _NetCfg(cfg.hidden, cfg.blocks))
         self.pm = PositiveMass(mean, std, lat_deg) if cfg.positive else None
         self.features = None  # cfg.gfeat: an OperatorFeatures callable x -> G(x) (attached after construction)
         if cfg.gfeat:
-            self.register_buffer("gscale", torch.ones(1, N_GFEAT, 1, 1))
+            self.register_buffer("gscale", torch.ones(1, n_gfeat(cfg), 1, 1))
         if cfg.balance:
             self.bal_head = nn.Conv2d(cfg.hidden, len(BAL_DYN), 1)
             nn.init.zeros_(self.bal_head.weight)
@@ -194,6 +203,11 @@ class StrongPhysics:
         R = pgrid.strong_residuals(F, self.guide.grid(x.device), tendencies=tend)
         return R, self.guide.mask(x, x, orog)
 
+    def parts(self, x: torch.Tensor, orog: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """The operator's tendency in parts (primitive.tendency_parts) at x (N, 66, H, W), collocation mask."""
+        F = self.guide.to_si(x, orog)
+        return pgrid.strong_parts(F, self.guide.grid(x.device)), self.guide.mask(x, x, orog)
+
     def mean_squares(self, R: Dict[str, torch.Tensor], mask: torch.Tensor,
                      scales: Optional[primitive.ResidualScales] = None) -> Dict[str, torch.Tensor]:
         """Weighted mean of (R_j / b_j)^2 per equation (1 = ERA5's level), kept in the graph."""
@@ -250,8 +264,9 @@ class OperatorFeatures:
     scale of an unweighted RMS; their values are kept, clamped)."""
 
     def __init__(self, phys: StrongPhysics, orog: torch.Tensor, scale: Optional[torch.Tensor] = None,
-                 clamp: float = 5.0):
+                 clamp: float = 5.0, split: bool = False):
         self.phys, self.orog, self.scale, self.clamp = phys, orog[:1], scale, clamp
+        self.split = bool(split)  # the 48 terms in two parts each (G_PARTS: 96 channels, each with its own scale)
         rows = phys.guide.grid(orog.device).lat_rows
         self.H = orog.shape[-2]
         self.rows = None if len(rows) == self.H else rows  # None = no pole rows (the residual rows are all rows)
@@ -272,7 +287,11 @@ class OperatorFeatures:
 
     def raw(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """(-R0 (B, 48, H, W) float64, valid-point mask (B, 48, H, W))."""
-        R0, m = self.phys.residuals(x, self.orog.expand(x.shape[0], -1, -1, -1), torch.zeros_like(x))
+        orog = self.orog.expand(x.shape[0], -1, -1, -1)
+        if self.split:
+            P, m = self.phys.parts(x, orog)
+            return self._full(torch.cat([P[q] for q in G_PARTS], 1)), self._full(m.repeat(1, len(G_PARTS), 1, 1))
+        R0, m = self.phys.residuals(x, orog, torch.zeros_like(x))
         return self._full(-torch.cat([R0[q] for q in G_EQS], 1)), self._full(m.repeat(1, len(G_EQS), 1, 1))
 
     def estimate_scale(self, states: torch.Tensor, chunk: int = 8) -> torch.Tensor:

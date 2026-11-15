@@ -92,6 +92,41 @@ def material_derivative(F: Fields, name: str, phi: torch.Tensor, const: Constant
     return out if ds is None else out + ds
 
 
+TENDENCY_PARTS = ("u_adv", "u_frc", "v_adv", "v_frc", "T_h", "T_v", "q_h", "q_v")
+
+
+def tendency_parts(F: Fields, phi: torch.Tensor, p: torch.Tensor, const: Constants = CONST,
+                   virtual: bool = True) -> Dict[str, torch.Tensor]:
+    """The tendency-free operator's tendency -R_j (no d_s X, no closures) of u, v, T, q in two parts each:
+
+    u, v: ``adv`` = minus the advection (horizontal and vertical), ``frc`` = Coriolis (with the metric term) and
+          pressure-gradient force, the two large terms that nearly cancel (the ageostrophic acceleration);
+    T:    ``h`` = minus the horizontal advection, ``v`` = the vertical term omega (R Tv / (cp p) - dT/dp)
+          (static stability times omega);
+    q:    ``h`` / ``v`` = minus the horizontal / the vertical advection.
+    u_adv + u_frc = -R_u of ``residuals`` and so on: the split adds no physics, it lets a network weight the
+    parts apart (the refined physical terms of the tendency core)."""
+    a, rd, cp = const.earth_radius, const.r_dry, const.cp_dry
+    cos, tan = torch.cos(phi), torch.tan(phi)
+    f = F["f"] if "f" in F else coriolis(phi, const)
+    f_eff = f + F["u"] * tan / a
+    tv = virtual_temperature(F, virtual)
+    omega = F.get("omega", torch.zeros_like(F["T"]))
+
+    def hadv(name):
+        return (F["u"] / (a * cos)) * F[f"dlam_{name}"] + (F["v"] / a) * F[f"dphi_{name}"]
+
+    def vadv(name):
+        return omega * F[f"dp_{name}"] if "omega" in F else torch.zeros_like(F[name])
+
+    out = {"u_adv": -(hadv("u") + vadv("u")), "u_frc": f_eff * F["v"] - F["dlam_Phi"] / (a * cos),
+           "v_adv": -(hadv("v") + vadv("v")), "v_frc": -f_eff * F["u"] - F["dphi_Phi"] / a,
+           "T_h": -hadv("T"), "T_v": rd * tv * omega / (cp * p) - vadv("T")}
+    if "q" in F and "dlam_q" in F:
+        out["q_h"], out["q_v"] = -hadv("q"), -vadv("q")
+    return out
+
+
 def residuals(F: Fields, phi: torch.Tensor, p: torch.Tensor, const: Constants = CONST,
               closures: Optional[Closures] = None, virtual: bool = True,
               hydrostatic_in_kelvin: bool = True) -> Dict[str, torch.Tensor]:

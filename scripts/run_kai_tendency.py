@@ -250,6 +250,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["pacc"] = list(a.core_pacc)
     if a.core_gfeat:
         opts["gfeat"] = True
+        if a.core_gsplit:  # only when asked for: the options of the cores trained before stay as they were
+            opts["gsplit"] = True
     if a.core_trunk != "res":  # only when asked for: the options of the cores trained before stay as they were
         opts.update(trunk=a.core_trunk, unet_dims=list(a.core_unet_dims))
     if a.core_mem_enc:
@@ -275,12 +277,13 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         H, W = yx.shape[-2:]
         if load or not isinstance(yx, np.memmap) or H * W <= 8192:
             xz = torch.from_numpy(zscore(yx[:1] if load else yx[::4], mean, std))
-            feats = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN])
+            feats = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN],
+                                      split=bool(opts.get("gsplit")))
         else:  # a fine grid: the states of the scale estimate are read a few at a time
             idx = np.arange(0, len(yx), 4)
             states = Lazy(lambda i: torch.from_numpy(zscore(np.asarray(yx[idx[i]]), mean, std))[:, DYN], len(idx))
             feats = operator_features(mean, std, torch.from_numpy(zscore(yx[:1], mean, std)), states=states,
-                                      chunk=max(1, 8 * 8192 // (H * W)))
+                                      chunk=max(1, 8 * 8192 // (H * W)), split=bool(opts.get("gsplit")))
         if not load:
             core.gscale.copy_(feats.scale)
         core.to(a.device)
@@ -1187,6 +1190,10 @@ def parser():
                    help="the physical terms: the primitive-equation operator's tendency G(x) of u, v, T, q on the 12 "
                         "levels as 48 input channels of the core (step 18); with --core-mem the memory integrates "
                         "G(x) of the past days as well (memory terms of the physical terms)")
+    p.add_argument("--core-gsplit", action="store_true",
+                   help="--core-gfeat: the 48 physical terms in two parts each, 96 input channels: u, v = advection | "
+                        "Coriolis + pressure-gradient force; T, q = horizontal advection | vertical term "
+                        "(the refined physical terms; the parts add up to G(x))")
     p.add_argument("--core-hist", action="store_true",
                    help="the core also gets the state one step before (the observed trend) as input")
     p.add_argument("--core-stride", type=int, default=1,

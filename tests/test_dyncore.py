@@ -125,3 +125,29 @@ def test_balance_head_starts_at_zero_and_corrects_only_z_and_t():
     other = [i for i in range(N) if i not in BAL_DYN]
     assert torch.equal(xb[:, 0, other], x0[:, other])
     assert not torch.allclose(xb[:, 0, BAL_DYN], x0[:, BAL_DYN])
+
+
+def test_split_physical_terms_add_up_to_the_operator_tendency():
+    """gsplit: the 96 parts (advection | forces, horizontal | vertical) are the 48 terms G = -R0 in two parts each."""
+    from pgcfm.dyncore import G_EQS, G_PARTS, OperatorFeatures, n_gfeat
+    _, phys, _, _ = _setup()
+    torch.manual_seed(0)
+    x = 0.3 * torch.randn(2, N, 32, 64)
+    orog = torch.zeros(1, 1, 32, 64)
+    R, _ = phys.residuals(x, orog.expand(2, -1, -1, -1), torch.zeros_like(x))
+    P, _ = phys.parts(x, orog.expand(2, -1, -1, -1))
+    assert tuple(G_PARTS) == ("u_adv", "u_frc", "v_adv", "v_frc", "T_h", "T_v", "q_h", "q_v")
+    for eq, (a, b) in zip(G_EQS, (("u_adv", "u_frc"), ("v_adv", "v_frc"), ("T_h", "T_v"), ("q_h", "q_v"))):
+        assert torch.allclose(P[a] + P[b], -R[eq], rtol=1e-9, atol=1e-12 * float(R[eq].abs().max()))
+        assert float(P[a].abs().max()) > 0 and float(P[b].abs().max()) > 0
+    whole, parts = OperatorFeatures(phys, orog), OperatorFeatures(phys, orog, split=True)
+    g48, m48 = whole.raw(x)
+    g96, m96 = parts.raw(x)
+    L = len(contract.LEVELS_HPA)
+    assert g48.shape[1] == len(G_EQS) * L and g96.shape[1] == len(G_PARTS) * L and m96.shape == g96.shape
+    assert torch.allclose(g96.view(2, 4, 2, L, 32, 64).sum(2).view_as(g48), g48, rtol=1e-9,
+                          atol=1e-12 * float(g48.abs().max()))
+    parts.scale = parts.estimate_scale(x)
+    assert parts.scale.shape == (1, 96, 1, 1) and parts(x).shape == (2, 96, 32, 64)
+    assert n_gfeat(DynCoreConfig(gfeat=True)) == 48 and n_gfeat(DynCoreConfig(gfeat=True, gsplit=True)) == 96
+    assert n_gfeat(DynCoreConfig()) == 0

@@ -308,7 +308,7 @@ def _mem_core_class():
     stays dx/dt = f(x, G(x), m). The kernel cannot fall back to one day (tau >= PACC_TAU[0]); P and D are fed in
     a rollout as well (G and the trend of the core's own states), E fades there with its kernel (e = 0).
     ``pacc_off`` (diagnostic) = "all" / "phys" (P, D) / "innov" (E) held at zero."""
-    from .dyncore import DynCore, Net, _NetCfg, G_EQS, N_DYN, N_GFEAT
+    from .dyncore import DynCore, Net, _NetCfg, G_EQS, N_DYN, n_gfeat
     from .core import time_features
     from .coupling import LEVEL_DYN
     eq_idx = sum((LEVEL_DYN[{"T": "t"}.get(e, e)] for e in G_EQS), [])  # the channel of every physical term
@@ -321,7 +321,7 @@ def _mem_core_class():
             super().__init__(cfg, static, t6, mean, std, lat_deg)
             self.mem, self.mem_ch, self.mz = int(mem), int(mem_ch), bool(mz)
             self.nomem = bool(nomem)  # control: the same sequence training, the memory state stays zero
-            ng = N_GFEAT if cfg.gfeat else 0
+            ng = n_gfeat(cfg)
             # ``era``: the time coordinate of the training period as one more input channel (see make_core);
             # the caller sets ``self.era`` (B,) for a training batch, None = the end of the period (a forecast)
             self.era_in, self.era = bool(era), None
@@ -331,6 +331,8 @@ def _mem_core_class():
             if self.pacc:  # the physical tendency accumulated in time, a kernel per physical term, in the memory
                 if nomem or not ng:
                     raise ValueError("the accumulated physical tendency needs the memory and the physical terms")
+                if getattr(cfg, "gsplit", False):
+                    raise ValueError("the accumulated physical tendency is defined for the 48 terms (no gsplit)")
                 lo, hi = PACC_TAU
                 if not all(lo < t < hi for t in self.pacc):
                     raise ValueError(f"time constants of the accumulated physical tendency: {lo} < tau < {hi} days")
@@ -502,7 +504,8 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               hidden: int = 48, blocks=(2, 2), norm: str = "bn", substeps: int = 1, stride: int = 1,
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
               nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
-              trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False):
+              trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False,
+              gsplit: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -530,6 +533,8 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     period can then hold what changed over the period (the trend, the changes of the reanalysis) apart from the
     dynamics instead of averaging over it."""
     from .dyncore import DynCore, DynCoreConfig
+    if gsplit and not gfeat:
+        raise ValueError("gsplit splits the physical terms of gfeat")
     if gfeat and hist and not mem:
         raise ValueError("the history core has no G(x) input; use mem for a memory of the physical terms")
     if (len(acc) or kern or len(pacc)) and not mem:
@@ -543,7 +548,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     if trunk == "unet":
         hidden = int(unet_dims[0])  # the width the head (and a long-memory term) reads
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
-                        gfeat=gfeat)
+                        gfeat=gfeat, gsplit=gsplit)
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
         core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch,
@@ -575,19 +580,21 @@ class CachedFeatures:
 
 
 def operator_features(mean, std, x_full: torch.Tensor, states: Optional[torch.Tensor] = None, scale=None,
-                      device=None, chunk: int = 8):
+                      device=None, chunk: int = 8, split: bool = False):
     """Step 18's operator features on KAI's daily contract: G(x) = -R0(x), the discrete primitive-equation
     operator's own tendency of (u, v, T, q) on the 12 levels (48 physical terms) at a normalized state of the 66
     dynamic channels. ``x_full`` (>= 1, 67, H, W) normalized: its orography channel is the lower boundary.
     ``states`` (N, 66, H, W): estimate the per-channel scale (RMS of G over the valid points) from them, ``chunk``
-    states at a time (anything with .shape[0] and slices that give tensors: a fine grid is read from disk)."""
+    states at a time (anything with .shape[0] and slices that give tensors: a fine grid is read from disk).
+    ``split`` (a core with ``gsplit``): the same tendencies in two parts each, 96 physical terms (dyncore.G_PARTS)."""
     from .coupling import PhysicsConfig, PhysicsGuide
     from .dyncore import OperatorFeatures, StrongPhysics
     H, W = x_full.shape[-2:]
     guide = PhysicsGuide(H, W, mean, std, PhysicsConfig(dt_seconds=24 * 3600.0))
     for q in guide.parameters():
         q.requires_grad_(False)
-    feats = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC)), x_full[:1, [OROG]].float(), scale)
+    feats = OperatorFeatures(StrongPhysics(guide, torch.ones(contract.N_DYNAMIC)), x_full[:1, [OROG]].float(), scale,
+                             split=split)
     if states is not None:
         feats.scale = feats.estimate_scale(states, chunk)
     if device is not None:  # after the scale estimate (CPU states): the operator follows the core to its device

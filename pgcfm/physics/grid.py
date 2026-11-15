@@ -178,6 +178,19 @@ def strong_residuals(F: Fields, grid: SphereGrid, const: Constants = CONST,
     return primitive.residuals(D, grid.phi3(rows=True), grid.p3(), const, closures, virtual)
 
 
+def strong_parts(F: Fields, grid: SphereGrid, const: Constants = CONST, virtual: bool = True
+                 ) -> Dict[str, torch.Tensor]:
+    """primitive.tendency_parts on rows ``grid.lat_rows`` from gridded fields (as strong_residuals without
+    tendencies: omega is diagnosed from continuity if absent)."""
+    F = dict(F)
+    F.pop("sp", None)
+    if "omega" not in F:
+        F["omega"] = diagnose_omega(F, grid, const=const)
+    names = [n for n in ("u", "v", "T", "Phi", "q", "omega") if n in F]
+    D = _rows(_derivatives(F, grid, names), grid)
+    return primitive.tendency_parts(D, grid.phi3(rows=True), grid.p3(), const, virtual)
+
+
 def time_integrated_residuals(F0: Fields, F1: Fields, grid: SphereGrid, dt: float = CONST.dt_seconds,
                               n_sub: int = 4, const: Constants = CONST,
                               closures: Optional[primitive.Closures] = None,
