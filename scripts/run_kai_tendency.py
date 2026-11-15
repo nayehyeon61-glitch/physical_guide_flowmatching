@@ -256,6 +256,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["gsource"] = "dycore"
             if a.core_gbase:
                 opts["gbase"] = True
+                if a.core_noise:
+                    opts["noise"] = True
     if a.core_trunk != "res":  # only when asked for: the options of the cores trained before stay as they were
         opts.update(trunk=a.core_trunk, unet_dims=list(a.core_unet_dims))
     if a.core_mem_enc:
@@ -323,7 +325,7 @@ def train(a, arm):
     rng = np.random.default_rng(a.seed)
     tr = load_years(a, a.train_years)
     va = load_years(a, [a.val_year])[a.val_year]
-    mean, std, inc, clim_phys = stats(a, tr)
+    mean, std, inc, _ = stats(a, tr)
     lat = lat_of(os.path.join(a.data, f"{a.val_year}.nc"), va.shape[-2], a.era5)
     dev = torch.device(a.device)
     if isinstance(va, np.memmap):  # a fine grid (or --lazy): the years stay on disk, normalized per batch
@@ -375,12 +377,12 @@ def train(a, arm):
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
     years = sorted(trz)
     era_in = is_core and getattr(m, "era_in", False)
-    sb_on = is_core and (a.sb_eps > 0 or a.sb_act > 0 or a.sb_act_hi > 0)
+    sb_on = is_core and a.sb_members > 1
     sb_log = None
     if sb_on:
-        if not getattr(m, "gbase", False):
-            raise ValueError("--sb-eps / --sb-act need the forecast-base core (--core-gbase): the control is its correction")
-        clim_z = torch.from_numpy(zscore(clim_phys, mean, std))[:, DYN].to(dev)  # (366, 66, H, W) normalized
+        if getattr(m, "noise_head", None) is None:
+            raise ValueError("--sb-members needs the noise core (--core-gbase --core-noise)")
+        m.noise_on = True
     log, t0 = [], time.time()
 
     def batch(K):
@@ -411,6 +413,8 @@ def train(a, arm):
 
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
+        if sb_on:
+            m.noise_on = False  # the validation loss is the deterministic step (dycore + correction)
         if era_in:
             m.era = None  # a forecast: the end of the training period
         with torch.no_grad():
@@ -426,6 +430,8 @@ def train(a, arm):
                 tgt = vaz[j + st].to(dev)
                 tot += float(lp(one_step(vaz[j].to(dev), torch.tensor(j, device=dev), tgt, pv), tgt)) * len(j)
         m.train()
+        if sb_on:
+            m.noise_on = True
         return tot / len(idx)
 
     # --resume: the state of the training is saved at every log step (<tag>.part) and a training that was cut
@@ -444,8 +450,9 @@ def train(a, arm):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         x, tg, doy = batch(K)
         if is_core:
-            if sb_on:
+            if sb_on:  # every IC as --sb-members members (the same start, different noise)
                 m.ctrl_log = []
+                x, tg, doy = (v.repeat_interleave(a.sb_members, 0) for v in (x, tg, doy))
             y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
             if getattr(m, "mz", False):
@@ -489,31 +496,36 @@ def train(a, arm):
             else:
                 loss = ((err ** 2) * wl).mean()
             if sb_on:
-                # the Schroedinger-bridge form with inequality constraints (docs/kai_dycore_integration.md, owner
-                # 2026-11-15): the dycore's day is the reference process, the core's correction u_k the control.
-                # SB = the path closest to the reference (KL = control energy) that meets the data's marginals; here
-                # deterministic: the marginals are the rollout MSE of days 1..K, and the KL enters as an INEQUALITY,
-                # the control energy of every day below the budget eps (hinge), plus the activity of every day above
-                # the floor (no damping toward climatology)
-                ctrl = torch.stack(m.ctrl_log, 1)  # (B, K, 66, H, W) normalized per day
+                # the Schroedinger-bridge form with a noise term and inequality constraints
+                # (docs/kai_dycore_integration.md, owner 2026-11-15). Reference process P: dycore + noise sigma(x) xi
+                # (what the equations explain + what they do not); controlled process Q: + the core's correction u.
+                #   marginals : the members of every rollout day match the data            -> CRPS per day
+                #   KL(Q || P) = sum_k E[u_k^2 / (2 sigma_k^2)] (Girsanov, per day)         -> hinge above --sb-kl
+                #   range      : spread / error of every day inside [--sb-ssr lo hi]        -> hinge outside the band
+                Mm = a.sb_members
+                ym = y.view(-1, Mm, *y.shape[1:])                      # (B, M, K, 66, H, W)
+                tt = tg[::Mm][:, :, dyn]                               # (B, K, 66, H, W)
+                e1 = ((ym - tt[:, None]).abs() / s_dyn[:, None]).mean(1)
+                e2 = ((ym[:, :, None] - ym[:, None]).abs() / s_dyn[:, None, None]).sum((1, 2)) / (Mm * (Mm - 1))
+                crps = e1 - 0.5 * e2                                   # fair CRPS (B, K, 66, H, W)
+                loss = (crps * wl * keep_dyn).mean() * (66.0 / 65.0)
+                u = torch.stack([c[0] for c in m.ctrl_log], 1)
+                sg = torch.stack([c[1] for c in m.ctrl_log], 1)
                 m.ctrl_log = None
-                e_k = (((ctrl / s_dyn) ** 2) * wl * keep_dyn).mean((0, 2, 3, 4)) * (66.0 / 65.0)  # (K,)
-                sb_log = dict(ctrl_e=[round(float(v), 4) for v in e_k.detach()])
-                if a.sb_eps > 0:
-                    loss = loss + a.sb_lam * torch.relu(e_k - a.sb_eps).mean()
-                if a.sb_act > 0:
-                    cz = torch.stack([clim_z[(doy + (k + 1) * st) % len(clim_z)] for k in range(K)], 1)  # (B, K, 66, H, W)
-                    def _sd(z):  # area-weighted spatial std of the anomaly per (B, K, channel)
-                        mu = (z * wl).mean((-2, -1), keepdim=True)
-                        return torch.sqrt((((z - mu) ** 2) * wl).mean((-2, -1)) + 1e-12)
-                    act = (_sd(y - cz) / _sd(tg[:, :, dyn] - cz))[:, :, scd].mean((0, 2))  # (K,)
-                    sb_log["act"] = [round(float(v), 3) for v in act.detach()]
-                    # a band, both sides: the dycore base starts ABOVE the truth's activity (1.2-1.8 at days 1-3 in the
-                    # smoke test: the dry dycore keeps noise and waves that the real atmosphere damps)
-                    band = torch.relu(a.sb_act - act) ** 2
-                    if a.sb_act_hi > 0:
-                        band = band + torch.relu(act - a.sb_act_hi) ** 2
-                    loss = loss + a.sb_act_lam * band.mean()
+                kl_k = ((0.5 * u ** 2 / (sg ** 2 + (1e-3 * s_dyn) ** 2)) * wl * keep_dyn).mean((0, 2, 3, 4)) * (66.0 / 65.0)
+                mu = ym.mean(1)
+                err2 = (((mu - tt) / s_dyn) ** 2 * wl * keep_dyn).mean((0, 2, 3, 4))
+                spr2 = ((ym.var(1, unbiased=True) / s_dyn ** 2) * wl * keep_dyn).mean((0, 2, 3, 4))
+                ssr = torch.sqrt((1 + 1 / Mm) * spr2 / (err2 + 1e-12))  # (K,)
+                sb_log = dict(crps=round(float(loss.detach()), 4), kl=[round(float(v), 3) for v in kl_k.detach()],
+                              ssr=[round(float(v), 3) for v in ssr.detach()],
+                              sigma=round(float((sg / s_dyn).detach()[:, :, scd].mean()), 3),
+                              ctrl=round(float((u / s_dyn).detach()[:, :, scd].abs().mean()), 3))
+                if a.sb_kl > 0:
+                    loss = loss + a.sb_lam * torch.relu(kl_k - a.sb_kl).mean()
+                if a.sb_ssr:
+                    lo, hi = a.sb_ssr
+                    loss = loss + a.sb_ssr_lam * (torch.relu(lo - ssr) ** 2 + torch.relu(ssr - hi) ** 2).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
         elif K == 1:
@@ -1252,14 +1264,16 @@ def parser():
                    help="JUMPS:DAILY, JUMPS = long-scale core tags joined by '+': every lead is made of the largest "
                         "steps first, DAILY (a core tag or a scored position tag) takes the single days; "
                         "scored as hier_JUMPS+DAILY")
-    p.add_argument("--sb-eps", type=float, default=0.0,
-                   help="--core-gbase: Schroedinger-bridge inequality, budget of the daily control energy (the core's correction "
-                        "in units of the daily increment std, squared, area mean); hinge on every rollout day; 0 = off")
-    p.add_argument("--sb-lam", type=float, default=1.0, help="weight of the control-energy hinge")
-    p.add_argument("--sb-act", type=float, default=0.0,
-                   help="--core-gbase: activity floor of every rollout day (spatial std of the forecast anomaly / the truth's); 0 = off")
-    p.add_argument("--sb-act-hi", type=float, default=0.0, help="activity ceiling of every rollout day; 0 = none")
-    p.add_argument("--sb-act-lam", type=float, default=1.0, help="weight of the activity hinge (squared)")
+    p.add_argument("--core-noise", action="store_true",
+                   help="--core-gbase: the noise term sigma(x) xi of the Schroedinger-bridge core (a 1 x 1 head on the trunk)")
+    p.add_argument("--sb-members", type=int, default=1,
+                   help="--core-noise: members per IC in training (>= 2 switches the bridge loss on: CRPS per rollout day)")
+    p.add_argument("--sb-kl", type=float, default=0.0,
+                   help="inequality: daily KL of the controlled process to the reference (dycore + noise), u^2 / (2 sigma^2), "
+                        "hinge above this budget; 0 = off")
+    p.add_argument("--sb-lam", type=float, default=1.0, help="weight of the KL hinge")
+    p.add_argument("--sb-ssr", type=float, nargs=2, default=None, help="inequality: spread / error band of every rollout day")
+    p.add_argument("--sb-ssr-lam", type=float, default=1.0, help="weight of the spread / error band hinge (squared)")
     p.add_argument("--core-zm", type=float, default=0.0, help="weight of a zonal-mean error term in the core loss")
     p.add_argument("--score-cores", nargs="*", default=None, help="core tags to score alone (default: --core-tag)")
     p.add_argument("--curriculum", type=int, nargs="+", default=[1, 2, 3, 4], help="core rollout days")

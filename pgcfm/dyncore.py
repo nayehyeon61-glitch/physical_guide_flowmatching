@@ -24,6 +24,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from . import contract
@@ -138,11 +139,24 @@ class DynCore(nn.Module):
             # base of the step and the network gives the remaining tendency, Heun over the residual; zero head =
             # the dycore's forecast. D is computed without gradient (JAX), so the gradient reaches x only directly.
             d = h * self.features.increment(x) * self.keep
-            k1 = self.tendency(x, t, g)
+            hk = self._trunk(x, t, g)
+            k1 = self.net.head(hk) * self.t6 * self.keep
             k2 = self.tendency(x + d + h * k1, t + HOURS_PER_STEP * h, g)
-            if getattr(self, "ctrl_log", None) is not None:  # the control of the step (the Schroedinger-bridge loss)
-                self.ctrl_log.append(0.5 * h * (k1 + k2))
-            return x + d + 0.5 * h * (k1 + k2)
+            u = 0.5 * h * (k1 + k2)
+            sig = None
+            if getattr(self, "noise_head", None) is not None:
+                # the noise term (owner 2026-11-15): what the equations and the correction do not explain. sigma(x) >= 0
+                # per channel and grid point, in units of the daily increment std; xi = white noise smoothed over
+                # 3 x 3 cells (unit variance). Reference process = dycore + noise, controlled process = + u.
+                sig = F.softplus(self.noise_head(hk) + self.noise_bias) * self.t6 * self.keep
+            if getattr(self, "ctrl_log", None) is not None:  # control (and noise scale) of the step: the bridge loss
+                self.ctrl_log.append((u, sig))
+            y = x + d + u
+            if sig is not None and getattr(self, "noise_on", False):
+                xi = torch.randn_like(x)
+                xi = F.avg_pool2d(F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect"), 3, 1) * 3.0
+                y = y + (h ** 0.5) * sig * xi
+            return y
         if self.cfg.balance and i == 0:
             k1, xb = self.heads(x, t, g)
             self.last_balanced = xb
