@@ -252,6 +252,10 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         opts["gfeat"] = True
         if a.core_gsplit:  # only when asked for: the options of the cores trained before stay as they were
             opts["gsplit"] = True
+        if a.core_gdycore:  # only when asked for, as above
+            opts["gsource"] = "dycore"
+            if a.core_gbase:
+                opts["gbase"] = True
     if a.core_trunk != "res":  # only when asked for: the options of the cores trained before stay as they were
         opts.update(trunk=a.core_trunk, unet_dims=list(a.core_unet_dims))
     if a.core_mem_enc:
@@ -275,7 +279,12 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         y = a.train_years[-1]
         yx = load_years(a, [y])[y]
         H, W = yx.shape[-2:]
-        if load or not isinstance(yx, np.memmap) or H * W <= 8192:
+        if opts.get("gsource") == "dycore":
+            from pgcfm.dycore_day import DycoreFeatures
+            feats = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64))
+            if not load:
+                feats.scale = feats.estimate_scale(torch.from_numpy(zscore(yx[::4], mean, std))[:, DYN])
+        elif load or not isinstance(yx, np.memmap) or H * W <= 8192:
             xz = torch.from_numpy(zscore(yx[:1] if load else yx[::4], mean, std))
             feats = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN],
                                       split=bool(opts.get("gsplit")))
@@ -289,7 +298,7 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
         core.to(a.device)
         feats.to(a.device)
         feats.scale = core.gscale  # after the move: the buffer the core now holds
-        core.features = CachedFeatures(feats)
+        core.features = feats if opts.get("gsource") == "dycore" else CachedFeatures(feats)  # dycore: own cache
     return core.to(a.device)
 
 
@@ -1186,6 +1195,11 @@ def parser():
                    help="score: memory cores again with only the last N days before the IC in the memory (0 = empty)")
     p.add_argument("--mem-freeze", action="store_true",
                    help="score: memory cores again without updating the memory after the IC")
+    p.add_argument("--core-gdycore", action="store_true",
+                   help="--core-gfeat: the 48 physical terms = the 24 h INTEGRATED increment of u, v, T, q by NeuralGCM's "
+                        "dycore (dinosaur, T21 on the data grid) instead of the instantaneous operator tendency G(x)")
+    p.add_argument("--core-gbase", action="store_true",
+                   help="--core-gdycore: the dycore's day is also the base of the forecast step (core = correction)")
     p.add_argument("--core-gfeat", action="store_true",
                    help="the physical terms: the primitive-equation operator's tendency G(x) of u, v, T, q on the 12 "
                         "levels as 48 input channels of the core (step 18); with --core-mem the memory integrates "

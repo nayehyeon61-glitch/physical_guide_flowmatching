@@ -505,7 +505,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
               nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
               trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False,
-              gsplit: bool = False):
+              gsplit: bool = False, gsource: str = "op", gbase: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -563,6 +563,14 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     elif norm != "bn":
         raise ValueError(norm)
     core.stride = int(stride)
+    # the source of the physical terms (docs/kai_dycore_integration.md): "op" = the instantaneous operator tendency
+    # G(x); "dycore" = the 24 h integration of the dry primitive equations by dinosaur (pgcfm.dycore_day); ``gbase``
+    # (with "dycore") = that integration is also the base of the forecast step
+    if gsource not in ("op", "dycore") or (gsource == "dycore" and not gfeat) or (gbase and gsource != "dycore"):
+        raise ValueError(f"gsource {gsource} gbase {gbase} (dycore needs gfeat; gbase needs dycore)")
+    if gbase and (mem or hist or substeps != 1):
+        raise ValueError("gbase is built for the plain core, one step a day")
+    core.gsource, core.gbase = gsource, bool(gbase)
     return core
 
 

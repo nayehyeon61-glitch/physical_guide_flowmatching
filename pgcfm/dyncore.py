@@ -133,6 +133,14 @@ class DynCore(nn.Module):
         h = 1.0 / n_sub  # in units of the 6 h step
         t = hours + i * HOURS_PER_STEP * h
         g = self.features(x) if self.cfg.gfeat else None  # one operator evaluation per substep (k2 reuses it)
+        if getattr(self, "gbase", False):
+            # the forecast-base form (docs/kai_dycore_integration.md): the day's dycore integration D(x) - x is the
+            # base of the step and the network gives the remaining tendency, Heun over the residual; zero head =
+            # the dycore's forecast. D is computed without gradient (JAX), so the gradient reaches x only directly.
+            d = h * self.features.increment(x) * self.keep
+            k1 = self.tendency(x, t, g)
+            k2 = self.tendency(x + d + h * k1, t + HOURS_PER_STEP * h, g)
+            return x + d + 0.5 * h * (k1 + k2)
         if self.cfg.balance and i == 0:
             k1, xb = self.heads(x, t, g)
             self.last_balanced = xb
