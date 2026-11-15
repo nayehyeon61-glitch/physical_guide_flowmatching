@@ -203,6 +203,7 @@ class DycoreFeatures:
         r = self.day(f)
         bad = ~np.all(np.isfinite(np.concatenate([r[k].reshape(B, -1) for k in r], 1)), 1)
         self.n_nan += int(bad.sum())
+        self.last_bad = bad
         inc = np.zeros_like(full)
         for v, sl in self.full_of.items():
             inc[:, sl] = r[v]
@@ -273,9 +274,15 @@ class ComboFeatures:
     (dycore, optional), ``nz`` noise channels]. Noise: white N(0, 1) per channel and grid point, new at every call
     (= every day and member) while ``noise_on``; zeros otherwise (a deterministic run of the same core)."""
 
-    def __init__(self, op=None, dy=None, nz: int = 0, seed: int = 0):
+    def __init__(self, op=None, dy=None, nz: int = 0, seed: int = 0, hnz: float = 0.0):
         import torch
         self.torch, self.op, self.dy, self.nz, self.noise_on = torch, op, dy, int(nz), False
+        # hnz > 0 (owner 2026-11-15, "noise inside the equations"): the nz = 48 noise channels are not white noise but
+        # what the dycore's 24 h integration makes of a perturbation of its start:
+        # delta = hint(x + a xi) - hint(x), a = hnz_scale (1, 66, 1, 1). Zeros when the noise is off.
+        self.hnz, self.hnz_scale = float(hnz), None
+        if self.hnz and (dy is None or self.nz != 48):
+            raise ValueError("hnz needs the dycore hint and nz = 48")
         self.gen = torch.Generator().manual_seed(seed)
         self.key, self.val = None, None
 
@@ -306,9 +313,20 @@ class ComboFeatures:
     def __call__(self, x):
         if self.key is not x:
             parts = [f(x) for f in (self.op, self.dy) if f is not None]
-            if self.nz:
+            if self.nz and self.hnz and self.noise_on:
+                F = self.torch.nn.functional
+                xc = x.detach().cpu().float()
+                xi = self.torch.randn(xc.shape, generator=self.gen)
+                xi = F.avg_pool2d(F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect"), 3, 1) * 3.0
+                raw0 = self.dy._get(x)[0]
+                raw1 = self.dy._integrate(xc + self.hnz_scale * xi)[0]
+                d = self.torch.from_numpy(raw1 - raw0).float() / self.dy.scale.cpu().float() / self.hnz  # per unit of perturbation
+                d[self.torch.from_numpy(np.asarray(self.dy.last_bad))] = 0.0  # a failed integration: no noise signal
+                z = d.clamp(-self.dy.clamp, self.dy.clamp)
+            elif self.nz:
                 z = (self.torch.randn((x.shape[0], self.nz) + tuple(x.shape[-2:]), generator=self.gen)
-                     if self.noise_on else self.torch.zeros((x.shape[0], self.nz) + tuple(x.shape[-2:])))
+                     if self.noise_on and not self.hnz else self.torch.zeros((x.shape[0], self.nz) + tuple(x.shape[-2:])))
+            if self.nz:
                 parts.append(z.to(x.dtype).to(x.device))
             self.key, self.val = x, self.torch.cat(parts, 1)
         return self.val

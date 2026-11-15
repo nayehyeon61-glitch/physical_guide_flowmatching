@@ -505,7 +505,8 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               hist: bool = False, mem: int = 0, mem_ch: int = 24, mz: bool = False, gfeat: bool = False,
               nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
               trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False,
-              gsplit: bool = False, gsource: str = "op", gbase: bool = False, noise: bool = False, nz: int = 0):
+              gsplit: bool = False, gsource: str = "op", gbase: bool = False, noise: bool = False, nz: int = 0,
+              hnz: float = 0.0):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -576,6 +577,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     if gbase and (mem or hist or substeps != 1):
         raise ValueError("gbase is built for the plain core, one step a day")
     core.gsource, core.gbase, core.nz = gsource, bool(gbase), int(nz)
+    core.hnz = float(hnz)  # > 0: the noise channels are the dycore's response to a perturbed start (ComboFeatures)
     if noise:  # the noise term of the Schroedinger-bridge core: a 1 x 1 head sigma(x) on the trunk (starts at ~0.3)
         if not gbase:
             raise ValueError("the noise term belongs to the dycore-base core (gbase)")

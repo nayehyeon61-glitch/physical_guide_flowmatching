@@ -256,6 +256,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["gsource"] = "both"
         if a.core_nz:
             opts["nz"] = a.core_nz
+        if a.core_hnz:  # only when asked for
+            opts["hnz"] = a.core_hnz
         if a.core_gdycore:  # only when asked for, as above
             opts["gsource"] = "dycore"
             if a.core_gbase:
@@ -295,7 +297,7 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
                 dy = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64))
                 if not load:
                     dy.scale = dy.estimate_scale(xz[:, DYN])
-            feats = ComboFeatures(op, dy, opts.get("nz", 0), seed=a.seed)
+            feats = ComboFeatures(op, dy, opts.get("nz", 0), seed=a.seed, hnz=opts.get("hnz", 0.0))
             if not load:
                 feats.scale = feats.scale_buffer()
         elif opts.get("gsource") == "dycore":
@@ -320,6 +322,10 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             feats.set_scale(core.gscale)
         else:
             feats.scale = core.gscale  # after the move: the buffer the core now holds
+        if opts.get("hnz"):  # the perturbation of the dycore's start: hnz x the daily increment's std, no noise on tisr
+            keep = torch.ones(len(DYN))
+            keep[DYN.index(TISR)] = 0
+            feats.hnz_scale = (opts["hnz"] * core.t6.cpu() * keep.view(1, -1, 1, 1)).float()
         own_cache = opts.get("gsource") in ("dycore", "both") or opts.get("nz")
         core.features = feats if own_cache else CachedFeatures(feats)
     return core.to(a.device)
@@ -1287,6 +1293,9 @@ def parser():
     p.add_argument("--core-nz", type=int, default=0,
                    help="--core-gfeat: noise input channels next to the physical terms (new every day and member); train with "
                         "--sb-members 2 (CRPS)")
+    p.add_argument("--core-hnz", type=float, default=0.0,
+                   help="--core-gdycore --core-nz 48: the noise channels = the dycore's 24 h response to a perturbed start "
+                        "(hint(x + a xi) - hint(x), a = this x the daily increment's std): noise inside the equations")
     p.add_argument("--core-gdycore", action="store_true",
                    help="--core-gfeat: the 48 physical terms = the 24 h INTEGRATED increment of u, v, T, q by NeuralGCM's "
                         "dycore (dinosaur, T21 on the data grid) instead of the instantaneous operator tendency G(x)")
