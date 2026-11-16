@@ -139,11 +139,13 @@ def main():
             j = ics[i:i + a.chunk]
             x0, doy = tez[j][:, DYN], torch.tensor(j)
             tis = torch.stack([tez[j + k + 1] for k in range(L)], 1)[:, :, TISR]
+            W1 = getattr(core, "mem", 0)  # a memory core (alone or as first stage): warmed up on the W days before the
+            pv = torch.stack([tez[np.maximum(j - k, 0)] for k in range(W1, 0, -1)], 1)[:, :, DYN] if W1 else None  # IC
             with torch.no_grad():
                 if core2 is None:
-                    y = core_rollout(core, x0, doy, L, tis)
+                    y = core_rollout(core, x0, doy, L, tis, prev=pv)
                 else:
-                    ya = core_rollout(core, x0, doy, n1, tis[:, :n1])
+                    ya = core_rollout(core, x0, doy, n1, tis[:, :n1], prev=pv)
                     both = getattr(core, "entv", False) and getattr(core2, "entv", False)
                     core2.ent_init = core.ent_s2.clone() if both else None
                     if a.m2 and getattr(core2, "nz", 0) == 48:

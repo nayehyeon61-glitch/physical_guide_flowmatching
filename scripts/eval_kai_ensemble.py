@@ -91,12 +91,15 @@ def main():
             doy = torch.tensor(j).repeat_interleave(m_)
             tgt = torch.stack([tez[j + k + 1] for k in range(L)], 1)  # (B, L, 67, H, W)
             tis = tgt[:, :, TISR].repeat_interleave(m_, 0)
+            W1 = getattr(core, "mem", 0)  # a memory core (alone or as first stage): warmed up on the W days before the
+            pv = (torch.stack([tez[np.maximum(j - k, 0)] for k in range(W1, 0, -1)], 1)[:, :, DYN]  # IC, as in the score
+                  .repeat_interleave(m_, 0) if W1 else None)
             with torch.no_grad():
                 if core2 is None:
-                    y = core_rollout(core, x0, doy, L, tis)
+                    y = core_rollout(core, x0, doy, L, tis, prev=pv)
                     vlog = list(core.v_log) if getattr(core, "entv", False) else None
                 else:
-                    ya = core_rollout(core, x0, doy, n1, tis[:, :n1])
+                    ya = core_rollout(core, x0, doy, n1, tis[:, :n1], prev=pv)
                     both = getattr(core, "entv", False) and getattr(core2, "entv", False)
                     vlog = list(core.v_log) if both else None
                     core2.ent_init = core.ent_s2.clone() if both else None

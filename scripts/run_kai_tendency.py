@@ -394,7 +394,7 @@ def train(a, arm):
         m.grad_ckpt = bool(a.core_ckpt)  # the activations of a day are recomputed in the backward pass
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
-        s1, s1_store, m2_tab, drawn = None, {}, None, {}
+        s1, s1_store, m2_tab, drawn, Ws = None, {}, None, {}, 0
         if a.stage1:
             # the second stage of a two-stage forecast (owner 2026-11-16: G_1 for day 0-5, G_2 from G_1's state and
             # entropy for day 6-10): every training rollout starts from the frozen first-stage core's day-n forecast
@@ -402,6 +402,13 @@ def train(a, arm):
             # state hands its s^2 over as this core's starting entropy (DynCore.ent_init)
             s1 = build_core(a, mean, std, inc, lat, load=True, tag=a.stage1)
             s1.noise_on = False
+            Ws = getattr(s1, "mem", 0)  # a memory core as first stage: warmed up on the Ws data days before every IC
+            assert not (Ws and (W or hist)), "--stage1 with a memory core: the second stage is a plain core"
+            if Ws and getattr(s1, "gsource", "op") == "dycore" and not getattr(s1, "gbase", False):
+                tp = time.time()  # those days' dycore integration once, as in the memory core's own training
+                for y in trz:
+                    s1.features.prefill(trz[y][:, DYN])
+                print(json.dumps(dict(stage1_dycore_prefill=len(s1.features.store), sec=round(time.time() - tp))), flush=True)
             if a.stage1_m2:  # the equations' second-moment term along the first stage's trajectory (precompute_m2.py)
                 assert getattr(m, "nz", 0) == 48 and not getattr(m, "hnz", 0), "--stage1-m2 needs --core-nz 48"
                 m2_tab = {y: np.load(f"{a.stage1_m2}_{y}.npy", mmap_mode="r") for y in trz}
@@ -459,7 +466,7 @@ def train(a, arm):
         ys = rng.choice(years, a.batch)
         xs, tg, doy, pv = [], [], [], []
         for y in ys:
-            d = int(rng.integers(W * st if W else st if hist else 0, len(trz[y]) - K * st))
+            d = int(rng.integers(max(W * st if W else st if hist else 0, Ws_of()), len(trz[y]) - K * st))
             xs.append(trz[y][d])
             tg.append(trz[y][d + st:d + st * K + 1:st])
             pv.append(trz[y][d - W * st:d:st] if W else trz[y][d - st] if hist else None)
@@ -468,12 +475,17 @@ def train(a, arm):
         prev.append(torch.stack(pv).to(dev) if hist else None)
         if is_core:
             drawn["ys"], drawn["d"] = [int(y) for y in ys], list(doy)
+            if Ws_of():  # the days before the ICs for the first stage's memory, oldest first
+                drawn["pv1"] = torch.stack([trz[y][d - Ws_of():d] for y, d in zip(ys, doy)]).to(dev)
         if era_in:  # the time coordinate of the training period: -1 at its start, +1 at its end
             m.era = torch.tensor([2 * (int(y) + d / 365.25 - years[0]) / (years[-1] + 1 - years[0]) - 1
                                   for y, d in zip(ys, doy)], dtype=torch.float32, device=dev)
         return torch.stack(xs).to(dev), torch.stack(tg).to(dev), torch.tensor(doy, device=dev)
 
     prev = [None]  # history cores: the state one step before the batch's start (memory cores: W steps, oldest first)
+
+    def Ws_of():  # memory length of a --stage1 memory core (0: none)
+        return Ws if is_core else 0
 
     def stage1_start(x, tg, doy, n):
         """--stage1: (x, tg, doy) of a batch drawn with n more days -> the same with x = the first stage's day-n
@@ -483,7 +495,8 @@ def train(a, arm):
         keys = [hash(r.numpy().tobytes()) for r in x[:, dyn].cpu()]
         if any(k not in s1_store for k in keys):
             with torch.no_grad():
-                y = core_rollout(s1, x[:, dyn], doy, n, tg[:, :n, TISR])[:, -1]
+                y = core_rollout(s1, x[:, dyn], doy, n, tg[:, :n, TISR],
+                                 prev=pdyn(drawn["pv1"]) if Ws_of() else None)[:, -1]
             s2 = s1.ent_s2 if getattr(s1, "entv", False) else None
             for i, k in enumerate(keys):
                 s1_store[k] = (y[i].clone(), None if s2 is None else s2[i].clone())
