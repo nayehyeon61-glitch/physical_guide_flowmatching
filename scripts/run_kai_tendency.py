@@ -394,6 +394,14 @@ def train(a, arm):
         m.grad_ckpt = bool(a.core_ckpt)  # the activations of a day are recomputed in the backward pass
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
+        s1, s1_store = None, {}
+        if a.stage1:
+            # the second stage of a two-stage forecast (owner 2026-11-16: G_1 for day 0-5, G_2 from G_1's state and
+            # entropy for day 6-10): every training rollout starts from the frozen first-stage core's day-n forecast
+            # of the IC, so this core learns the long-lead regime with short rollouts; a first stage with an entropy
+            # state hands its s^2 over as this core's starting entropy (DynCore.ent_init)
+            s1 = build_core(a, mean, std, inc, lat, load=True, tag=a.stage1)
+            s1.noise_on = False
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
         keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1).to(dev)
@@ -445,6 +453,22 @@ def train(a, arm):
 
     prev = [None]  # history cores: the state one step before the batch's start (memory cores: W steps, oldest first)
 
+    def stage1_start(x, tg, doy, n):
+        """--stage1: (x, tg, doy) of a batch drawn with n more days -> the same with x = the first stage's day-n
+        forecast, the targets and the day moved by n, and the first stage's entropy state (or None). The forecasts
+        are kept by the IC's content (an IC is drawn many times); a batch with a new IC is rolled out whole, so the
+        dycore sees one batch shape."""
+        keys = [hash(r.numpy().tobytes()) for r in x[:, dyn].cpu()]
+        if any(k not in s1_store for k in keys):
+            with torch.no_grad():
+                y = core_rollout(s1, x[:, dyn], doy, n, tg[:, :n, TISR])[:, -1]
+            s2 = s1.ent_s2 if getattr(s1, "entv", False) else None
+            for i, k in enumerate(keys):
+                s1_store[k] = (y[i].clone(), None if s2 is None else s2[i].clone())
+        xs = torch.stack([s1_store[k][0] for k in keys])
+        s2 = None if s1_store[keys[0]][1] is None else torch.stack([s1_store[k][1] for k in keys])
+        return x.index_copy(1, dyn, xs.to(x)), tg[:, n:], doy + n * st, s2
+
     def pdyn(pv):
         return None if pv is None else pv.index_select(-3, dyn)
 
@@ -455,6 +479,8 @@ def train(a, arm):
 
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
         m.eval()
+        if is_core:
+            m.ent_init = None  # from data states: the analysis value of the entropy state
         if sb_on:
             m.noise_on = False  # the validation loss is the deterministic step (dycore + correction)
             if getattr(m, "nz", 0):
@@ -494,7 +520,11 @@ def train(a, arm):
         print(json.dumps(dict(resumed_at=it0)), flush=True)
     for it in range(it0 + 1, a.iters + 1):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
-        x, tg, doy = batch(K)
+        n1 = a.stage1_days if (is_core and s1 is not None) else 0
+        x, tg, doy = batch(K + n1)
+        if n1:
+            x, tg, doy, s2_0 = stage1_start(x, tg, doy, n1)
+            m.ent_init = s2_0
         if is_core:
             if sb_on:  # every IC as --sb-members members (the same start, different noise)
                 m.ctrl_log = []
@@ -1334,6 +1364,10 @@ def parser():
     p.add_argument("--core-nz", type=int, default=0,
                    help="--core-gfeat: noise input channels next to the physical terms (new every day and member); train with "
                         "--sb-members 2 (CRPS)")
+    p.add_argument("--stage1", default=None,
+                   help="--arm core: train this core as the SECOND stage: its rollouts start from the day --stage1-days "
+                        "forecast of the frozen core with this tag (and from that core's entropy state, if it has one)")
+    p.add_argument("--stage1-days", type=int, default=5)
     p.add_argument("--core-ent-anti", action="store_true",
                    help="--core-ent: the members start as symmetric pairs x +- a xi, so their mean starts at x")
     p.add_argument("--sb-mean", action="store_true",

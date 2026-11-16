@@ -128,7 +128,9 @@ class DynCore(nn.Module):
             parts.append(self.features(x) if g is None else g)
         if getattr(self.cfg, "entv", False):
             if self.ent_s2 is None or self.ent_s2.shape != x.shape:
-                self.ent_s2 = torch.full_like(x, self.entv_a0 ** 2)
+                init = getattr(self, "ent_init", None)  # a second stage starts from the first stage's entropy
+                self.ent_s2 = (init.to(x).clone() if init is not None and init.shape == x.shape
+                               else torch.full_like(x, self.entv_a0 ** 2))
             parts.append(0.5 * torch.log(self.ent_s2).detach())
         return self.net.trunk(torch.cat(parts, 1))
 

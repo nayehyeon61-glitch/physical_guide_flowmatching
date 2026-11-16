@@ -28,6 +28,9 @@ def main():
     p.add_argument("--members", type=int, default=8)
     p.add_argument("--chunk", type=int, default=4, help="ICs per batch (x members)")
     p.add_argument("--json", default=None)
+    p.add_argument("--stages", nargs="*", default=[],
+                   help="A>B@n: one deterministic run of core A to day n, then core B from A's day-n state (and from A's "
+                        "entropy state when both carry one); row key st_A>B@n")
     p.add_argument("--hint-noise", type=float, default=0.0,
                    help="--tags of dycore-hint cores: noise of this many daily-increment std added to the state the dycore "
                         "integrates (the core itself sees the clean state), new every day and member")
@@ -53,8 +56,17 @@ def main():
     def wm(x):  # area mean over the grid -> (..., C)
         return (x * w).mean((-2, -1))
 
-    for tag, m_ in [(t, M) for t in a.tags] + [(t, 1) for t in a.det]:
-        core = R.build_core(a, mean, std, inc, lat, load=True, tag=tag)
+    for tag, m_ in [(t, M) for t in a.tags] + [(t, 1) for t in a.det] + [("st_" + t, 1) for t in a.stages]:
+        core2, n1 = None, 0
+        if tag.startswith("st_"):
+            ta, rest = tag[3:].split(">")
+            tb, n1 = rest.rsplit("@", 1)
+            n1 = int(n1)
+            core = R.build_core(a, mean, std, inc, lat, load=True, tag=ta)
+            core2 = R.build_core(a, mean, std, inc, lat, load=True, tag=tb)
+            core2.noise_on = False
+        else:
+            core = R.build_core(a, mean, std, inc, lat, load=True, tag=tag)
         core.noise_on = m_ > 1
         if getattr(core, "nz", 0):
             core.features.noise_on = m_ > 1
@@ -76,15 +88,27 @@ def main():
             tgt = torch.stack([tez[j + k + 1] for k in range(L)], 1)  # (B, L, 67, H, W)
             tis = tgt[:, :, TISR].repeat_interleave(m_, 0)
             with torch.no_grad():
-                y = core_rollout(core, x0, doy, L, tis).view(B, m_, L, len(DYN), *x0.shape[-2:])
+                if core2 is None:
+                    y = core_rollout(core, x0, doy, L, tis)
+                    vlog = list(core.v_log) if getattr(core, "entv", False) else None
+                else:
+                    ya = core_rollout(core, x0, doy, n1, tis[:, :n1])
+                    both = getattr(core, "entv", False) and getattr(core2, "entv", False)
+                    vlog = list(core.v_log) if both else None
+                    core2.ent_init = core.ent_s2.clone() if both else None
+                    yb = core_rollout(core2, ya[:, -1], doy + n1, L - n1, tis[:, n1:])
+                    y = torch.cat([ya, yb], 1)
+                    if both:
+                        vlog = vlog + list(core2.v_log)
+                y = y.view(B, m_, L, len(DYN), *x0.shape[-2:])
             t = tgt[:, :, DYN]
             c = torch.stack([cz[(torch.tensor(j) + k + 1) % len(cz)] for k in range(L)], 1)
             mu = y.mean(1)
             e1 = (y - t[:, None]).abs().mean(1)
             e2 = (y[:, :, None] - y[:, None]).abs().sum((1, 2)) / (m_ * (m_ - 1)) if m_ > 1 else torch.zeros_like(e1)
-            entv = getattr(core, "entv", False) and m_ == 1
+            entv = vlog is not None and m_ == 1
             if entv:  # a deterministic run with its entropy state: the forecast is N(mu, s^2), CRPS in closed form
-                sd = torch.exp(0.5 * torch.stack(core.v_log, 1)) * core.t6.cpu().view(1, 1, -1, 1, 1)
+                sd = torch.exp(0.5 * torch.stack(vlog, 1)) * core.t6.cpu().view(1, 1, -1, 1, 1)
                 z = (t - mu) / sd
                 nd = torch.distributions.Normal(0.0, 1.0)
                 cg = sd * (z * (2 * nd.cdf(z) - 1) + 2 * torch.exp(nd.log_prob(z)) - 1 / np.sqrt(np.pi))
@@ -101,9 +125,9 @@ def main():
             acc["act_m"] += wm((y[:, 0] - c) ** 2).sum(0)
             acc["act_e"] += wm(fa ** 2).sum(0)
             acc["act_t"] += wm(ta ** 2).sum(0)
-            print(tag, i + B, "/", len(ics), "nan states", getattr(core.features, "n_nan", 0), flush=True)
+            nan_n = getattr(core.features, "n_nan", 0) + (getattr(core2.features, "n_nan", 0) if core2 is not None else 0)
+            print(tag, i + B, "/", len(ics), "nan states", nan_n, flush=True)
         n = len(ics)
-        entv = getattr(core, "entv", False) and m_ == 1
         mse, var = acc["mse"] / n, (acc["var"] / n if (m_ > 1 or entv) else torch.zeros_like(acc["mse"]))
         fin = 1.0 if entv else 1 + 1 / m_  # the finite-ensemble factor (none for the entropy state's own variance)
         if getattr(core, "ent_anti", False) and m_ > 1:  # symmetric pairs: the population variance about the mean
@@ -118,9 +142,9 @@ def main():
             "vars": {v: {"rmse_mean": (torch.sqrt(mse[:, vi[q]]) * vstd[q]).tolist(),
                          "spread": (torch.sqrt(fin * var[:, vi[q]]) * vstd[q]).tolist(),
                          "crps": ((acc["crps"] / n)[:, vi[q]] * vstd[q]).tolist()} for q, v in enumerate(VARS)},
-            "nan_states": int(getattr(core.features, "n_nan", 0)), "members": m_,
+            "nan_states": int(nan_n), "members": m_,
         }
-        res["arms"][tag if m_ > 1 else tag + "~det"] = out  # ~det: one run without noise
+        res["arms"][tag if (m_ > 1 or core2 is not None) else tag + "~det"] = out  # ~det: one run without noise
         print(tag, "crps", [round(v, 4) for v in out["crps"]], "\n  nrmse", [round(v, 3) for v in out["nrmse_mean"]],
               "\n  ssr", [round(v, 2) for v in out["ssr"]], "\n  acc", [round(v, 3) for v in out["acc_mean"]],
               "\n  act member", [round(v, 2) for v in out["activity_member"]], "mean", [round(v, 2) for v in out["activity_mean"]], flush=True)
