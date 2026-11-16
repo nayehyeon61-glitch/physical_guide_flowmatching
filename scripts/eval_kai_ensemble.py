@@ -82,9 +82,18 @@ def main():
             mu = y.mean(1)
             e1 = (y - t[:, None]).abs().mean(1)
             e2 = (y[:, :, None] - y[:, None]).abs().sum((1, 2)) / (m_ * (m_ - 1)) if m_ > 1 else torch.zeros_like(e1)
-            acc["crps"] += wm(e1 - 0.5 * e2).sum(0)                      # (L, C)
+            entv = getattr(core, "entv", False) and m_ == 1
+            if entv:  # a deterministic run with its entropy state: the forecast is N(mu, s^2), CRPS in closed form
+                sd = torch.exp(0.5 * torch.stack(core.v_log, 1)) * core.t6.cpu().view(1, 1, -1, 1, 1)
+                z = (t - mu) / sd
+                nd = torch.distributions.Normal(0.0, 1.0)
+                cg = sd * (z * (2 * nd.cdf(z) - 1) + 2 * torch.exp(nd.log_prob(z)) - 1 / np.sqrt(np.pi))
+                acc["crps"] += wm(cg).sum(0)
+                acc["var"] += wm(sd ** 2).sum(0)
+            else:
+                acc["crps"] += wm(e1 - 0.5 * e2).sum(0)                  # (L, C)
+                acc["var"] += (wm(y.var(1, unbiased=True)).sum(0) if m_ > 1 else 0.0)
             acc["mse"] += wm((mu - t) ** 2).sum(0)
-            acc["var"] += (wm(y.var(1, unbiased=True)).sum(0) if m_ > 1 else 0.0)
             fa, ta = mu - c, t - c
             acc["acc_n"] += wm(fa * ta).sum(0)
             acc["acc_p"] += wm(fa ** 2).sum(0)
@@ -94,16 +103,18 @@ def main():
             acc["act_t"] += wm(ta ** 2).sum(0)
             print(tag, i + B, "/", len(ics), "nan states", getattr(core.features, "n_nan", 0), flush=True)
         n = len(ics)
-        mse, var = acc["mse"] / n, (acc["var"] / n if m_ > 1 else torch.zeros_like(acc["mse"]))
+        entv = getattr(core, "entv", False) and m_ == 1
+        mse, var = acc["mse"] / n, (acc["var"] / n if (m_ > 1 or entv) else torch.zeros_like(acc["mse"]))
+        fin = 1.0 if entv else 1 + 1 / m_  # the finite-ensemble factor (none for the entropy state's own variance)
         out = {
             "crps": (acc["crps"] / n)[:, sc].mean(1).tolist(),
             "nrmse_mean": torch.sqrt(mse[:, sc]).mean(1).tolist(),
-            "ssr": torch.sqrt((1 + 1 / m_) * var[:, sc].mean(1) / mse[:, sc].mean(1)).tolist(),
+            "ssr": torch.sqrt(fin * var[:, sc].mean(1) / mse[:, sc].mean(1)).tolist(),
             "acc_mean": (acc["acc_n"] / torch.sqrt(acc["acc_p"] * acc["acc_t"]))[:, sc].mean(1).tolist(),
             "activity_member": torch.sqrt(acc["act_m"] / acc["act_t"])[:, sc].mean(1).tolist(),
             "activity_mean": torch.sqrt(acc["act_e"] / acc["act_t"])[:, sc].mean(1).tolist(),
             "vars": {v: {"rmse_mean": (torch.sqrt(mse[:, vi[q]]) * vstd[q]).tolist(),
-                         "spread": (torch.sqrt((1 + 1 / m_) * var[:, vi[q]]) * vstd[q]).tolist(),
+                         "spread": (torch.sqrt(fin * var[:, vi[q]]) * vstd[q]).tolist(),
                          "crps": ((acc["crps"] / n)[:, vi[q]] * vstd[q]).tolist()} for q, v in enumerate(VARS)},
             "nan_states": int(getattr(core.features, "n_nan", 0)), "members": m_,
         }

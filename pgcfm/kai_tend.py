@@ -506,7 +506,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               nomem: bool = False, acc=(), acc_ch: int = 12, kern: int = 0, kern_ch: int = 24, pacc=(),
               trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False,
               gsplit: bool = False, gsource: str = "op", gbase: bool = False, noise: bool = False, nz: int = 0,
-              hnz: float = 0.0, ent: float = 0.0):
+              hnz: float = 0.0, ent: float = 0.0, entv: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -549,7 +549,9 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     if trunk == "unet":
         hidden = int(unet_dims[0])  # the width the head (and a long-memory term) reads
     cfg = DynCoreConfig(hidden=hidden, blocks=tuple(blocks), dt_hours=6.0 / substeps, solver="heun", positive=True,
-                        gfeat=gfeat, gsplit=gsplit, gextra=(48 if gsource == "both" else 0) + int(nz))
+                        gfeat=gfeat, gsplit=gsplit, gextra=(48 if gsource == "both" else 0) + int(nz), entv=bool(entv))
+    if entv and (mem or hist or gbase or trunk != "res"):
+        raise ValueError("the entropy state is built for the plain core (no memory, history, dycore base or U-Net)")
     args = (cfg, static, torch.as_tensor(inc_std[DYN], dtype=torch.float32), mean[DYN], std[DYN], lat_deg)
     if mem:
         core = _mem_core_class()(*args, mem=mem, mem_ch=mem_ch, mz=mz, nomem=nomem, acc=tuple(acc), acc_ch=acc_ch,
@@ -577,6 +579,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
     if gbase and (mem or hist or substeps != 1):
         raise ValueError("gbase is built for the plain core, one step a day")
     core.gsource, core.gbase, core.nz = gsource, bool(gbase), int(nz)
+    core.entv = bool(entv)  # a deterministic run with its entropy as a state (dyncore.DynCore: cfg.entv)
     core.hnz = float(hnz)  # > 0: the noise channels are the dycore's response to a perturbed start (ComboFeatures)
     if ent:  # the entropy term in place of a noise (dyncore.DynCore._f): sigma(x) head, starts at 0.31 increment std
         if mem or hist or gbase:
@@ -658,6 +661,8 @@ def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
         core.reset(prev, doy.float() * 24.0, xd)
     elif getattr(core, "hist", False):
         core.prev = prev
+    if getattr(core, "entv", False):  # the entropy state starts again with every trajectory
+        core.reset_entropy()
     for k in range(steps):
         x = core_step(core, x, doy + k * st, None if tisr is None else tisr[:, k])
         out.append(x)

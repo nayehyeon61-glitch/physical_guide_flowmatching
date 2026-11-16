@@ -260,6 +260,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["hnz"] = a.core_hnz
         if a.core_ent:  # only when asked for
             opts["ent"] = a.core_ent
+        if a.core_entv:  # only when asked for
+            opts["entv"] = True
         if a.core_gdycore:  # only when asked for, as above
             opts["gsource"] = "dycore"
             if a.core_gbase:
@@ -541,6 +543,16 @@ def train(a, arm):
                         loss = loss + a.mz_acc_orth * (c[scd] ** 2).mean()
             else:
                 loss = ((err ** 2) * wl).mean()
+            if getattr(m, "entv", False):
+                # the entropy state of the deterministic run: the log score of the day's error under N(0, s^2)
+                # (its expectation is the cross entropy - int p log q). The error is detached and the tendency reads
+                # log s detached, so this term trains the entropy head only and the forecast keeps its own loss.
+                vs = torch.stack(m.v_log, 1)                                   # (B, K, 66, H, W) log variance
+                e2 = err.detach() ** 2
+                nll = (0.5 * (vs + e2 * torch.exp(-vs)) * wl * keep_dyn).mean() * (66.0 / 65.0)
+                loss = loss + a.entv_lam * nll
+                cal = torch.sqrt((torch.exp(vs) * wl * keep_dyn).mean((0, 2, 3, 4)) / ((e2 * wl * keep_dyn).mean((0, 2, 3, 4)) + 1e-12))
+                sb_log = dict(nll=round(float(nll.detach()), 4), cal=[round(float(v), 3) for v in cal.detach()])
             if sb_on:
                 # the Schroedinger-bridge form with a noise term and inequality constraints
                 # (docs/kai_dycore_integration.md, owner 2026-11-15). Reference process P: dycore + noise sigma(x) xi
@@ -1301,6 +1313,11 @@ def parser():
     p.add_argument("--core-nz", type=int, default=0,
                    help="--core-gfeat: noise input channels next to the physical terms (new every day and member); train with "
                         "--sb-members 2 (CRPS)")
+    p.add_argument("--core-entv", action="store_true",
+                   help="a deterministic core that carries its entropy as a state: the error variance s^2 grows by "
+                        "sigma(x)^2 a day (what a noise would add), log s is an input of the tendency, s is trained by "
+                        "the log score of the error (--entv-lam)")
+    p.add_argument("--entv-lam", type=float, default=1.0, help="--core-entv: weight of the log score of the entropy state")
     p.add_argument("--core-ent", type=float, default=0.0,
                    help="the entropy term in place of a noise (probability-flow form, Gaussian closure per channel): "
                         "f(x) + sigma(x)^2 / 2 (x - member mean) / s^2; this value = the initial perturbation of the "

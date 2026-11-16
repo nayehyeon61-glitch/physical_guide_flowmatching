@@ -53,6 +53,7 @@ class DynCoreConfig:
     gfeat: bool = False       # step 18: the discrete operator's tendency G(x) = -R0(x) as 48 extra input channels
     gsplit: bool = False      # gfeat: the 48 terms in two parts each (advection | forces, horizontal | vertical): 96
     gextra: int = 0           # gfeat: further feature channels (the integrated hint next to G: 48; noise channels)
+    entv: bool = False        # the entropy state of a deterministic run as 66 more input channels (DynCore._f)
 
 
 BAL_DYN = LEVEL_DYN["z"] + LEVEL_DYN["t"]  # the channels head 1 may correct (the hydrostatic pair)
@@ -89,8 +90,21 @@ class DynCore(nn.Module):
         keep = torch.ones(N_DYN)
         keep[TISR_DYN] = 0
         self.register_buffer("keep", keep.view(1, N_DYN, 1, 1))
-        self.net = Net(N_DYN + static.shape[0] + 4 + n_gfeat(cfg), N_DYN,
-                       _NetCfg(cfg.hidden, cfg.blocks))
+        self.net = Net(N_DYN + static.shape[0] + 4 + n_gfeat(cfg) + (N_DYN if getattr(cfg, "entv", False) else 0),
+                       N_DYN, _NetCfg(cfg.hidden, cfg.blocks))
+        if getattr(cfg, "entv", False):
+            # the entropy state (owner 2026-11-16: the entropy structure is for the DETERMINISTIC long-range forecast,
+            # not for an ensemble): one run carries, next to x, the variance s^2 of its own error per channel and
+            # grid point (Gaussian closure: entropy density = log s + const). A noise sigma(x) xi would raise the
+            # variance by sigma^2 a day; here that growth is the equation of the state s^2 and no noise is added:
+            #   s^2 <- s^2 + sigma(x)^2,  sigma = softplus(1 x 1 head on the DETACHED trunk),
+            # and the tendency reads log s as input channels (detached), so the same map can act differently on a
+            # sharp state (day 1) and on an uncertain one (day 8). The forecast is trained by its usual loss, the
+            # entropy state by the log score of the error (trainer); units: daily increment std.
+            self.entv_head = nn.Conv2d(cfg.hidden, N_DYN, 1)
+            nn.init.zeros_(self.entv_head.weight)
+            nn.init.zeros_(self.entv_head.bias)
+            self.entv_a0, self.ent_s2, self.v_log, self._sig = 0.05, None, None, None
         self.pm = PositiveMass(mean, std, lat_deg) if cfg.positive else None
         self.features = None  # cfg.gfeat: an OperatorFeatures callable x -> G(x) (attached after construction)
         if cfg.gfeat:
@@ -112,7 +126,15 @@ class DynCore(nn.Module):
             if self.features is None:
                 raise RuntimeError("cfg.gfeat needs model.features = OperatorFeatures(...)")
             parts.append(self.features(x) if g is None else g)
+        if getattr(self.cfg, "entv", False):
+            if self.ent_s2 is None or self.ent_s2.shape != x.shape:
+                self.ent_s2 = torch.full_like(x, self.entv_a0 ** 2)
+            parts.append(0.5 * torch.log(self.ent_s2).detach())
         return self.net.trunk(torch.cat(parts, 1))
+
+    def reset_entropy(self):
+        """The start of a trajectory (cfg.entv): the entropy state back to the analysis value, a new log of it."""
+        self.ent_s2, self.v_log = None, []
 
     def tendency(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
         """f_theta(x): normalized increment per 6 h (B, 66, H, W); ``g`` = precomputed G(x) (cfg.gfeat)."""
@@ -168,7 +190,9 @@ class DynCore(nn.Module):
         if self.cfg.solver == "euler":
             return x + h * k1
         if self.cfg.solver == "heun":
-            k2 = self._f(x + h * k1, t + HOURS_PER_STEP * h, g)
+            k2 = self._f(x + h * k1, t + HOURS_PER_STEP * h, g, first=False)
+            if getattr(self.cfg, "entv", False):  # the entropy production of the substep (sigma at its start)
+                self.ent_s2 = self.ent_s2 + h * self._sig ** 2
             return x + 0.5 * h * (k1 + k2)
         raise ValueError(self.cfg.solver)
 
@@ -184,11 +208,17 @@ class DynCore(nn.Module):
         return (getattr(self, "ent_head", None) is not None and getattr(self, "noise_on", False)
                 and getattr(self, "ent_members", 0) > 1)
 
-    def _f(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if not self._ent_on():
+    def _f(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None,
+           first: bool = True) -> torch.Tensor:
+        entv = getattr(self.cfg, "entv", False)
+        if not (entv or self._ent_on()):
             return self.tendency(x, hours, g)
         hk = self._trunk(x, hours, g)
         k = self.net.head(hk) * self.t6 * self.keep
+        if entv and first:
+            self._sig = F.softplus(self.entv_head(hk.detach())) * self.keep
+        if not self._ent_on():
+            return k
         M = self.ent_members
         B = x.shape[0] // M
         xm = x.view(B, M, *x.shape[1:])
@@ -220,6 +250,8 @@ class DynCore(nn.Module):
         n_sub = self.n_sub()
         for i in range(n_sub):
             x = self.substep(x, hours, i, n_sub)
+        if getattr(self.cfg, "entv", False) and self.v_log is not None:
+            self.v_log.append(torch.log(self.ent_s2))
         return self.finish(x, tisr_next)
 
     def rollout(self, x0: torch.Tensor, hour0: torch.Tensor, steps: int,
