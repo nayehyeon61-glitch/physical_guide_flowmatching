@@ -231,7 +231,7 @@ def fig_data(run, out):
         q.set_xticks(x)
         q.set_xticklabels(name)
         q.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-    fig.suptitle("Core scaling test S3: the data ladder of the baseline core, 1 to 32 training years "
+    fig.suptitle("Core scaling test S3 / S4: the data ladder of the baseline core, 1 to 32 training years "
                  "(5.625 deg, 119 forecasts of 2017)", fontsize=11, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(os.path.join(out, "fig_data.png"), dpi=150)
