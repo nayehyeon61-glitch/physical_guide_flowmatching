@@ -405,6 +405,23 @@ def train(a, arm):
             if a.stage1_m2:  # the equations' second-moment term along the first stage's trajectory (precompute_m2.py)
                 assert getattr(m, "nz", 0) == 48 and not getattr(m, "hnz", 0), "--stage1-m2 needs --core-nz 48"
                 m2_tab = {y: np.load(f"{a.stage1_m2}_{y}.npy", mmap_mode="r") for y in trz}
+        mj = None
+        if a.joint:
+            # both stages of a two-stage forecast trained together (owner 2026-11-17 00:25 KST: "is the next step the
+            # one where the two cores are trained together?"). This core is the first stage (--init, day 1 to
+            # --stage1-days), --joint the trained second stage (the --curriculum days after the island); both are
+            # trained, each with its own days' loss, on rollouts of --stage1-days + K days. The error of the days after
+            # the island reaches the first stage through the island state; --joint-detach cuts exactly that path
+            # (the control: the same batches and steps, every stage with its own loss only).
+            assert a.init and not a.stage1 and not W and not hist and a.sb_members == 1, "--joint: plain cores, --init"
+            mj = build_core(a, mean, std, inc, lat, load=True, tag=a.joint)
+            assert mj.opts == m.opts and not any(m.opts.get(k) for k in ("entv", "nz", "ent", "mem", "hist")), mj.opts
+            mj.train()
+            for (k, q), (k2, q2) in zip(m.named_parameters(), mj.named_parameters()):
+                assert k == k2
+                q2.requires_grad_(q.requires_grad)
+            mj.grad_ckpt = bool(a.core_ckpt)
+            opt = torch.optim.AdamW(list(m.parameters()) + list(mj.parameters()), lr=a.core_lr, weight_decay=1e-3)
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
         keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1).to(dev)
@@ -519,6 +536,8 @@ def train(a, arm):
     if a.resume and os.path.exists(part):
         ck = torch.load(part, map_location=dev, weights_only=False)
         m.load_state_dict(ck["state"])
+        if is_core and mj is not None:
+            mj.load_state_dict(ck["state2"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         rng.bit_generator.state = ck["rng"]
@@ -528,7 +547,8 @@ def train(a, arm):
     for it in range(it0 + 1, a.iters + 1):
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         n1 = a.stage1_days if (is_core and s1 is not None) else 0
-        x, tg, doy = batch(K + n1)
+        nj = a.stage1_days if (is_core and mj is not None) else 0
+        x, tg, doy = batch(K + n1 + nj)
         if n1:
             x, tg, doy, s2_0 = stage1_start(x, tg, doy, n1)
             m.ent_init = s2_0
@@ -545,7 +565,13 @@ def train(a, arm):
             if sb_on and getattr(m, "ent", 0):  # the entropy core: members = a small initial distribution, no noise after
                 m.ent_members = a.sb_members
                 xd = m.perturb(xd)
-            y = core_rollout(m, xd, doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
+            if nj:  # the first stage to the island, the second stage from its state (with the gradient, or without)
+                y1 = core_rollout(m, xd, doy, nj, tg[:, :nj, TISR])
+                y2 = core_rollout(mj, y1[:, -1].detach() if a.joint_detach else y1[:, -1], doy + nj * st, K,
+                                  tg[:, nj:, TISR])
+                y = torch.cat([y1, y2], 1)
+            else:
+                y = core_rollout(m, xd, doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
             if getattr(m, "mz", False):
                 # Mori-Zwanzig form on the sequence: the W days before the batch's start are forecast one by one
@@ -585,6 +611,10 @@ def train(a, arm):
                     acc_log.append(round(float(c.detach()[scd].mean()), 4))
                     if a.mz_acc_orth > 0:
                         loss = loss + a.mz_acc_orth * (c[scd] ** 2).mean()
+            elif nj:  # every stage's days as in its own training (mean over its days), summed
+                l1, l2 = ((err[:, :nj] ** 2) * wl).mean(), ((err[:, nj:] ** 2) * wl).mean()
+                loss = l1 + l2
+                sb_log = dict(mse1=round(float(l1.detach()), 4), mse2=round(float(l2.detach()), 4))
             else:
                 loss = ((err ** 2) * wl).mean()
             if getattr(m, "entv", False):
@@ -664,6 +694,8 @@ def train(a, arm):
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+        if is_core and mj is not None:
+            torch.nn.utils.clip_grad_norm_(mj.parameters(), 1.0)
         opt.step()
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
@@ -687,7 +719,8 @@ def train(a, arm):
             print(json.dumps(log[-1]), flush=True)
             if a.resume and it < a.iters:
                 torch.save(dict(state=m.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), it=it, log=log,
-                                rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), sec=time.time() - t0),
+                                rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), sec=time.time() - t0,
+                                **(dict(state2=mj.state_dict()) if is_core and mj is not None else {})),
                            part + ".tmp")
                 os.replace(part + ".tmp", part)
                 if it == a.stop_at:
@@ -696,6 +729,10 @@ def train(a, arm):
                     core_opts=getattr(m, "opts", None),
                     params=sum(p.numel() for p in m.parameters()), train_seconds=time.time() - t0),
                os.path.join(a.out, f"{a.tag or arm}.pt"))
+    if is_core and mj is not None:  # the second stage trained along, under its own name
+        torch.save(dict(state=mj.state_dict(), cfg=config_dict(mj.cfg), log=log, args=vars(a), core_opts=mj.opts,
+                        params=sum(p.numel() for p in mj.parameters()), train_seconds=time.time() - t0),
+                   os.path.join(a.out, f"{a.joint_tag or a.joint + '_j'}.pt"))
     if os.path.exists(part):
         os.remove(part)
 
@@ -1424,6 +1461,13 @@ def parser():
                    help="--arm core: train this core as the SECOND stage: its rollouts start from the day --stage1-days "
                         "forecast of the frozen core with this tag (and from that core's entropy state, if it has one)")
     p.add_argument("--stage1-days", type=int, default=5)
+    p.add_argument("--joint", default=None,
+                   help="--arm core with --init: train this core (the first stage, to day --stage1-days) TOGETHER with "
+                        "the trained second-stage core of this tag (the --curriculum days after): one rollout through "
+                        "the island, each stage with the loss of its own days")
+    p.add_argument("--joint-tag", default=None, help="--joint: name of the second stage's new checkpoint (default <joint>_j)")
+    p.add_argument("--joint-detach", action="store_true",
+                   help="--joint: no gradient through the island state (the control: the same steps, the stages apart)")
     p.add_argument("--stage1-m2", default=None,
                    help="--stage1 with --core-nz 48: the 48 channels are the second-moment hint made by "
                         "scripts/precompute_m2.py (this prefix + _<year>.npy), one entry per rollout day")
