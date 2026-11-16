@@ -258,6 +258,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["nz"] = a.core_nz
         if a.core_hnz:  # only when asked for
             opts["hnz"] = a.core_hnz
+        if a.core_ent:  # only when asked for
+            opts["ent"] = a.core_ent
         if a.core_gdycore:  # only when asked for, as above
             opts["gsource"] = "dycore"
             if a.core_gbase:
@@ -414,8 +416,8 @@ def train(a, arm):
     sb_on = is_core and a.sb_members > 1
     sb_log = None
     if sb_on:
-        if getattr(m, "noise_head", None) is None and not getattr(m, "nz", 0):
-            raise ValueError("--sb-members needs a noise core (--core-gbase --core-noise, or --core-nz)")
+        if getattr(m, "noise_head", None) is None and not getattr(m, "nz", 0) and not getattr(m, "ent", 0):
+            raise ValueError("--sb-members needs a noise core (--core-gbase --core-noise, --core-nz or --core-ent)")
         m.noise_on = True
         if getattr(m, "nz", 0):
             m.features.noise_on = True
@@ -493,7 +495,11 @@ def train(a, arm):
             if sb_on:  # every IC as --sb-members members (the same start, different noise)
                 m.ctrl_log = []
                 x, tg, doy = (v.repeat_interleave(a.sb_members, 0) for v in (x, tg, doy))
-            y = core_rollout(m, x[:, dyn], doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
+            xd = x[:, dyn]
+            if sb_on and getattr(m, "ent", 0):  # the entropy core: members = a small initial distribution, no noise after
+                m.ent_members = a.sb_members
+                xd = m.perturb(xd)
+            y = core_rollout(m, xd, doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
             if getattr(m, "mz", False):
                 # Mori-Zwanzig form on the sequence: the W days before the batch's start are forecast one by one
@@ -564,6 +570,8 @@ def train(a, arm):
                     sb_log.update(kl=[round(float(v), 3) for v in kl_k.detach()],
                                   sigma=round(float((sg / s_dyn).detach()[:, :, scd].mean()), 3),
                                   ctrl=round(float((u / s_dyn).detach()[:, :, scd].abs().mean()), 3))
+                if getattr(m, "ent", 0):  # sigma of the entropy term and the members' spread at the last evaluation
+                    sb_log.update(sigma=round(m.ent_stat[0], 3), spread=round(m.ent_stat[1], 3))
                 if a.sb_kl > 0 and has_ctrl:
                     loss = loss + a.sb_lam * torch.relu(kl_k - a.sb_kl).mean()
                 if a.sb_ssr:
@@ -1293,6 +1301,10 @@ def parser():
     p.add_argument("--core-nz", type=int, default=0,
                    help="--core-gfeat: noise input channels next to the physical terms (new every day and member); train with "
                         "--sb-members 2 (CRPS)")
+    p.add_argument("--core-ent", type=float, default=0.0,
+                   help="the entropy term in place of a noise (probability-flow form, Gaussian closure per channel): "
+                        "f(x) + sigma(x)^2 / 2 (x - member mean) / s^2; this value = the initial perturbation of the "
+                        "members in daily increment std; train with --sb-members 2")
     p.add_argument("--core-hnz", type=float, default=0.0,
                    help="--core-gdycore --core-nz 48: the noise channels = the dycore's 24 h response to a perturbed start "
                         "(hint(x + a xi) - hint(x), a = this x the daily increment's std): noise inside the equations")

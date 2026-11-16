@@ -164,13 +164,48 @@ class DynCore(nn.Module):
             self.last_balanced = xb
             x = x + (xb - x).detach() if self.cfg.bal_detach else xb
         else:
-            k1 = self.tendency(x, t, g)
+            k1 = self._f(x, t, g)
         if self.cfg.solver == "euler":
             return x + h * k1
         if self.cfg.solver == "heun":
-            k2 = self.tendency(x + h * k1, t + HOURS_PER_STEP * h, g)
+            k2 = self._f(x + h * k1, t + HOURS_PER_STEP * h, g)
             return x + 0.5 * h * (k1 + k2)
         raise ValueError(self.cfg.solver)
+
+    # ---- the entropy term (owner 2026-11-16): the dual of an added noise sigma xi. The density p of the noisy
+    # process follows the Fokker-Planck equation, whose diffusion term is the gradient flow of the entropy
+    # int p log p; the deterministic drift  f(x) - (sigma^2 / 2) grad log p(x)  (probability-flow form) has the same
+    # marginals. grad log p of a 135k-dimensional state cannot be estimated from a few members, so the closure is a
+    # Gaussian per IC and channel with the members' area-mean variance s^2:  - grad log p = (x - mean) / s^2.
+    # The term is then (sigma(x)^2 / 2) (x_i - mean) / s^2: no new noise, the members' own differences grow, the
+    # variance by sigma^2 a day where sigma is uniform (as the noise would make it). sigma(x) >= 0 per channel and
+    # grid point is a 1 x 1 head on the trunk, in units of the daily increment std.
+    def _ent_on(self) -> bool:
+        return (getattr(self, "ent_head", None) is not None and getattr(self, "noise_on", False)
+                and getattr(self, "ent_members", 0) > 1)
+
+    def _f(self, x: torch.Tensor, hours: torch.Tensor, g: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if not self._ent_on():
+            return self.tendency(x, hours, g)
+        hk = self._trunk(x, hours, g)
+        k = self.net.head(hk) * self.t6 * self.keep
+        M = self.ent_members
+        B = x.shape[0] // M
+        xm = x.view(B, M, *x.shape[1:])
+        dev = ((xm - xm.mean(1, keepdim=True)) * self.keep / self.t6.clamp_min(1e-8)).view_as(x)  # increment-std units
+        var = dev.view(B, M, *x.shape[1:]).pow(2).sum(1) / (M - 1)               # (B, C, H, W)
+        s2 = (var * self.ent_w.to(x)).mean((-2, -1), keepdim=True)               # (B, C, 1, 1)
+        sig = F.softplus(self.ent_head(hk) + self.ent_bias)
+        e = 0.5 * sig ** 2 * dev / (s2.repeat_interleave(M, 0) + self.ent_eps)
+        self.ent_stat = (float(sig.detach().mean()), float(s2.detach().mean().sqrt()))
+        return k + e * self.t6 * self.keep
+
+    def perturb(self, x: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:
+        """The initial distribution of the entropy core: a flow from one point stays one point, so the members start
+        from x + ent x (daily increment std) x white noise smoothed over 3 x 3 cells (unit variance)."""
+        xi = torch.randn(x.shape, generator=gen).to(x)
+        xi = F.avg_pool2d(F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect"), 3, 1) * 3.0
+        return x + self.ent * xi * self.t6 * self.keep
 
     def finish(self, x: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:
         """The end of a 6 h step: the forcing of the new time, positive mass."""

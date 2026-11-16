@@ -58,6 +58,9 @@ def main():
         core.noise_on = m_ > 1
         if getattr(core, "nz", 0):
             core.features.noise_on = m_ > 1
+        ent = getattr(core, "ent", 0) and m_ > 1
+        if ent:
+            core.ent_members, egen = m_, torch.Generator().manual_seed(a.seed)
         if a.hint_noise > 0 and m_ > 1:
             keep = torch.ones(len(DYN)); keep[DYN.index(TISR)] = 0
             core.features.noise_scale = (a.hint_noise * core.t6.cpu() * keep.view(1, -1, 1, 1)).float()
@@ -67,6 +70,8 @@ def main():
             j = ics[i:i + a.chunk]
             B = len(j)
             x0 = tez[j][:, DYN].repeat_interleave(m_, 0)
+            if ent:
+                x0 = core.perturb(x0, egen)
             doy = torch.tensor(j).repeat_interleave(m_)
             tgt = torch.stack([tez[j + k + 1] for k in range(L)], 1)  # (B, L, 67, H, W)
             tis = tgt[:, :, TISR].repeat_interleave(m_, 0)
