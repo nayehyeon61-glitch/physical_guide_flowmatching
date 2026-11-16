@@ -555,6 +555,16 @@ def train(a, arm):
                 loss = loss + a.entv_lam * nll
                 cal = torch.sqrt((torch.exp(vs) * wl * keep_dyn).mean((0, 2, 3, 4)) / ((e2 * wl * keep_dyn).mean((0, 2, 3, 4)) + 1e-12))
                 sb_log = dict(nll=round(float(nll.detach()), 4), cal=[round(float(v), 3) for v in cal.detach()])
+                if a.entv_beta < 1.0:
+                    # the forecast under the same log score (owner 2026-11-16: the entropy's share of the loss must
+                    # grow with the lead): e^2 / (2 s^2) + log s. While s is small (the start) the error term rules;
+                    # as s grows its weight 1 / s^2 falls and the entropy term grows, by the amount of the diffusion
+                    # itself. beta-NLL (Seitzer et al. 2022): times stopgrad(s^(2 beta)), so the forecast's gradient is
+                    # e / s^(2 - 2 beta) (beta = 1: the plain loss, 0: the log score); it replaces the two terms above.
+                    mse = float(loss.detach() - a.entv_lam * nll.detach())
+                    full = 0.5 * (vs + err ** 2 * torch.exp(-vs))
+                    loss = (torch.exp(a.entv_beta * vs).detach() * full * wl * keep_dyn).mean() * (66.0 / 65.0)
+                    sb_log.update(mse=round(mse, 4), bnll=round(float(loss.detach()), 4))
             if sb_on:
                 # the Schroedinger-bridge form with a noise term and inequality constraints
                 # (docs/kai_dycore_integration.md, owner 2026-11-15). Reference process P: dycore + noise sigma(x) xi
@@ -1334,6 +1344,9 @@ def parser():
                         "sigma(x)^2 a day (what a noise would add), log s is an input of the tendency, s is trained by "
                         "the log score of the error (--entv-lam)")
     p.add_argument("--entv-lam", type=float, default=1.0, help="--core-entv: weight of the log score of the entropy state")
+    p.add_argument("--entv-beta", type=float, default=1.0,
+                   help="--core-entv: < 1 trains the forecast by the log score too (beta-NLL: gradient e / s^(2 - 2 beta)); "
+                        "1 = the plain loss for the forecast and the log score for the entropy state only")
     p.add_argument("--core-ent", type=float, default=0.0,
                    help="the entropy term in place of a noise (probability-flow form, Gaussian closure per channel): "
                         "f(x) + sigma(x)^2 / 2 (x - member mean) / s^2; this value = the initial perturbation of the "
