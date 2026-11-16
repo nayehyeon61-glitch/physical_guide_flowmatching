@@ -7,6 +7,7 @@ fig_size.png   (score_S2, breakdown_S2, diag_gap_size.json) 2 x 2: the error of 
                loop on the 32-year KAI; the core's share on that KAI by lead for every size; the generalization gap
                (unseen / trained years - 1) against the size. Solid = nRMSE, dashed = its information part.
 fig_data.png   (score_S3 / score_S4 and their gap files, when they exist) the same along the training years.
+fig_levers.png (score_S1 .. S5) the gain of one doubling of each lever at day 1 / 3 / 5, alone and in the loop.
 """
 
 import json
@@ -238,6 +239,66 @@ def fig_data(run, out):
     plt.close(fig)
 
 
+def fig_levers(run, out):
+    """fig_levers.png: the gain of ONE DOUBLING of each lever (parameters, iterations, training years, physical terms)
+    at day 1 / 3 / 5, the core alone and inside the coupled loop on the 32-year KAI. A lever that was changed by
+    another factor f is brought to one doubling as 1 - (E_b / E_a) ** (ln 2 / ln f); the size ladder uses its slope."""
+    std = np.load(os.path.join(run, "stats.npz"))["std"].astype(np.float64) + 1e-8
+    cache = {}
+
+    def E(sc, tag):
+        if sc not in cache:
+            cache[sc] = (json.load(open(os.path.join(run, f"score_{sc}.json"))),
+                         np.load(os.path.join(run, f"score_{sc}_raw.npz")))
+        return errors(*cache[sc], std, tag)[0]
+
+    def per2(Ea, Eb, f=2.0):
+        return 100 * (1 - (Eb / Ea) ** (np.log(2) / np.log(f)))
+
+    B, H = "core_gngmz8", "core_gngmz8h96"
+    lad = [B + "h24", B, B + "w", H]
+    xs = np.array([json.load(open(os.path.join(run, "score_S2.json")))["arms"][t]["params"] for t in lad], float)
+    s5 = os.path.exists(os.path.join(run, "score_S5.json"))
+    fig, ax = plt.subplots(1, 2, figsize=(13.0, 4.6), sharey=True)
+    for p, w, title, xmax in ((ax[0], "{}", "core alone", 8.6),
+                              (ax[1], "loop_{}@" + K, "coupled loop on the 32-year KAI (another scale)", 2.9)):
+        t = w.format
+        rows = [("parameters × 2\n(width, 0.08 to 0.90 M)",
+                 100 * (1 - 2.0 ** -exponents(xs, np.stack([E("S2", t(k)) for k in lad]))[1])),
+                ("iterations × 2\n(0.26 M core, 3000 to 6000)", per2(E("S2", t(B)), E("S2", t(B + "_x2")))),
+                ("training years × 2\n(0.26 M core, 1 to 2 years)", per2(E("S3", t(B + "_y1")), E("S3", t(B + "_y2")))),
+                ("training years × 2\n(0.90 M core, 4 to 32 years)", per2(E("S4", t(H)), E("S4", t(H + "_y32")), 8)),
+                ("training years × 2\n(0.26 M core, 4 to 32 years)", per2(E("S4", t(B)), E("S4", t(B + "_y32")), 8)),
+                (("physical terms × 2\n(48 to 96 at the same size)", per2(E("S5", t(B + "h51")), E("S5", t(B + "g96"))))
+                 if s5 else ("physical terms × 2\n(48 to 96, + 10 % parameters)",
+                             per2(E("S1", t(B)), E("S1", t(B + "g96")))))]
+        for i, (_, v) in enumerate(rows):
+            y = len(rows) - 1 - i
+            d = [v[k - 1] for k in DAYS]
+            p.plot([min(d), max(d)], [y, y], color=GRID, lw=2.5, zorder=1, solid_capstyle="round")
+            for j in range(len(DAYS)):
+                p.plot([d[j]], [y], ls="none", marker="o", ms=8, color=CAT[j], mec=SURFACE, mew=1.5, zorder=3)
+            p.annotate(" / ".join(f"{q:+.1f}" for q in d), (max(max(d), 0), y), xytext=(10, 0),
+                       textcoords="offset points", va="center", fontsize=8.5, color=INK)
+        p.axvline(0, color=INK, lw=1)
+        p.set_yticks(range(len(rows)))
+        p.set_yticklabels([r[0] for r in rows][::-1], fontsize=9, color=INK)
+        p.set_ylim(-0.6, len(rows) - 0.4)
+        p.set_xlim(-0.07 * xmax, xmax)
+        p.set_xlabel("gain in nRMSE from one doubling (%)")
+        p.set_title(title, fontsize=10.5, loc="left")
+        p.grid(axis="x", color=GRID, lw=0.8)
+        p.tick_params(axis="y", length=0)
+    for j, d in enumerate(DAYS):
+        ax[0].plot([], [], ls="none", marker="o", ms=8, color=CAT[j], mec=SURFACE, mew=1.5, label=f"day {d}")
+    ax[0].legend(frameon=False, fontsize=9, loc="lower right", title="lead (numbers: day 1 / 3 / 5)", title_fontsize=8.5)
+    fig.suptitle("Core scaling test: what one doubling of each lever gives (5.625 deg, 119 forecasts of 2017)",
+                 fontsize=11, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(os.path.join(out, "fig_levers.png"), dpi=150)
+    plt.close(fig)
+
+
 def main(run, out):
     os.makedirs(out, exist_ok=True)
     style()
@@ -247,6 +308,9 @@ def main(run, out):
     if os.path.exists(os.path.join(run, "score_S3.json")):
         fig_data(run, out)
         print("wrote", os.path.join(out, "fig_data.png"))
+    if os.path.exists(os.path.join(run, "score_S4.json")):
+        fig_levers(run, out)
+        print("wrote", os.path.join(out, "fig_levers.png"))
 
 
 if __name__ == "__main__":
