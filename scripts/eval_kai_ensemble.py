@@ -31,6 +31,9 @@ def main():
     p.add_argument("--stages", nargs="*", default=[],
                    help="A>B@n: one deterministic run of core A to day n, then core B from A's day-n state (and from A's "
                         "entropy state when both carry one); row key st_A>B@n")
+    p.add_argument("--m2", default=None,
+                   help="--stages whose second core has 48 second-moment channels (--stage1-m2): the prefix of the "
+                        "tables of scripts/precompute_m2.py (+ _<test year>.npy)")
     p.add_argument("--hint-noise", type=float, default=0.0,
                    help="--tags of dycore-hint cores: noise of this many daily-increment std added to the state the dycore "
                         "integrates (the core itself sees the clean state), new every day and member")
@@ -52,6 +55,7 @@ def main():
     vi = [DYN.index(contract.CHANNEL_INDEX[v]) for v in VARS]
     vstd = torch.as_tensor(std[[contract.CHANNEL_INDEX[v] for v in VARS]], dtype=torch.float32)
     res = {"ics": int(len(ics)), "members": M, "leads": L, "arms": {}}
+    m2_tab = None
 
     def wm(x):  # area mean over the grid -> (..., C)
         return (x * w).mean((-2, -1))
@@ -96,6 +100,11 @@ def main():
                     both = getattr(core, "entv", False) and getattr(core2, "entv", False)
                     vlog = list(core.v_log) if both else None
                     core2.ent_init = core.ent_s2.clone() if both else None
+                    if a.m2 and getattr(core2, "nz", 0) == 48:
+                        if m2_tab is None:
+                            m2_tab = np.load(f"{a.m2}_{a.test_year}.npy", mmap_mode="r")
+                        core2.features.ext = [torch.from_numpy(np.asarray(m2_tab[j, l], np.float32))
+                                              for l in range(L - n1)]
                     yb = core_rollout(core2, ya[:, -1], doy + n1, L - n1, tis[:, n1:])
                     y = torch.cat([ya, yb], 1)
                     if both:

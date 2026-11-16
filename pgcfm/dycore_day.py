@@ -285,6 +285,7 @@ class ComboFeatures:
             raise ValueError("hnz needs the dycore hint and nz = 48")
         self.gen = torch.Generator().manual_seed(seed)
         self.key, self.val = None, None
+        self.ext = []  # (B, nz, H, W) tensors for the coming calls instead of noise (see __call__)
 
     @property
     def n_nan(self):
@@ -313,7 +314,11 @@ class ComboFeatures:
     def __call__(self, x):
         if self.key is not x:
             parts = [f(x) for f in (self.op, self.dy) if f is not None]
-            if self.nz and self.hnz and self.noise_on:
+            if self.nz and self.ext:
+                # channels made beforehand for this call, one entry per coming call (the second-moment hint of a
+                # two-stage forecast, scripts/precompute_m2.py); calls without an entry get zeros below
+                z = self.ext.pop(0)
+            elif self.nz and self.hnz and self.noise_on:
                 F = self.torch.nn.functional
                 xc = x.detach().cpu().float()
                 xi = self.torch.randn(xc.shape, generator=self.gen)

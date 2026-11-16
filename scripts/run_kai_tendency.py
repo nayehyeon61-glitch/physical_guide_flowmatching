@@ -394,7 +394,7 @@ def train(a, arm):
         m.grad_ckpt = bool(a.core_ckpt)  # the activations of a day are recomputed in the backward pass
         opt = torch.optim.AdamW(m.parameters(), lr=a.core_lr, weight_decay=1e-3)  # step 16
         cur = a.curriculum
-        s1, s1_store = None, {}
+        s1, s1_store, m2_tab, drawn = None, {}, None, {}
         if a.stage1:
             # the second stage of a two-stage forecast (owner 2026-11-16: G_1 for day 0-5, G_2 from G_1's state and
             # entropy for day 6-10): every training rollout starts from the frozen first-stage core's day-n forecast
@@ -402,6 +402,9 @@ def train(a, arm):
             # state hands its s^2 over as this core's starting entropy (DynCore.ent_init)
             s1 = build_core(a, mean, std, inc, lat, load=True, tag=a.stage1)
             s1.noise_on = False
+            if a.stage1_m2:  # the equations' second-moment term along the first stage's trajectory (precompute_m2.py)
+                assert getattr(m, "nz", 0) == 48 and not getattr(m, "hnz", 0), "--stage1-m2 needs --core-nz 48"
+                m2_tab = {y: np.load(f"{a.stage1_m2}_{y}.npy", mmap_mode="r") for y in trz}
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
         keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1).to(dev)
@@ -446,6 +449,8 @@ def train(a, arm):
             doy.append(d)
         prev.clear()
         prev.append(torch.stack(pv).to(dev) if hist else None)
+        if is_core:
+            drawn["ys"], drawn["d"] = [int(y) for y in ys], list(doy)
         if era_in:  # the time coordinate of the training period: -1 at its start, +1 at its end
             m.era = torch.tensor([2 * (int(y) + d / 365.25 - years[0]) / (years[-1] + 1 - years[0]) - 1
                                   for y, d in zip(ys, doy)], dtype=torch.float32, device=dev)
@@ -481,6 +486,8 @@ def train(a, arm):
         m.eval()
         if is_core:
             m.ent_init = None  # from data states: the analysis value of the entropy state
+            if hasattr(m.features, "ext"):
+                m.features.ext = []
         if sb_on:
             m.noise_on = False  # the validation loss is the deterministic step (dycore + correction)
             if getattr(m, "nz", 0):
@@ -525,6 +532,11 @@ def train(a, arm):
         if n1:
             x, tg, doy, s2_0 = stage1_start(x, tg, doy, n1)
             m.ent_init = s2_0
+            if m2_tab is not None:  # one entry per rollout day, taken by the core's features in order
+                m.features.ext = [torch.from_numpy(np.stack([np.asarray(m2_tab[y][d, l], np.float32)
+                                                             for y, d in zip(drawn["ys"], drawn["d"])])).to(dev)
+                                  for l in range(K)]
+                m2_abs = round(float(torch.stack(m.features.ext).abs().mean()), 3)
         if is_core:
             if sb_on:  # every IC as --sb-members members (the same start, different noise)
                 m.ctrl_log = []
@@ -585,6 +597,8 @@ def train(a, arm):
                 loss = loss + a.entv_lam * nll
                 cal = torch.sqrt((torch.exp(vs) * wl * keep_dyn).mean((0, 2, 3, 4)) / ((e2 * wl * keep_dyn).mean((0, 2, 3, 4)) + 1e-12))
                 sb_log = dict(nll=round(float(nll.detach()), 4), cal=[round(float(v), 3) for v in cal.detach()])
+                if m2_tab is not None:
+                    sb_log["m2"] = m2_abs  # mean |second-moment channels| of the batch (0 = not in the table)
                 if a.entv_beta < 1.0:
                     # the forecast under the same log score (owner 2026-11-16: the entropy's share of the loss must
                     # grow with the lead): e^2 / (2 s^2) + log s. While s is small (the start) the error term rules;
@@ -1368,6 +1382,9 @@ def parser():
                    help="--arm core: train this core as the SECOND stage: its rollouts start from the day --stage1-days "
                         "forecast of the frozen core with this tag (and from that core's entropy state, if it has one)")
     p.add_argument("--stage1-days", type=int, default=5)
+    p.add_argument("--stage1-m2", default=None,
+                   help="--stage1 with --core-nz 48: the 48 channels are the second-moment hint made by "
+                        "scripts/precompute_m2.py (this prefix + _<year>.npy), one entry per rollout day")
     p.add_argument("--core-ent-anti", action="store_true",
                    help="--core-ent: the members start as symmetric pairs x +- a xi, so their mean starts at x")
     p.add_argument("--sb-mean", action="store_true",
