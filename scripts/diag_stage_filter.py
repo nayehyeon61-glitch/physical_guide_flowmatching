@@ -46,7 +46,8 @@ def terms(pa, ta, w):
     vf, vo, cov = pp - mf ** 2, tt - mo ** 2, pt - mf * mo
     info = vo - cov ** 2 / vf.clamp_min(1e-30)
     bias = (mf - mo) ** 2
-    return {k: v.numpy() for k, v in dict(mse=mse, bias=bias, info=info, amp=mse - bias - info, pp=pp, tt=tt, pt=pt).items()}
+    return {k: v.numpy() for k, v in dict(mse=mse, bias=bias, info=info, amp=mse - bias - info, pp=pp, tt=tt, pt=pt,
+                                          vf=vf.clamp_min(0), vo=vo).items()}
 
 
 def pool(x, k):
@@ -207,6 +208,9 @@ def main():
         """The three scores over the scored channels, and RMSE (physical units) / ACC / activity of the five variables."""
         o = dict(zip(("nrmse", "acc", "act"), (v.tolist() for v in stat(X))))
         m = lambda k: X[k].mean(0)  # noqa: E731
+        # the score files' definitions (run_kai_tendency.py --score): ACC and activity of every forecast, then the mean
+        o["acc_fc"] = (X["pt"] / np.sqrt(X["pp"] * X["tt"] + 1e-30)).mean(0)[:, sc].mean(1).tolist()
+        o["act_fc"] = np.sqrt(X["vf"] / (X["vo"] + 1e-30)).mean(0)[:, sc].mean(1).tolist()
         o["vars"] = {v: {"rmse": (np.sqrt(m("mse")[:, vi[q]]) * vstd[q]).tolist(),
                          "acc": (m("pt") / np.sqrt(m("pp") * m("tt")))[:, vi[q]].tolist(),
                          "act": np.sqrt(m("pp") / m("tt"))[:, vi[q]].tolist()} for q, v in enumerate(VARS)}
