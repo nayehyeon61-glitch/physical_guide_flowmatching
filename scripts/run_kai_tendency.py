@@ -850,11 +850,12 @@ def score(a, tags):
         that state, with ta's entropy state when both carry one and the second-moment tables (--stage1-m2) of the
         year ``cur_year`` when tb takes them."""
         c1, c2 = get_core(ta), get_core(tb)
-        assert not getattr(c1, "mem", 0) and not getattr(c2, "mem", 0), "two stages: memory cores are not wired"
+        assert not getattr(c2, "mem", 0), "two stages: a memory core as the SECOND stage is not wired"
+        W1 = getattr(c1, "mem", 0)  # a memory core as the first stage: its memory is warmed up on the days before the IC
 
         def fn(x0, doy, tis, pv=None):
             c1.noise_on = c2.noise_on = False
-            ya = core_rollout(c1, x0[:, dyn], doy, n1, tis[:, :n1])
+            ya = core_rollout(c1, x0[:, dyn], doy, n1, tis[:, :n1], prev=pv.index_select(-3, dyn) if W1 else None)
             both = getattr(c1, "entv", False) and getattr(c2, "entv", False)
             c2.ent_init = c1.ent_s2.clone() if both else None
             if a.stage1_m2 and getattr(c2, "nz", 0) == 48:
@@ -866,7 +867,7 @@ def score(a, tags):
                                    for l in range(L - n1)]
             yb = core_rollout(c2, ya[:, -1], doy + n1, L - n1, tis[:, n1:])
             return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, torch.cat([ya, yb], 1))
-        fn.mem = 0
+        fn.mem = W1
         return fn
 
     def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with

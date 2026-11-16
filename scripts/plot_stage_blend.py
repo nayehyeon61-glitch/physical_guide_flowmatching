@@ -103,7 +103,7 @@ def main():
         ax.set_xlabel("lead (days)")
     if a.island:
         y0, y1 = axes[0, 0].get_ylim()
-        axes[0, 0].text(a.island + 0.62, y0 + 0.04 * (y1 - y0), "second stage starts", fontsize=8.5, color=MUTED, va="bottom")
+        axes[0, 0].text(a.island + 0.62, y1 - 0.03 * (y1 - y0), "second stage starts", fontsize=8.5, color=MUTED, va="top")
     fig.legend(handles=handles, loc="lower center", ncol=min(3, len(handles)), frameon=False, fontsize=9.5,
                bbox_to_anchor=(0.5, 0.005))
     fig.suptitle(a.title or f"Blends with {a.base_name}: gains over {a.base_name} alone", x=0.06, y=0.985, ha="left",
