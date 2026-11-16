@@ -233,8 +233,16 @@ class DynCore(nn.Module):
     def perturb(self, x: torch.Tensor, gen: Optional[torch.Generator] = None) -> torch.Tensor:
         """The initial distribution of the entropy core: a flow from one point stays one point, so the members start
         from x + ent x (daily increment std) x white noise smoothed over 3 x 3 cells (unit variance)."""
-        xi = torch.randn(x.shape, generator=gen).to(x)
+        anti = getattr(self, "ent_anti", False)
+        if anti:  # symmetric pairs x +- a xi (members 0 | 1, 2 | 3, ... of every IC): the member mean starts at x itself
+            if x.shape[0] % 2:
+                raise ValueError("symmetric pairs need an even number of members")
+            xi = torch.randn((x.shape[0] // 2,) + tuple(x.shape[1:]), generator=gen).to(x)
+        else:
+            xi = torch.randn(x.shape, generator=gen).to(x)
         xi = F.avg_pool2d(F.pad(F.pad(xi, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="reflect"), 3, 1) * 3.0
+        if anti:
+            xi = torch.stack([xi, -xi], 1).view_as(x)
         return x + self.ent * xi * self.t6 * self.keep
 
     def finish(self, x: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:

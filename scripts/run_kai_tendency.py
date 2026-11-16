@@ -260,6 +260,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
             opts["hnz"] = a.core_hnz
         if a.core_ent:  # only when asked for
             opts["ent"] = a.core_ent
+            if a.core_ent_anti:
+                opts["ent_anti"] = True
         if a.core_entv:  # only when asked for
             opts["entv"] = True
         if a.core_gdycore:  # only when asked for, as above
@@ -578,6 +580,15 @@ def train(a, arm):
                 spr2 = ((ym.var(1, unbiased=True) / s_dyn ** 2) * wl * keep_dyn).mean((0, 2, 3, 4))
                 ssr = torch.sqrt((1 + 1 / Mm) * spr2 / (err2 + 1e-12) + 1e-6)  # (K,); + eps: zero spread at the start
                 sb_log = dict(crps=round(float(loss.detach()), 4), ssr=[round(float(v), 3) for v in ssr.detach()])
+                if a.sb_mean:
+                    # the deterministic goal (owner 2026-11-16): the forecast is the member MEAN, trained by the plain
+                    # rollout loss. Members tied to each other by the entropy term are not independent draws, and a
+                    # fair CRPS of two of them is lowered by moving them apart alone (antithetic pair), so no CRPS
+                    # here. The range: the members' variance about their mean (population form) = the mean's error.
+                    loss = ((((mu - tt) / s_dyn) ** 2) * wl).mean()
+                    ssr = torch.sqrt((Mm - 1) / Mm * spr2 / (err2 + 1e-12) + 1e-6)
+                    sb_log = dict(mse=round(float(loss.detach()), 4), pair_crps=sb_log["crps"],
+                                  ssr=[round(float(v), 3) for v in ssr.detach()])
                 if has_ctrl:
                     sb_log.update(kl=[round(float(v), 3) for v in kl_k.detach()],
                                   sigma=round(float((sg / s_dyn).detach()[:, :, scd].mean()), 3),
@@ -1313,6 +1324,11 @@ def parser():
     p.add_argument("--core-nz", type=int, default=0,
                    help="--core-gfeat: noise input channels next to the physical terms (new every day and member); train with "
                         "--sb-members 2 (CRPS)")
+    p.add_argument("--core-ent-anti", action="store_true",
+                   help="--core-ent: the members start as symmetric pairs x +- a xi, so their mean starts at x")
+    p.add_argument("--sb-mean", action="store_true",
+                   help="--sb-members: the loss is the plain rollout loss of the member MEAN (the deterministic forecast) "
+                        "instead of the CRPS; --sb-ssr then bounds sqrt(members' population variance / mean's error)")
     p.add_argument("--core-entv", action="store_true",
                    help="a deterministic core that carries its entropy as a state: the error variance s^2 grows by "
                         "sigma(x)^2 a day (what a noise would add), log s is an input of the tendency, s is trained by "

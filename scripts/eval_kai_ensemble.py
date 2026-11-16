@@ -106,6 +106,8 @@ def main():
         entv = getattr(core, "entv", False) and m_ == 1
         mse, var = acc["mse"] / n, (acc["var"] / n if (m_ > 1 or entv) else torch.zeros_like(acc["mse"]))
         fin = 1.0 if entv else 1 + 1 / m_  # the finite-ensemble factor (none for the entropy state's own variance)
+        if getattr(core, "ent_anti", False) and m_ > 1:  # symmetric pairs: the population variance about the mean
+            fin = (m_ - 1) / m_
         out = {
             "crps": (acc["crps"] / n)[:, sc].mean(1).tolist(),
             "nrmse_mean": torch.sqrt(mse[:, sc]).mean(1).tolist(),
