@@ -806,6 +806,32 @@ def score(a, tags):
         fn.mem = W
         return fn
 
+    cur_year, m2_tabs = [a.test_year], {}  # the year of the running rollout (second-moment tables); the tables
+
+    def stage_fn(ta, tb, n1):
+        """Two-stage forecast (scripts/eval_kai_ensemble.py --stages): core ``ta`` to day n1, then core ``tb`` from
+        that state, with ta's entropy state when both carry one and the second-moment tables (--stage1-m2) of the
+        year ``cur_year`` when tb takes them."""
+        c1, c2 = get_core(ta), get_core(tb)
+        assert not getattr(c1, "mem", 0) and not getattr(c2, "mem", 0), "two stages: memory cores are not wired"
+
+        def fn(x0, doy, tis, pv=None):
+            c1.noise_on = c2.noise_on = False
+            ya = core_rollout(c1, x0[:, dyn], doy, n1, tis[:, :n1])
+            both = getattr(c1, "entv", False) and getattr(c2, "entv", False)
+            c2.ent_init = c1.ent_s2.clone() if both else None
+            if a.stage1_m2 and getattr(c2, "nz", 0) == 48:
+                yr = cur_year[0]
+                if yr not in m2_tabs:
+                    m2_tabs[yr] = np.load(f"{a.stage1_m2}_{yr}.npy", mmap_mode="r")
+                j = doy.cpu().numpy()
+                c2.features.ext = [torch.from_numpy(np.asarray(m2_tabs[yr][j, l], np.float32)).to(x0.device)
+                                   for l in range(L - n1)]
+            yb = core_rollout(c2, ya[:, -1], doy + n1, L - n1, tis[:, n1:])
+            return x0[:, None].repeat(1, L, 1, 1, 1).index_copy(2, dyn, torch.cat([ya, yb], 1))
+        fn.mem = 0
+        return fn
+
     def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with
         ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location=dev, weights_only=False)
         arm = tag.split("_")[0]
@@ -910,6 +936,16 @@ def score(a, tags):
             if getattr(get_core(ct), "kern", 0):  # the kernel network's part: the same rollout with the kernel k0
                 res[f"{ct}~k0"] = scored(core_fn(ct, k0=True))
             print("scored", ct, "memory diagnostics", flush=True)
+    stage_names = []
+    for spec in a.score_stages:  # NAME=A>B@n: a two-stage forecast, scored and blended like a core
+        name, rest = spec.split("=", 1)
+        ta, rest = rest.split(">")
+        tb, n1 = rest.rsplit("@", 1)
+        fns[name] = stage_fn(ta, tb, int(n1))
+        keep[name] = rollout(fns[name], tez, ics)
+        res[name] = metrics(keep[name])
+        stage_names.append(name)
+        print("scored", name, flush=True)
     for tag in tags:
         m, ck = load(tag)
         models[tag] = m
@@ -1021,9 +1057,11 @@ def score(a, tags):
         kai_m = models[bt]
         sfx = "" if bt == "kai" else f"@{bt}"
         vk, nv = rollout(fns[bt], vaz, vics), len(vics)
-        for other in [t for t in core_tags if t in keep] + [t for t in a.blend_with
-                                                            if t in keep and t not in core_tags and t != bt]:
+        for other in [t for t in core_tags if t in keep] + stage_names + [t for t in a.blend_with
+                                                                          if t in keep and t not in core_tags and t != bt]:
+            cur_year[0] = a.val_year
             vc = rollout(fns[other], vaz, vics)
+            cur_year[0] = a.test_year
             num = gmean(lambda c: (vk[c] - vc[c]) * (vtruth[c] - vc[c]) * w, nv)
             den = gmean(lambda c: (vk[c] - vc[c]) ** 2 * w, nv)
             wk = np.clip(num / np.maximum(den, 1e-30), 0.0, 1.0).astype(np.float32)  # (L, 67) weight of KAI
@@ -1283,6 +1321,10 @@ def parser():
                         "one stationary climate")
     p.add_argument("--gate-lr", type=float, default=1e-2, help="arm gate: learning rate of the 67 mixing weights")
     p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
+    p.add_argument("--score-stages", nargs="*", default=[],
+                   help="NAME=A>B@n: score the two-stage forecast (core A to day n, then core B from A's state; with "
+                        "--stage1-m2 the second-moment tables of a B with 48 such channels) under NAME, alone and in "
+                        "the lead-wise blend with the base KAI (blend_NAME)")
     p.add_argument("--blend-multi", nargs="*", default=[],
                    help="A+B: three-way blend of the base KAI with two kept forecasts (e.g. a short- and a long-range core)")
     p.add_argument("--seq-mix", nargs="*", default=[],
