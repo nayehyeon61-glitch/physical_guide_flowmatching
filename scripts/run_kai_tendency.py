@@ -44,7 +44,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
 from pgcfm.kai_tend import (ARMS, DYN, CachedFeatures, CoreBase, KAIPos, KAIPosConfig, LpLoss, OROG, TISR,  # noqa: E402
-                            config_dict, core_rollout, make_core, needs_core, operator_features)
+                            config_dict, core_continue, core_rollout, hand_memory, make_core, needs_core,
+                            operator_features)
 
 EPS = contract.KAI_STD_EPS
 LAZY_BYTES = 2 ** 30  # a year of daily fields larger than this stays on disk (1.5 deg: 2.9 GB; 5.625 deg: 0.2 GB)
@@ -450,7 +451,13 @@ def train(a, arm):
             mj = build_core(a, mean, std, inc, lat, load=True, tag=a.joint,
                             add_opts=dict(entv=True, isl=True) if a.joint_entv else None)
             assert not any(m.opts.get(k) for k in ("entv", "nz", "ent", "hist", "acc", "kern", "pacc")), m.opts
-            assert not any(mj.opts.get(k) for k in ("nz", "ent", "mem", "hist")), mj.opts
+            assert not any(mj.opts.get(k) for k in ("nz", "ent", "hist")), mj.opts
+            # a second stage WITH the memory (owner 2026-11-17 17:47 KST): it takes over the first stage's memory
+            # at the island (hand_memory) and is stepped on from there, so the two cores must be of the same memory
+            # form; the first stage is frozen (--joint-freeze: no gradient goes back through the memory)
+            mem2 = bool(mj.opts.get("mem"))
+            assert not mem2 or (a.joint_freeze and not a.joint_entv and m.opts.get("mem") == mj.opts.get("mem")
+                                and bool(m.opts.get("mz")) == bool(mj.opts.get("mz"))), (m.opts, mj.opts)
             assert bool(mj.opts.get("entv")) == bool(mj.opts.get("isl")) == bool(a.joint_entv), mj.opts
             assert mj.opts == m.opts or m.opts.get("mem") or a.joint_entv, (m.opts, mj.opts)
             mj.train()
@@ -464,9 +471,17 @@ def train(a, arm):
             mj.grad_ckpt = bool(a.core_ckpt)
             ent_par = [q for k, q in mj.named_parameters() if k.split(".")[0] in ("entv_head", "isl_head")]
             mj_par = [q for k, q in mj.named_parameters() if k.split(".")[0] not in ("entv_head", "isl_head")]
-            opt = torch.optim.AdamW([dict(params=list(m.parameters()) + mj_par)]  # the new entropy heads on their own
-                                    + ([dict(params=ent_par, lr=a.entv_lr)] if ent_par else []),  # (larger) step
-                                    lr=a.core_lr, weight_decay=1e-3)
+            if a.joint_freeze:
+                # the first stage kept exactly as it is (owner 2026-11-17 17:33 KST: the early days are good by the
+                # memory; keep that and let the island's correction and the second stage improve the late days. Step 1
+                # showed why: with the 10-day gradient the first stage lost day 1-5). None of its weights is trained,
+                # its forecast of day 1 to the island is the loaded core's; the island head, the correction and the
+                # second stage are trained on its island states.
+                for q in m.parameters():
+                    q.requires_grad_(False)
+            opt = torch.optim.AdamW([dict(params=([] if a.joint_freeze else list(m.parameters())) + mj_par)]
+                                    + ([dict(params=ent_par, lr=a.entv_lr)] if ent_par else []),  # the new entropy
+                                    lr=a.core_lr, weight_decay=1e-3)                               # heads: a larger step
             if a.joint_kalman:
                 # the island as a Kalman filter (owner 2026-11-17 11:06-11:13 KST: day 0-5 with the entropy, the
                 # Kalman filter at the island, day 6-10 the second core). Prediction: the first stage, the variance
@@ -477,7 +492,10 @@ def train(a, arm):
                 # scripts/diag_island_kalman.py (validation year). The second stage starts from x_a with the
                 # posterior variance P_a = (1 - K)^2 S + K^2 R + 2 K (1 - K) c as its entropy state. The gain reads
                 # S detached: the island head is trained by its log score only, the gain follows the entropy.
-                assert a.joint_entv and a.kal_table and m.opts.get("mem"), "--joint-kalman: --joint-entv, --kal-table, a memory first stage"
+                # --kal-fixed: the gain of the table itself (S = the first stage's error variance at the island per
+                # channel and latitude, the validation year), no island head: K is the same for every state.
+                assert (a.joint_entv or a.kal_fixed) and a.kal_table and m.opts.get("mem"), \
+                    "--joint-kalman: --joint-entv or --kal-fixed, --kal-table, a memory first stage"
                 ckk = torch.load(os.path.join(a.out, f"{a.joint_kalman}.pt"), map_location=dev, weights_only=False)
                 kai_m = build(a, a.joint_kalman.split("_")[0], inc, None)
                 miss = kai_m.load_state_dict(ckk["state"], strict=False)
@@ -489,6 +507,8 @@ def train(a, arm):
                 sd2 = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, -1, 1, 1) ** 2
                 kal = dict(kai=kai_m, rho=torch.as_tensor(tab["rho"], dtype=torch.float32)[None, :, :, None].clamp(-0.99, 0.99).to(dev),
                            R=(torch.as_tensor(tab["R"], dtype=torch.float32)[None, :, :, None] / sd2).clamp_min(1e-8).to(dev))
+                if a.kal_fixed:
+                    kal["S"] = (torch.as_tensor(tab["S"], dtype=torch.float32)[None, :, :, None] / sd2).clamp_min(1e-8).to(dev)
                 del ckk
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
@@ -642,17 +662,19 @@ def train(a, arm):
                 m.ent_members = a.sb_members
                 xd = m.perturb(xd)
             if nj:  # the first stage to the island, the second stage from its state (with the gradient, or without)
-                y1 = core_rollout(m, xd, doy, nj, tg[:, :nj, TISR], prev=pdyn(prev[0]))
+                with torch.set_grad_enabled(not a.joint_freeze):  # a frozen first stage: no graph of its days
+                    y1 = core_rollout(m, xd, doy, nj, tg[:, :nj, TISR], prev=pdyn(prev[0]))
                 xi = y1[:, -1].detach() if a.joint_detach else y1[:, -1]
                 if kal is not None:  # the Kalman island: the correction toward KAI's forecast of the island day
-                    v0k = mj.island_entropy(xi, (doy + nj * st).float() * 24.0)   # log S(x): the island head's graph
-                    with torch.no_grad():
-                        S_ = torch.exp(v0k)
+                    v0k = None if "S" in kal else mj.island_entropy(xi, (doy + nj * st).float() * 24.0)  # log S(x)
+                    with torch.no_grad():                                         # (the island head's graph)
+                        S_ = kal["S"].expand_as(xi) if v0k is None else torch.exp(v0k)
                         z = kal["kai"].rollout(x, doy, nj, tg[:, :nj, TISR], prev=prev[0][:, -1])[:, -1][:, dyn]
                         c_ = kal["rho"] * torch.sqrt(S_ * kal["R"])
                         Kg = ((S_ - c_) / (S_ + kal["R"] - 2 * c_).clamp_min(1e-8)).clamp(0.0, 1.0) * keep_dyn[:, 0]
                         Pa = ((1 - Kg) ** 2 * S_ + Kg ** 2 * kal["R"] + 2 * Kg * (1 - Kg) * c_).clamp_min(1e-8)
-                    mj.isl_fix = (v0k, Pa)
+                    if v0k is not None:
+                        mj.isl_fix = (v0k, Pa)
                     xa = xi + Kg * (z - xi)
                     with torch.no_grad():
                         ti = tg[:, nj - 1, dyn]
@@ -661,7 +683,11 @@ def train(a, arm):
                                           kal_info=round(float((0.5 * torch.log(S_ / Pa) * wl[:, 0] * keep_dyn[:, 0]).mean() * 66.0 / 65.0), 4),
                                           kal_gain=round(float(1 - torch.sqrt(ea / ef)), 4))
                     xi = xa
-                y2 = core_rollout(mj, xi, doy + nj * st, K, tg[:, nj:, TISR])
+                if getattr(mj, "mem", 0):  # the second stage goes on with the first stage's memory: the island's
+                    hand_memory(m, mj)     # correction is an innovation for it
+                    y2 = core_continue(mj, xi, doy + nj * st, K, tg[:, nj:, TISR])
+                else:
+                    y2 = core_rollout(mj, xi, doy + nj * st, K, tg[:, nj:, TISR])
                 y = torch.cat([y1, y2], 1)
             else:
                 y = core_rollout(m, xd, doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
@@ -711,6 +737,8 @@ def train(a, arm):
                 l1, l2 = loss, ((err[:, nj:] ** 2) * wl).mean()  # sequence and orthogonality terms), summed
                 loss = l1 + l2
                 sb_log = dict(mse1=round(float(l1.detach()), 4), mse2=round(float(l2.detach()), 4))
+                if kal is not None and getattr(mj, "isl_head", None) is None:
+                    sb_log.update(kal["log"])
                 if getattr(mj, "isl_head", None) is not None:
                     # the island's entropy: the log score of the first stage's error at the island under
                     # N(0, s_0^2(island state)), and of the second stage's days under its entropy state (which
@@ -1602,9 +1630,14 @@ def parser():
                         "island forecast of this frozen KAI checkpoint with the gain K = (S - c) / (S + R - 2 c), "
                         "S = the island's entropy; the second stage starts from the corrected state with the "
                         "posterior variance")
+    p.add_argument("--kal-fixed", action="store_true",
+                   help="--joint-kalman: the gain of --kal-table itself (S of the table), no island head")
     p.add_argument("--kal-table", default=None,
                    help="--joint-kalman: npz of scripts/diag_island_kalman.py with R (66, H) = KAI's error variance at "
                         "the island and rho = the correlation of its error with the first stage's (validation year)")
+    p.add_argument("--joint-freeze", action="store_true",
+                   help="--joint: the first stage is not trained (its days stay the loaded core's); the second stage, "
+                        "the island head and the island's correction are trained on its island states")
     p.add_argument("--joint-detach", action="store_true",
                    help="--joint: no gradient through the island state (the control: the same steps, the stages apart)")
     p.add_argument("--stage1-m2", default=None,

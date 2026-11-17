@@ -14,9 +14,19 @@
                      x_a +- a sqrt(P_a / S) P_k (what is left of the uncertainty after the correction,
                      P_a = (1 - K)^2 S + K^2 R + 2 K (1 - K) c), their mean is the forecast; a = 0: one run
 
+--kal-days D ...: the same correction on days BEFORE the island as well (a side check: the owner's goal of
+2026-11-17 17:33 KST is to keep the early days as they are and improve the late ones, and KAI's forecast is the only
+thing measured so far that adds to day 1-4), a Kalman filter cycle along the first core: on each of these days
+x_a = x_f + K_d (z_d - x_f), z_d = KAI's forecast of that day, and the corrected state is the start of the next day
+(the memory sees the correction as an innovation). The gain of every day comes from the library year IN SEQUENCE: the errors of day d are those of the
+run that already has the corrections of the days before it. --kal-open: only the output of these days is corrected,
+the core goes on from its own state (= the best linear blend per lead; the comparison).
+
 Under a Gaussian the entropy power of an error is its variance, so K is the owner's entropy form; the entropy taken
 out at the island is I = 1/2 ln(S / P_a) nats per degree of freedom (printed). A memory core that goes on after the
 island sees the correction as an innovation (the input it was trained with) and the noise as its own state.
+A second stage WITH the memory (owner 2026-11-17 17:47 KST; trained by run_kai_tendency.py --joint-freeze with a
+memory core as --joint) takes the first stage's memory over at the island and goes on in the same way.
 Without --kalman this is scripts/diag_island_noise.py with a second stage. Nothing is trained.
 
 Written per amplitude: the forecast in the cache format of scripts/diag_stage_filter.py (``fc_<name>_<year>.npy``),
@@ -38,7 +48,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import run_kai_tendency as R  # noqa: E402
 from diag_island_noise import VARS, get_state, max_diff, run_days, set_state  # noqa: E402
 from pgcfm import contract  # noqa: E402
-from pgcfm.kai_tend import DYN, TISR  # noqa: E402
+from pgcfm.kai_tend import DYN, TISR, core_step, hand_memory  # noqa: E402
 
 
 def main():
@@ -48,6 +58,8 @@ def main():
     p.add_argument("--gain", default="corr", choices=["corr", "plain", "isl"])
     p.add_argument("--robust", type=float, default=0.0, help="> 0: Student-t weight with this many degrees of freedom")
     p.add_argument("--n1", type=int, default=5, help="the island")
+    p.add_argument("--kal-days", type=int, nargs="*", default=[], help="days before the island with the same correction")
+    p.add_argument("--kal-open", action="store_true", help="--kal-days: correct the output only, no feedback to the core")
     p.add_argument("--amps", type=float, nargs="+", default=[0.0], help="noise after the island (0 = one run)")
     p.add_argument("--shape", default="err", choices=["err", "white"])
     p.add_argument("--members", type=int, default=8, help="even: symmetric pairs")
@@ -87,9 +99,13 @@ def main():
     sd2 = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, -1, 1, 1) ** 2   # the entropy state's unit
     W1 = getattr(core, "mem", 0)
     assert W1 or not getattr(core, "hist", False)
-    assert core2 is None or not (getattr(core2, "mem", 0) or getattr(core2, "hist", False)), "a plain second stage"
+    # a second stage WITH the memory (owner 2026-11-17 17:47 KST): it takes over the first stage's memory at the
+    # island (hand_memory), so the island's correction is an innovation for it, as for the same core going on
+    W2 = getattr(core2, "mem", 0) if core2 is not None else 0
+    assert core2 is None or (W2 == W1 and getattr(core2, "mz", False) == getattr(core, "mz", False)) or not (
+        W2 or getattr(core2, "hist", False)), "a plain second stage, or one of the first stage's memory form"
     cont = core2 if core2 is not None else core   # the core of the days after the island
-    Wc = W1 if core2 is None else 0               # ... carries the first stage's memory when it is the same core
+    Wc = W1 if (core2 is None or W2) else 0       # ... carries the first stage's memory: the same core, or a memory core
     nan = lambda: sum(int(getattr(getattr(c, "features", None), "n_nan", 0)) for c in (core, core2) if c is not None)  # noqa: E731
     kai = None
     if a.kalman:
@@ -120,15 +136,33 @@ def main():
         if W1:
             core.reset(pv, doy.float() * 24.0, x0)
 
-    def kai_day(tez, j):
-        """(len(j), 66, H, W): KAI's forecast of day n1 from the ICs j."""
+    def kai_days(tez, j):
+        """(len(j), n1, 66, H, W): KAI's forecasts of day 1 .. n1 from the ICs j."""
         out = []
         with torch.no_grad():
             for i in range(0, len(j), 16):
                 q = j[i:i + 16]
                 tis = torch.stack([tez[q + k + 1] for k in range(n1)], 1)[:, :, TISR]
-                out.append(kai.rollout(tez[q], torch.tensor(q), n1, tis, prev=tez[np.maximum(q - 1, 0)])[:, -1][:, DYN])
+                out.append(kai.rollout(tez[q], torch.tensor(q), n1, tis, prev=tez[np.maximum(q - 1, 0)])[:, :, DYN])
         return torch.cat(out)
+
+    early = sorted({d for d in a.kal_days if 0 < d < n1}) if a.kalman else []   # corrected days before the island
+    feed, st1, keep5 = not a.kal_open, getattr(core, "stride", 1), keep.unsqueeze(1)
+
+    def stage1(x0, doy, tis, zs, Kd):
+        """Day 1 .. n1 of the first core with the corrections Kd (day -> gain) toward zs: (the forecasts as they
+        leave the core, the outputs); with ``feed`` the corrected state is the start of the next day."""
+        x, raw, outp = x0, [], []
+        for k in range(n1):
+            x = core_step(core, x, doy + k * st1, tis[:, k])
+            raw.append(x)
+            if k + 1 in Kd:
+                xc = x + Kd[k + 1] * (zs[:, k] - x) * keep
+                outp.append(xc)
+                x = xc if feed else x
+            else:
+                outp.append(x)
+        return torch.stack(raw, 1), torch.stack(outp, 1)
 
     # ---- the library: the first core's day-n1 errors over the library year (as scripts/diag_island_noise.py)
     lib_path = os.path.join(a.out, f"isn_lib_{a.tag}_{n1}_{lib_year}_s{a.lib_stride}.npz")
@@ -153,16 +187,49 @@ def main():
     lib_rms = torch.sqrt((lib ** 2).mean(0))
     print(f"library {lib_year}: {len(lib)} patterns, rms {float(lib_rms[sc].mean()):.3f} state std", flush=True)
 
+    ktag = ("_d" + "".join(str(d) for d in early) + ("o" if a.kal_open else "")) if early else ""
     out = {"tag": a.tag, "stage2": a.stage2, "kalman": a.kalman, "gain": a.gain, "robust": a.robust, "n1": n1,
            "members": M, "shape": a.shape, "year": year, "lib_year": lib_year, "lib": int(len(lib))}
     g = lambda v, d=3: " ".join(f"{x:.{d}f}" for x in v)  # noqa: E731
     K = var_d = None
     post = torch.ones(1, len(DYN), 1, 1)
+    Ke = {}
     if kai is not None:
         # ---- the gain: error statistics of the island in the library year, per channel and latitude
-        ez = (kai_day(tez, ld) - tez[ld + n1][:, DYN]) * keep
+        zl = kai_days(tez, ld)
+        ezl = (zl - torch.stack([tez[ld + k + 1] for k in range(n1)], 1)[:, :, DYN]) * keep5
+        ez, lib_k = ezl[:, -1], lib
         m3 = lambda v: v.double().mean((0, -1), keepdim=True)  # noqa: E731  (1, 66, H, 1)
-        S, Rv, c = m3(lib ** 2), m3(ez ** 2), m3(lib * ez)
+        if early:   # the gains of the days before the island, in sequence (every day sees the corrections before it)
+            def lib_run(Kd):
+                """The first core's errors of day 1 .. n1 over the library year with the corrections Kd."""
+                errs = []
+                for i in range(0, len(ld), B0 * M):
+                    j = ld[i:i + B0 * M]
+                    jp, x0, doy, tis, pv = batch(tez, j, B0 * M)
+                    zc = zl[i:i + len(j)]
+                    zc = torch.cat([zc, zc[-1:].expand(B0 * M - len(j), *zc.shape[1:])])
+                    with torch.no_grad():
+                        start(x0, doy, pv)
+                        raw = stage1(x0, doy, tis, zc, Kd)[0][:len(j)]
+                    errs.append((raw - torch.stack([tez[j + k + 1] for k in range(n1)], 1)[:, :, DYN]) * keep5)
+                return torch.cat(errs)
+
+            def gain_of(ef, ek):
+                S_, R_, c_ = m3(ef ** 2), m3(ek ** 2), m3(ef * ek)
+                Kd = S_ / (S_ + R_).clamp_min(1e-12) if a.gain == "plain" else (S_ - c_) / (S_ + R_ - 2 * c_).clamp_min(1e-12)
+                return Kd.clamp(0, 1).float(), float(np.sqrt((S_ * w.view(1, 1, -1, 1).double()).mean((0, 2, 3)).numpy()[sc]).mean())
+            t0, el, rms_e = time.time(), lib_run({}), {}
+            for d in early:
+                if feed and Ke:
+                    el = lib_run(Ke)
+                Ke[d], rms_e[d] = gain_of(el[:, d - 1], ezl[:, d - 1])
+                print(f"gain of day {d}: K {float((Ke[d].double() * w.view(1, 1, -1, 1)).mean((0, 2, 3))[sc].mean()):.3f}, "
+                      f"core rms {rms_e[d]:.3f}, {time.time() - t0:.0f} s", flush=True)
+            lib_k = (lib_run(Ke) if feed else el)[:, -1]   # the island's errors after the earlier corrections
+            out["kal_days"], out["kal_open"] = early, bool(a.kal_open)
+            out["early_K"] = {str(d): float((Ke[d].double() * w.view(1, 1, -1, 1)).mean((0, 2, 3))[sc].mean()) for d in early}
+        S, Rv, c = m3(lib_k ** 2), m3(ez ** 2), m3(lib_k * ez)
         var_d = (S + Rv - 2 * c).clamp_min(1e-12)
         K = (S / (S + Rv).clamp_min(1e-12) if a.gain == "plain" else (S - c) / var_d).clamp(0, 1)
         Pa = (1 - K) ** 2 * S + K ** 2 * Rv + 2 * K * (1 - K) * c
@@ -172,7 +239,7 @@ def main():
         info = 0.5 * torch.log(S.clamp_min(1e-12) / Pa.clamp_min(1e-12))
         rho = c / torch.sqrt(S * Rv).clamp_min(1e-12)
         # the table of the island (state units): for --joint-kalman of scripts/run_kai_tendency.py and --gain isl
-        np.savez(os.path.join(a.out, f"kal_tab_{a.tag}_{n1}_{lib_year}_s{a.lib_stride}.npz"), S=S[0, :, :, 0].numpy(),
+        np.savez(os.path.join(a.out, f"kal_tab_{a.tag}_{n1}_{lib_year}_s{a.lib_stride}{ktag}.npz"), S=S[0, :, :, 0].numpy(),
                  R=Rv[0, :, :, 0].numpy(), c=c[0, :, :, 0].numpy(), rho=rho[0, :, :, 0].numpy())
         out["gain_stats"] = {"K": float(am(K)[sc].mean()), "rho": float(am(rho)[sc].mean()),
                              "S_over_R": float((am(S)[sc] / am(Rv)[sc]).mean()),
@@ -227,7 +294,7 @@ def main():
                                   act=np.sqrt(pp[:, q] / tt[:, q]).tolist()) for v, q, s in zip(VARS, vi, vstd)})
 
     base = a.tag + (f"+{a.stage2}" if a.stage2 else "")
-    kal = (f"-K{a.gain}" + (f"t{a.robust:g}" if a.robust else "")) if kai is not None else ""
+    kal = (f"-K{a.gain}" + (f"t{a.robust:g}" if a.robust else "") + ktag.replace("_", "")) if kai is not None else ""
     names = {amp: f"isn-{base}{kal}-{a.shape}{amp:g}-m{M if amp else 1}" for amp in a.amps}
     kinds = [f"m{2 * k}" for k in range(1, M // 2 + 1)] + ["one"]
     acc = {"central": 0.0, "kai": 0.0, **{(amp, k): 0.0 for amp in a.amps for k in kinds}}
@@ -256,15 +323,22 @@ def main():
         with torch.no_grad():
             n0 = nan()
             start(x0, doy, pv)
-            ya = run_days(core, x0, doy, range(n1), tis)                         # the prediction up to the island
+            ya = ya0 = run_days(core, x0, doy, range(n1), tis)                   # the prediction up to the island
             state = get_state(core) if Wc else None
+            if W2:
+                hand_memory(core, cont)
             cen = torch.cat([ya, run2(ya[:, -1], doy, tis)], 1)[:nb]
             nans["central"] += nan() - n0
             acc["central"] = acc["central"] + sums(cen, Tb, Cb)
             cen_fc.append(cen.numpy().astype(np.float16))
             xa, fix = ya[:, -1], None
-            if kai is not None:                                                  # the correction at the island
-                z = kai_day(tez, jp)
+            if kai is not None:
+                zs = kai_days(tez, jp)
+                if early:   # again from the IC, with the corrections of the days before the island
+                    start(x0, doy, pv)
+                    raw, ya = stage1(x0, doy, tis, zs, Ke)
+                    state, xa = get_state(core) if Wc else None, raw[:, -1]
+                z = zs[:, -1]                                                    # the correction at the island
                 d = (z - xa) * keep
                 Kx, vd, Pa_x, v0 = K, var_d, Pa_s.expand_as(xa), None
                 if ent2:
@@ -282,8 +356,8 @@ def main():
                 wsum = wsum + float(wt[:nb].mean()) * nb
                 xa = xa + Kx * wt * d
                 zz = cen.clone()
-                zz[:, n1 - 1] = (z * keep + ya[:, -1] * (1 - keep))[:nb]
-                acc["kai"] = acc["kai"] + sums(zz, Tb, Cb)                       # only its day n1 is KAI's
+                zz[:, :n1] = (zs * keep5 + ya0 * (1 - keep5))[:nb]
+                acc["kai"] = acc["kai"] + sums(zz, Tb, Cb)                       # only its days 1 .. n1 are KAI's
             head = torch.cat([ya[:, :n1 - 1], xa[:, None]], 1)[:nb]              # day 1 .. n1, the island corrected
             for amp in a.amps:
                 n0 = nan()
@@ -292,7 +366,7 @@ def main():
                 pert = (torch.stack([P1, -P1], 2).reshape(B0 * M, *P1.shape[2:]) * amp * post if amp
                         else torch.zeros_like(xa))
                 if Wc:  # the correction is an innovation for the memory, the noise is its own state
-                    set_state(core, state, Me, pert)
+                    set_state(cont, state, Me, pert)
                 y = run2(rep(xa) + pert, rep(doy), rep(tis), None if fix is None else tuple(rep(v) for v in fix))
                 y = y.view(B0, Me, L - n1, len(DYN), *x0.shape[-2:])[:nb]
                 nans[amp] += nan() - n0
@@ -325,6 +399,10 @@ def main():
             print(f"== the gain from the island's entropy: mean K(x) {ksum / N:.3f} (table of {lib_year}: {out['gain_stats']['K']:.3f})")
         print(f"== day {n1} (the island): nRMSE core {c['nrmse'][n1 - 1]:.4f}, KAI {kz['nrmse'][n1 - 1]:.4f}; "
               f"ACC core {c['acc'][n1 - 1]:.4f}, KAI {kz['acc'][n1 - 1]:.4f}; mean robust weight {wsum / N:.3f}")
+        print(f"== KAI alone, day 1..{n1}: nRMSE {g(kz['nrmse'][:n1])} | ACC {g(kz['acc'][:n1])}")
+        if early:
+            print(f"== corrections on day {early} ({'output only' if a.kal_open else 'fed back to the core'}), mean K "
+                  + " ".join(f"{out['early_K'][str(d)]:.3f}" for d in early))
     for amp in a.amps:
         name = names[amp]
         r = {k: score(acc[amp, k]) for k in kinds}

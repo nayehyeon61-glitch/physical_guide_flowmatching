@@ -687,6 +687,35 @@ def core_rollout(core, xd, doy, steps, tisr=None, prev=None):
     return torch.stack(out, 1)
 
 
+MEM_STATE = ("m", "prev", "gprev", "fc", "z", "M", "PD")  # a memory core's tensors of ONE trajectory
+
+
+def hand_memory(src, dst):
+    """A second memory core goes on with the first one's memory (owner 2026-11-17 17:47 KST: the second core of the
+    two-stage forecast should have the memory too). ``dst`` takes over the state of the trajectory ``src`` was stepped
+    along: the memory, the state before the last step and its physical terms, the last forecast (and the long-memory
+    accumulators). The state ``dst`` is stepped from next is compared with that last forecast, so a correction made
+    at the hand-over (the island's Kalman correction) enters the second core's memory as an innovation. No gradient
+    goes back to ``src``. Both cores must be of the same memory form."""
+    for k in ("mem", "mem_ch", "mz", "acc", "kern", "pacc"):
+        assert getattr(src, k, None) == getattr(dst, k, None), f"hand_memory: the cores differ in {k}"
+    for k in MEM_STATE:
+        v = getattr(src, k, None)
+        setattr(dst, k, v.detach() if torch.is_tensor(v) else None)
+    dst.past = [v.detach() for v in getattr(src, "past", [])]
+    dst.started, dst.seq = True, None
+
+
+def core_continue(core, x, doy, steps, tisr=None):
+    """``steps`` more solver steps from x WITHOUT a new start of the core's memory (after hand_memory, or the same
+    core going on): doy = the day of x, tisr (B, steps, H, W) = the forcing at the end of each step."""
+    out, st = [], getattr(core, "stride", 1)
+    for k in range(steps):
+        x = core_step(core, x, doy + k * st, None if tisr is None else tisr[:, k])
+        out.append(x)
+    return torch.stack(out, 1)
+
+
 class CoreBase:
     """The frozen tendency core as a map of the full 67-channel state: (x, doy, tisr_next) -> next-day state.
     ``prev`` (history cores): the full state one day before x; None = no trend.
