@@ -60,6 +60,8 @@ def main():
     p.add_argument("--n1", type=int, default=5, help="the island")
     p.add_argument("--kal-days", type=int, nargs="*", default=[], help="days before the island with the same correction")
     p.add_argument("--kal-open", action="store_true", help="--kal-days: correct the output only, no feedback to the core")
+    p.add_argument("--kai-fc", nargs="?", const="save", default=None, choices=["save", "only"],
+                   help="also save KAI's forecasts of all leads (fc_<kalman>_<year>.npy); only: nothing else")
     p.add_argument("--amps", type=float, nargs="+", default=[0.0], help="noise after the island (0 = one run)")
     p.add_argument("--shape", default="err", choices=["err", "white"])
     p.add_argument("--members", type=int, default=8, help="even: symmetric pairs")
@@ -136,15 +138,23 @@ def main():
         if W1:
             core.reset(pv, doy.float() * 24.0, x0)
 
-    def kai_days(tez, j):
-        """(len(j), n1, 66, H, W): KAI's forecasts of day 1 .. n1 from the ICs j."""
-        out = []
+    def kai_days(tez, j, n=None):
+        """(len(j), n, 66, H, W): KAI's forecasts of day 1 .. n (default n1) from the ICs j."""
+        out, n = [], n or n1
         with torch.no_grad():
             for i in range(0, len(j), 16):
                 q = j[i:i + 16]
-                tis = torch.stack([tez[q + k + 1] for k in range(n1)], 1)[:, :, TISR]
-                out.append(kai.rollout(tez[q], torch.tensor(q), n1, tis, prev=tez[np.maximum(q - 1, 0)])[:, :, DYN])
+                tis = torch.stack([tez[q + k + 1] for k in range(n)], 1)[:, :, TISR]
+                out.append(kai.rollout(tez[q], torch.tensor(q), n, tis, prev=tez[np.maximum(q - 1, 0)])[:, :, DYN])
         return torch.cat(out)
+
+    if a.kai_fc and kai is not None and not a.max_ics:   # KAI's own forecasts of every lead, in the cache format
+        pk = os.path.join(a.out, f"fc_{a.kalman}_{year}.npy")
+        if not os.path.exists(pk):
+            np.save(pk, kai_days(Z[year], np.arange(0, len(Z[year]) - L, a.ic_stride), L).numpy().astype(np.float16))
+            print(f"saved {pk}", flush=True)
+        if a.kai_fc == "only":
+            return
 
     early = sorted({d for d in a.kal_days if 0 < d < n1}) if a.kalman else []   # corrected days before the island
     feed, st1, keep5 = not a.kal_open, getattr(core, "stride", 1), keep.unsqueeze(1)
