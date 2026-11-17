@@ -420,13 +420,23 @@ def train(a, arm):
             # trained, each with its own days' loss, on rollouts of --stage1-days + K days. The error of the days after
             # the island reaches the first stage through the island state; --joint-detach cuts exactly that path
             # (the control: the same batches and steps, every stage with its own loss only).
-            assert a.init and not a.stage1 and not W and not hist and a.sb_members == 1, "--joint: plain cores, --init"
+            # The first stage may be a memory core (owner 2026-11-17 09:51 KST: the double core on the 8-day memory
+            # core, first trained on the 10 days, then tuned at the 5-day island): it is warmed up on the W days
+            # before the IC and keeps the loss of its own training (the Mori-Zwanzig sequence + its days); the
+            # second stage is a plain core.
+            assert a.init and not a.stage1 and not a.core_hist and a.sb_members == 1, "--joint: --init, no history core"
             mj = build_core(a, mean, std, inc, lat, load=True, tag=a.joint)
-            assert mj.opts == m.opts and not any(m.opts.get(k) for k in ("entv", "nz", "ent", "mem", "hist")), mj.opts
+            assert not any(m.opts.get(k) for k in ("entv", "nz", "ent", "hist", "acc", "kern", "pacc")), m.opts
+            assert not any(mj.opts.get(k) for k in ("entv", "nz", "ent", "mem", "hist")), mj.opts
+            assert mj.opts == m.opts or m.opts.get("mem"), (m.opts, mj.opts)
             mj.train()
-            for (k, q), (k2, q2) in zip(m.named_parameters(), mj.named_parameters()):
-                assert k == k2
-                q2.requires_grad_(q.requires_grad)
+            if mj.opts == m.opts:
+                for (k, q), (k2, q2) in zip(m.named_parameters(), mj.named_parameters()):
+                    assert k == k2
+                    q2.requires_grad_(q.requires_grad)
+            else:  # a first stage of another form: every weight of the second stage is trained (a new core has no
+                for q2 in mj.parameters():  # frozen weight; build_core froze the loaded one as a whole)
+                    q2.requires_grad_(True)
             mj.grad_ckpt = bool(a.core_ckpt)
             opt = torch.optim.AdamW(list(m.parameters()) + list(mj.parameters()), lr=a.core_lr, weight_decay=1e-3)
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
@@ -557,7 +567,9 @@ def train(a, arm):
         torch.set_rng_state(ck["torch_rng"].cpu())  # map_location moved it to the GPU; the CPU generator needs a CPU ByteTensor
         log, it0, t0 = ck["log"], ck["it"], time.time() - ck["sec"]
         print(json.dumps(dict(resumed_at=it0)), flush=True)
-    for it in range(it0 + 1, a.iters + 1):
+    A = max(1, a.accum)  # --accum: an optimizer step = the mean gradient of A batches (the memory of one of them)
+    for sit in range(it0 * A + 1, a.iters * A + 1):
+        it = (sit + A - 1) // A
         K = cur[min(len(cur) - 1, (it - 1) * len(cur) // a.iters)]
         n1 = a.stage1_days if (is_core and s1 is not None) else 0
         nj = a.stage1_days if (is_core and mj is not None) else 0
@@ -579,20 +591,21 @@ def train(a, arm):
                 m.ent_members = a.sb_members
                 xd = m.perturb(xd)
             if nj:  # the first stage to the island, the second stage from its state (with the gradient, or without)
-                y1 = core_rollout(m, xd, doy, nj, tg[:, :nj, TISR])
+                y1 = core_rollout(m, xd, doy, nj, tg[:, :nj, TISR], prev=pdyn(prev[0]))
                 y2 = core_rollout(mj, y1[:, -1].detach() if a.joint_detach else y1[:, -1], doy + nj * st, K,
                                   tg[:, nj:, TISR])
                 y = torch.cat([y1, y2], 1)
             else:
                 y = core_rollout(m, xd, doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
             err = (y - tg[:, :, dyn]) / s_dyn
+            err1 = err[:, :nj] if nj else err  # the days of this core (--joint: the first stage's)
             if getattr(m, "mz", False):
                 # Mori-Zwanzig form on the sequence: the W days before the batch's start are forecast one by one
                 # (first from an empty memory = the Markov term, then with the memory integral up to that day)
                 # and enter the loss with the rollout; W + K supervised positions
                 seq_true = torch.cat([pdyn(prev[0])[:, 1:], x[:, None, dyn]], 1)
                 es = (m.seq - seq_true) / s_dyn
-                loss = ((torch.cat([es, err], 1) ** 2) * wl).mean()
+                loss = ((torch.cat([es, err1], 1) ** 2) * wl).mean()
                 # the noise term is orthogonal to the past: consecutive one-step residuals of the sequence (the W
                 # forecasts and the first rollout day, all started from data) must not be correlated at lag 1, 2
                 r = torch.cat([es, err[:, :1]], 1) * keep_dyn
@@ -624,12 +637,12 @@ def train(a, arm):
                     acc_log.append(round(float(c.detach()[scd].mean()), 4))
                     if a.mz_acc_orth > 0:
                         loss = loss + a.mz_acc_orth * (c[scd] ** 2).mean()
-            elif nj:  # every stage's days as in its own training (mean over its days), summed
-                l1, l2 = ((err[:, :nj] ** 2) * wl).mean(), ((err[:, nj:] ** 2) * wl).mean()
+            else:
+                loss = ((err1 ** 2) * wl).mean()
+            if nj:  # every stage's days as in its own training (mean over its days; a memory first stage with its
+                l1, l2 = loss, ((err[:, nj:] ** 2) * wl).mean()  # sequence and orthogonality terms), summed
                 loss = l1 + l2
                 sb_log = dict(mse1=round(float(l1.detach()), 4), mse2=round(float(l2.detach()), 4))
-            else:
-                loss = ((err ** 2) * wl).mean()
             if getattr(m, "entv", False):
                 # the entropy state of the deterministic run: the log score of the day's error under N(0, s^2)
                 # (its expectation is the cross entropy - int p log q). The error is detached and the tendency reads
@@ -704,8 +717,11 @@ def train(a, arm):
         else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
             y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
             loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
-        opt.zero_grad()
-        loss.backward()
+        if sit % A == 1 or A == 1:
+            opt.zero_grad()
+        (loss / A if A > 1 else loss).backward()
+        if sit % A:
+            continue
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         if is_core and mj is not None:
             torch.nn.utils.clip_grad_norm_(mj.parameters(), 1.0)
@@ -1550,6 +1566,9 @@ def parser():
     p.add_argument("--device", default="cpu", help="cuda: train and score on a GPU (the data stays in main memory)")
     p.add_argument("--lazy", action="store_true",
                    help="keep the years on disk and normalize per batch (automatic above 1 GB a year: the 1.5 deg grid)")
+    p.add_argument("--accum", type=int, default=1,
+                   help="an optimizer step is the mean gradient of this many batches of --batch (a long rollout that "
+                        "does not fit in memory at the full batch: --batch 4 --accum 2 = batch 8)")
     p.add_argument("--core-ckpt", action="store_true",
                    help="core training: gradient checkpointing per day, the activations of a day are recomputed in "
                         "the backward pass (a fine grid with --core-substeps: a sequence costs the memory of one day)")
