@@ -226,9 +226,11 @@ def constants_of(a, lat):
     raise FileNotFoundError(f"no constants_*deg.nc with the data's {len(lat)} latitudes under {a.era5}/constants")
 
 
-def build_core(a, mean, std, inc, lat, load=True, tag=None):
+def build_core(a, mean, std, inc, lat, load=True, tag=None, add_opts=None):
     """The tendency core ``tag`` (default --core-tag): built from the options saved in its checkpoint, frozen.
-    ``load=False``: a new core from the command line options (training)."""
+    ``load=False``: a new core from the command line options (training). ``add_opts`` (with load): options the
+    loaded core gets on top of its own (entv, isl: a plain second stage becomes an entropy core); the weights that
+    read the new input channels start at zero and the new heads as a new core's, so the forecast is the same."""
     from pgcfm.core import static_features
     oro, lsm, lon = constants_of(a, lat)
     contract.register_latitudes(lat)
@@ -280,9 +282,26 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None):
     if load:
         ck = torch.load(os.path.join(a.out, f"{tag or a.core_tag}.pt"), map_location="cpu", weights_only=False)
         opts = ck.get("core_opts", dict(hidden=a.core_hidden, blocks=list(a.core_blocks), norm="bn", substeps=1))
+        if add_opts:
+            opts = {**opts, **add_opts}
     core = make_core(static_features(lat, lon, oro, lsm), inc, mean, std, lat, **opts)
     core.opts = opts
-    if load:
+    if load and add_opts and opts != ck.get("core_opts"):
+        new, state = core.state_dict(), {}
+        for k, v in ck["state"].items():
+            if new[k].shape != v.shape:  # more input channels, appended after the old ones
+                assert new[k].shape[0] == v.shape[0] and new[k].shape[2:] == v.shape[2:] and new[k].shape[1] > v.shape[1], k
+                w = torch.zeros_like(new[k])
+                w[:, :v.shape[1]] = v
+                v = w
+            state[k] = v
+        miss = core.load_state_dict(state, strict=False)
+        assert not miss.unexpected_keys and all(k.split(".")[0] in ("entv_head", "isl_head", "isl_scale", "isl_n")
+                                                for k in miss.missing_keys), miss
+        core.eval()
+        for p in core.parameters():
+            p.requires_grad_(False)
+    elif load:
         core.load_state_dict(ck["state"])
         core.eval()
         for p in core.parameters():
@@ -425,10 +444,15 @@ def train(a, arm):
             # before the IC and keeps the loss of its own training (the Mori-Zwanzig sequence + its days); the
             # second stage is a plain core.
             assert a.init and not a.stage1 and not a.core_hist and a.sb_members == 1, "--joint: --init, no history core"
-            mj = build_core(a, mean, std, inc, lat, load=True, tag=a.joint)
+            # --joint-entv (the owner's island entropy): the second stage as an entropy core whose state starts from
+            # the island's entropy (make_core, isl), trained by the log score of the first stage's error at the
+            # island and of its own days; a plain second stage is widened to that form (build_core, add_opts).
+            mj = build_core(a, mean, std, inc, lat, load=True, tag=a.joint,
+                            add_opts=dict(entv=True, isl=True) if a.joint_entv else None)
             assert not any(m.opts.get(k) for k in ("entv", "nz", "ent", "hist", "acc", "kern", "pacc")), m.opts
-            assert not any(mj.opts.get(k) for k in ("entv", "nz", "ent", "mem", "hist")), mj.opts
-            assert mj.opts == m.opts or m.opts.get("mem"), (m.opts, mj.opts)
+            assert not any(mj.opts.get(k) for k in ("nz", "ent", "mem", "hist")), mj.opts
+            assert bool(mj.opts.get("entv")) == bool(mj.opts.get("isl")) == bool(a.joint_entv), mj.opts
+            assert mj.opts == m.opts or m.opts.get("mem") or a.joint_entv, (m.opts, mj.opts)
             mj.train()
             if mj.opts == m.opts:
                 for (k, q), (k2, q2) in zip(m.named_parameters(), mj.named_parameters()):
@@ -438,7 +462,11 @@ def train(a, arm):
                 for q2 in mj.parameters():  # frozen weight; build_core froze the loaded one as a whole)
                     q2.requires_grad_(True)
             mj.grad_ckpt = bool(a.core_ckpt)
-            opt = torch.optim.AdamW(list(m.parameters()) + list(mj.parameters()), lr=a.core_lr, weight_decay=1e-3)
+            ent_par = [q for k, q in mj.named_parameters() if k.split(".")[0] in ("entv_head", "isl_head")]
+            mj_par = [q for k, q in mj.named_parameters() if k.split(".")[0] not in ("entv_head", "isl_head")]
+            opt = torch.optim.AdamW([dict(params=list(m.parameters()) + mj_par)]  # the new entropy heads on their own
+                                    + ([dict(params=ent_par, lr=a.entv_lr)] if ent_par else []),  # (larger) step
+                                    lr=a.core_lr, weight_decay=1e-3)
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
         keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1).to(dev)
@@ -643,6 +671,30 @@ def train(a, arm):
                 l1, l2 = loss, ((err[:, nj:] ** 2) * wl).mean()  # sequence and orthogonality terms), summed
                 loss = l1 + l2
                 sb_log = dict(mse1=round(float(l1.detach()), 4), mse2=round(float(l2.detach()), 4))
+                if getattr(mj, "isl_head", None) is not None:
+                    # the island's entropy: the log score of the first stage's error at the island under
+                    # N(0, s_0^2(island state)), and of the second stage's days under its entropy state (which
+                    # starts at s_0^2 and grows by the second stage's own production). Errors detached: these terms
+                    # train the two entropy heads only, the forecasts keep their losses.
+                    e0 = err[:, nj - 1].detach() ** 2                              # (B, 66, H, W)
+                    with torch.no_grad():  # the usual size of that error per channel: a running mean
+                        c0 = ((e0 * wl[:, 0]).mean((0, 2, 3)) + 1e-8).view(1, -1, 1, 1)
+                        if float(mj.isl_n) == 0:
+                            mj.isl_scale.copy_(torch.where(keep_dyn[:, 0] > 0, c0, mj.isl_scale))
+                        else:
+                            mj.isl_scale.lerp_(torch.where(keep_dyn[:, 0] > 0, c0, mj.isl_scale), 0.02)
+                        mj.isl_n += 1
+                    v0 = mj.isl_v
+                    nll0 = (0.5 * (v0 + e0 * torch.exp(-v0)) * wl[:, 0] * keep_dyn[:, 0]).mean() * (66.0 / 65.0)
+                    vs = torch.stack(mj.v_log, 1)                                  # (B, K, 66, H, W) log variance
+                    e2 = err[:, nj:].detach() ** 2
+                    nll2 = (0.5 * (vs + e2 * torch.exp(-vs)) * wl * keep_dyn).mean() * (66.0 / 65.0)
+                    loss = loss + a.entv_lam * (nll0 + nll2)
+                    cal0 = torch.sqrt((torch.exp(v0) * wl[:, 0] * keep_dyn[:, 0]).mean() / ((e0 * wl[:, 0] * keep_dyn[:, 0]).mean() + 1e-12))
+                    cal = torch.sqrt((torch.exp(vs) * wl * keep_dyn).mean((0, 2, 3, 4)) / ((e2 * wl * keep_dyn).mean((0, 2, 3, 4)) + 1e-12))
+                    sb_log.update(nll0=round(float(nll0.detach()), 4), nll2=round(float(nll2.detach()), 4),
+                                  cal0=round(float(cal0.detach()), 3), cal=[round(float(v), 3) for v in cal.detach()],
+                                  isl_sd=round(float(v0.detach().mul(0.5).exp().std() / v0.detach().mul(0.5).exp().mean()), 3))
             if getattr(m, "entv", False):
                 # the entropy state of the deterministic run: the log score of the day's error under N(0, s^2)
                 # (its expectation is the cross entropy - int p log q). The error is detached and the tendency reads
@@ -724,7 +776,9 @@ def train(a, arm):
             continue
         torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         if is_core and mj is not None:
-            torch.nn.utils.clip_grad_norm_(mj.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(mj_par, 1.0)
+            if ent_par:
+                torch.nn.utils.clip_grad_norm_(ent_par, 1.0)
         opt.step()
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
@@ -1496,6 +1550,11 @@ def parser():
                         "the trained second-stage core of this tag (the --curriculum days after): one rollout through "
                         "the island, each stage with the loss of its own days")
     p.add_argument("--joint-tag", default=None, help="--joint: name of the second stage's new checkpoint (default <joint>_j)")
+    p.add_argument("--joint-entv", action="store_true",
+                   help="--joint: the second stage carries an entropy state that starts from the island's entropy, read "
+                        "off the island state by a head trained on the first stage's error there (owner 2026-11-17: "
+                        "tuning at the 5-day island with the entropy); a plain second stage is widened to that form")
+    p.add_argument("--entv-lr", type=float, default=2e-3, help="--joint-entv: learning rate of the new entropy heads")
     p.add_argument("--joint-detach", action="store_true",
                    help="--joint: no gradient through the island state (the control: the same steps, the stages apart)")
     p.add_argument("--stage1-m2", default=None,

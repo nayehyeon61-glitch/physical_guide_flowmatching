@@ -129,8 +129,18 @@ class DynCore(nn.Module):
         if getattr(self.cfg, "entv", False):
             if self.ent_s2 is None or self.ent_s2.shape != x.shape:
                 init = getattr(self, "ent_init", None)  # a second stage starts from the first stage's entropy
-                self.ent_s2 = (init.to(x).clone() if init is not None and init.shape == x.shape
-                               else torch.full_like(x, self.entv_a0 ** 2))
+                isl = getattr(self, "isl_head", None)
+                if isl is not None:
+                    # the island's entropy (kai_tend.make_core, isl): the first stage carries no entropy state, so
+                    # the variance of the state this core starts from is read off that state, log s^2 = log(scale)
+                    # + head(x, static, time); trained by the log score of the first stage's error at the island
+                    # (trainer), the tendency reads it detached like every entropy state
+                    v = isl(torch.cat([x.detach(), self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1))
+                    self.isl_v = (torch.log(self.isl_scale) + v).clamp(-12.0, 8.0)
+                    self.ent_s2 = (torch.exp(self.isl_v) * self.keep + self.entv_a0 ** 2 * (1 - self.keep)).detach()
+                else:
+                    self.ent_s2 = (init.to(x).clone() if init is not None and init.shape == x.shape
+                                   else torch.full_like(x, self.entv_a0 ** 2))
             parts.append(0.5 * torch.log(self.ent_s2).detach())
         return self.net.trunk(torch.cat(parts, 1))
 

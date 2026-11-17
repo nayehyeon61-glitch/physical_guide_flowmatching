@@ -507,7 +507,7 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
               trunk: str = "res", unet_dims=(64, 128, 192), mem_enc: int = 0, era: bool = False,
               gsplit: bool = False, gsource: str = "op", gbase: bool = False, noise: bool = False, nz: int = 0,
               hnz: float = 0.0, ent: float = 0.0, entv: bool = False,
-              ent_anti: bool = False):
+              ent_anti: bool = False, isl: bool = False):
     """Step 16's DynCore on daily data: ``t6`` is the std of the DAILY increment, one solver step = one day.
 
     ``norm`` "bn" = ClimODE's block as it is; "gn" = stateless_norm (the drift fix). ``substeps`` Heun steps
@@ -581,6 +581,22 @@ def make_core(static: torch.Tensor, inc_std: np.ndarray, mean: np.ndarray, std: 
         raise ValueError("gbase is built for the plain core, one step a day")
     core.gsource, core.gbase, core.nz = gsource, bool(gbase), int(nz)
     core.entv = bool(entv)  # a deterministic run with its entropy as a state (dyncore.DynCore: cfg.entv)
+    if isl:
+        # the island's entropy (owner 2026-11-17: the double core on the memory core, tuned at the 5-day island with
+        # the entropy): this core is the SECOND stage of a pair whose first stage has no entropy state (a memory
+        # core). Its entropy state then starts from s^2 = isl_scale x exp(head(island state, static, time)): the
+        # variance of the first stage's error at the island, per channel and grid point (DynCore._trunk).
+        # ``isl_scale`` = the mean squared error per channel (a running mean kept by the trainer), so the head only
+        # holds where and when the island is less certain than usual.
+        if not entv:
+            raise ValueError("the island's entropy is the start of an entropy state (entv)")
+        core.isl_head = nn.Sequential(nn.Conv2d(contract.N_DYNAMIC + static.shape[0] + 4, hidden, 3, padding=1),
+                                      nn.SiLU(), nn.Conv2d(hidden, contract.N_DYNAMIC, 1))
+        nn.init.zeros_(core.isl_head[2].weight)
+        nn.init.zeros_(core.isl_head[2].bias)
+        core.register_buffer("isl_scale", torch.ones(1, contract.N_DYNAMIC, 1, 1))
+        core.register_buffer("isl_n", torch.zeros(()))
+        core.isl_v = None
     core.hnz = float(hnz)  # > 0: the noise channels are the dycore's response to a perturbed start (ComboFeatures)
     if ent:  # the entropy term in place of a noise (dyncore.DynCore._f): sigma(x) head, starts at 0.31 increment std
         if mem or hist or gbase:
