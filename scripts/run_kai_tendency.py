@@ -431,7 +431,7 @@ def train(a, arm):
             if a.stage1_m2:  # the equations' second-moment term along the first stage's trajectory (precompute_m2.py)
                 assert getattr(m, "nz", 0) == 48 and not getattr(m, "hnz", 0), "--stage1-m2 needs --core-nz 48"
                 m2_tab = {y: np.load(f"{a.stage1_m2}_{y}.npy", mmap_mode="r") for y in trz}
-        mj = None
+        mj, kal = None, None
         if a.joint:
             # both stages of a two-stage forecast trained together (owner 2026-11-17 00:25 KST: "is the next step the
             # one where the two cores are trained together?"). This core is the first stage (--init, day 1 to
@@ -467,6 +467,29 @@ def train(a, arm):
             opt = torch.optim.AdamW([dict(params=list(m.parameters()) + mj_par)]  # the new entropy heads on their own
                                     + ([dict(params=ent_par, lr=a.entv_lr)] if ent_par else []),  # (larger) step
                                     lr=a.core_lr, weight_decay=1e-3)
+            if a.joint_kalman:
+                # the island as a Kalman filter (owner 2026-11-17 11:06-11:13 KST: day 0-5 with the entropy, the
+                # Kalman filter at the island, day 6-10 the second core). Prediction: the first stage, the variance
+                # of its island state S(x) = the island's entropy (the island head of --joint-entv). Correction: the
+                # island state moves toward the measurement z = the frozen KAI's forecast of the island day,
+                # x_a = x_f + K (z - x_f), K = (S - c) / (S + R - 2 c), c = rho sqrt(S R); R (KAI's error variance
+                # there) and rho (the correlation of the two errors) per channel and latitude from the table of
+                # scripts/diag_island_kalman.py (validation year). The second stage starts from x_a with the
+                # posterior variance P_a = (1 - K)^2 S + K^2 R + 2 K (1 - K) c as its entropy state. The gain reads
+                # S detached: the island head is trained by its log score only, the gain follows the entropy.
+                assert a.joint_entv and a.kal_table and m.opts.get("mem"), "--joint-kalman: --joint-entv, --kal-table, a memory first stage"
+                ckk = torch.load(os.path.join(a.out, f"{a.joint_kalman}.pt"), map_location=dev, weights_only=False)
+                kai_m = build(a, a.joint_kalman.split("_")[0], inc, None)
+                miss = kai_m.load_state_dict(ckk["state"], strict=False)
+                assert set(miss.missing_keys) <= {"dyn"} and not miss.unexpected_keys, miss
+                kai_m.eval()
+                for q in kai_m.parameters():
+                    q.requires_grad_(False)
+                tab = np.load(a.kal_table)
+                sd2 = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, -1, 1, 1) ** 2
+                kal = dict(kai=kai_m, rho=torch.as_tensor(tab["rho"], dtype=torch.float32)[None, :, :, None].clamp(-0.99, 0.99).to(dev),
+                           R=(torch.as_tensor(tab["R"], dtype=torch.float32)[None, :, :, None] / sd2).clamp_min(1e-8).to(dev))
+                del ckk
         s_dyn = torch.as_tensor(inc[DYN], dtype=torch.float32).view(1, 1, -1, 1, 1).to(dev)
         scd = torch.tensor([i for i, c in enumerate(DYN) if c != TISR], device=dev)  # the 65 scored channels among the 66
         keep_dyn = torch.ones(len(DYN)).index_fill(0, torch.tensor([DYN.index(TISR)]), 0.0).view(1, 1, -1, 1, 1).to(dev)
@@ -620,8 +643,25 @@ def train(a, arm):
                 xd = m.perturb(xd)
             if nj:  # the first stage to the island, the second stage from its state (with the gradient, or without)
                 y1 = core_rollout(m, xd, doy, nj, tg[:, :nj, TISR], prev=pdyn(prev[0]))
-                y2 = core_rollout(mj, y1[:, -1].detach() if a.joint_detach else y1[:, -1], doy + nj * st, K,
-                                  tg[:, nj:, TISR])
+                xi = y1[:, -1].detach() if a.joint_detach else y1[:, -1]
+                if kal is not None:  # the Kalman island: the correction toward KAI's forecast of the island day
+                    v0k = mj.island_entropy(xi, (doy + nj * st).float() * 24.0)   # log S(x): the island head's graph
+                    with torch.no_grad():
+                        S_ = torch.exp(v0k)
+                        z = kal["kai"].rollout(x, doy, nj, tg[:, :nj, TISR], prev=prev[0][:, -1])[:, -1][:, dyn]
+                        c_ = kal["rho"] * torch.sqrt(S_ * kal["R"])
+                        Kg = ((S_ - c_) / (S_ + kal["R"] - 2 * c_).clamp_min(1e-8)).clamp(0.0, 1.0) * keep_dyn[:, 0]
+                        Pa = ((1 - Kg) ** 2 * S_ + Kg ** 2 * kal["R"] + 2 * Kg * (1 - Kg) * c_).clamp_min(1e-8)
+                    mj.isl_fix = (v0k, Pa)
+                    xa = xi + Kg * (z - xi)
+                    with torch.no_grad():
+                        ti = tg[:, nj - 1, dyn]
+                        ef, ea = ((((v - ti) / s_dyn[:, 0]) ** 2 * wl[:, 0] * keep_dyn[:, 0]).mean() for v in (xi, xa))
+                        kal["log"] = dict(kal_K=round(float((Kg * wl[:, 0]).mean() * 66.0 / 65.0), 4),
+                                          kal_info=round(float((0.5 * torch.log(S_ / Pa) * wl[:, 0] * keep_dyn[:, 0]).mean() * 66.0 / 65.0), 4),
+                                          kal_gain=round(float(1 - torch.sqrt(ea / ef)), 4))
+                    xi = xa
+                y2 = core_rollout(mj, xi, doy + nj * st, K, tg[:, nj:, TISR])
                 y = torch.cat([y1, y2], 1)
             else:
                 y = core_rollout(m, xd, doy, K, tg[:, :, TISR], prev=pdyn(prev[0]))
@@ -692,6 +732,8 @@ def train(a, arm):
                     loss = loss + a.entv_lam * (nll0 + nll2)
                     cal0 = torch.sqrt((torch.exp(v0) * wl[:, 0] * keep_dyn[:, 0]).mean() / ((e0 * wl[:, 0] * keep_dyn[:, 0]).mean() + 1e-12))
                     cal = torch.sqrt((torch.exp(vs) * wl * keep_dyn).mean((0, 2, 3, 4)) / ((e2 * wl * keep_dyn).mean((0, 2, 3, 4)) + 1e-12))
+                    if kal is not None:
+                        sb_log.update(kal["log"])
                     sb_log.update(nll0=round(float(nll0.detach()), 4), nll2=round(float(nll2.detach()), 4),
                                   cal0=round(float(cal0.detach()), 3), cal=[round(float(v), 3) for v in cal.detach()],
                                   isl_sd=round(float(v0.detach().mul(0.5).exp().std() / v0.detach().mul(0.5).exp().mean()), 3))
@@ -1555,6 +1597,14 @@ def parser():
                         "off the island state by a head trained on the first stage's error there (owner 2026-11-17: "
                         "tuning at the 5-day island with the entropy); a plain second stage is widened to that form")
     p.add_argument("--entv-lr", type=float, default=2e-3, help="--joint-entv: learning rate of the new entropy heads")
+    p.add_argument("--joint-kalman", default=None,
+                   help="--joint-entv: the island as a Kalman filter. The island state is corrected toward the day-"
+                        "island forecast of this frozen KAI checkpoint with the gain K = (S - c) / (S + R - 2 c), "
+                        "S = the island's entropy; the second stage starts from the corrected state with the "
+                        "posterior variance")
+    p.add_argument("--kal-table", default=None,
+                   help="--joint-kalman: npz of scripts/diag_island_kalman.py with R (66, H) = KAI's error variance at "
+                        "the island and rho = the correlation of its error with the first stage's (validation year)")
     p.add_argument("--joint-detach", action="store_true",
                    help="--joint: no gradient through the island state (the control: the same steps, the stages apart)")
     p.add_argument("--stage1-m2", default=None,

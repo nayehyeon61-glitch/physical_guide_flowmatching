@@ -134,15 +134,30 @@ class DynCore(nn.Module):
                     # the island's entropy (kai_tend.make_core, isl): the first stage carries no entropy state, so
                     # the variance of the state this core starts from is read off that state, log s^2 = log(scale)
                     # + head(x, static, time); trained by the log score of the first stage's error at the island
-                    # (trainer), the tendency reads it detached like every entropy state
-                    v = isl(torch.cat([x.detach(), self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1))
-                    self.isl_v = (torch.log(self.isl_scale) + v).clamp(-12.0, 8.0)
-                    self.ent_s2 = (torch.exp(self.isl_v) * self.keep + self.entv_a0 ** 2 * (1 - self.keep)).detach()
+                    # (trainer), the tendency reads it detached like every entropy state.
+                    # ``isl_fix`` = (log s^2 of the island, the variance this core starts with), set by the caller
+                    # for ONE trajectory: the island was corrected (the Kalman island: the state the core starts
+                    # from is the analysis, its variance the posterior one), so the entropy is not read off x again
+                    fix = getattr(self, "isl_fix", None)
+                    if fix is not None and fix[1].shape == x.shape:
+                        self.isl_v, s2 = fix[0], fix[1].to(x)
+                    else:
+                        self.isl_v = self.island_entropy(x, hours)
+                        s2 = torch.exp(self.isl_v)
+                    self.isl_fix = None
+                    self.ent_s2 = (s2 * self.keep + self.entv_a0 ** 2 * (1 - self.keep)).detach()
                 else:
                     self.ent_s2 = (init.to(x).clone() if init is not None and init.shape == x.shape
                                    else torch.full_like(x, self.entv_a0 ** 2))
             parts.append(0.5 * torch.log(self.ent_s2).detach())
         return self.net.trunk(torch.cat(parts, 1))
+
+    def island_entropy(self, x: torch.Tensor, hours: torch.Tensor) -> torch.Tensor:
+        """log s^2 (B, 66, H, W) of the island state x, read off it by the island head (units: the squared daily
+        increment std of every channel, as the entropy state)."""
+        B, _, H, W = x.shape
+        v = self.isl_head(torch.cat([x.detach(), self.static.expand(B, -1, -1, -1), time_features(hours, H, W)], 1))
+        return (torch.log(self.isl_scale) + v).clamp(-12.0, 8.0)
 
     def reset_entropy(self):
         """The start of a trajectory (cfg.entv): the entropy state back to the analysis value, a new log of it."""
