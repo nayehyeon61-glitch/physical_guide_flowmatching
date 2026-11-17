@@ -188,6 +188,8 @@ def main():
     print(f"library {lib_year}: {len(lib)} patterns, rms {float(lib_rms[sc].mean()):.3f} state std", flush=True)
 
     ktag = ("_d" + "".join(str(d) for d in early) + ("o" if a.kal_open else "")) if early else ""
+    if a.kalman and a.kalman != "kai":   # another measurement model: its own gain table and run names
+        ktag += "_" + a.kalman.replace("_", "")
     out = {"tag": a.tag, "stage2": a.stage2, "kalman": a.kalman, "gain": a.gain, "robust": a.robust, "n1": n1,
            "members": M, "shape": a.shape, "year": year, "lib_year": lib_year, "lib": int(len(lib))}
     g = lambda v, d=3: " ".join(f"{x:.{d}f}" for x in v)  # noqa: E731
