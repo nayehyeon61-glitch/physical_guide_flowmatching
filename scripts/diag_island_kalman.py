@@ -313,6 +313,8 @@ def main():
     if os.path.exists(path) and not a.max_ics:
         out["central_vs_cache"] = max_diff(cen_fc, path)
         print("run without correction vs the cached forecast, max |difference|:", out["central_vs_cache"])
+    elif cen_fc and not a.max_ics and not a.no_save:  # the plain forecast in the cache format of diag_stage_filter.py
+        np.save(path, np.concatenate(cen_fc))
     print(f"== {base} without correction, day 1..{L} ({N} ICs of {year})\n nRMSE {g(c['nrmse'])}\n ACC   {g(c['acc'])}"
           f"\n act   {g(c['act'], 2)}", flush=True)
     if kai is not None:
