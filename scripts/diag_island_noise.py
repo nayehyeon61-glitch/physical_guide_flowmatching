@@ -70,6 +70,19 @@ def set_state(core, state, M, pert=None):
         core.past = [v.repeat_interleave(M, 0) for v in past]
 
 
+def max_diff(blocks, path):
+    """The largest difference between forecast blocks (float16, in the order of the ICs) and a cached forecast, block
+    by block (both whole arrays in float32 cost 2 GB more)."""
+    ref = np.load(path, mmap_mode="r")
+    if ref.shape[0] != sum(len(b) for b in blocks) or ref.shape[1:] != blocks[0].shape[1:]:
+        return None
+    n, d = 0, 0.0
+    for b in blocks:
+        d = max(d, float(np.abs(b.astype(np.float32) - np.asarray(ref[n:n + len(b)], np.float32)).max()))
+        n += len(b)
+    return d
+
+
 def main():
     p = R.parser()
     p.add_argument("--n1", type=int, default=5, help="the island: the day after which the noise is put in")
@@ -238,9 +251,7 @@ def main():
     c = out["central"]
     path = os.path.join(a.out, f"fc_{a.tag}_{year}.npy")
     if os.path.exists(path) and not a.max_ics:  # the same forecast as the other scripts' (their loop)
-        ref = np.load(path).astype(np.float32)
-        cen_all = np.concatenate(cen_fc).astype(np.float32)
-        out["central_vs_cache"] = float(np.abs(cen_all - ref).max()) if ref.shape == cen_all.shape else None
+        out["central_vs_cache"] = max_diff(cen_fc, path)
         print("central run vs the cached forecast, max |difference|:", out["central_vs_cache"])
     print(f"== {a.tag} central run, day 1..{L} ({N} ICs of {year})\n nRMSE {g(c['nrmse'])}\n ACC   {g(c['acc'])}"
           f"\n act   {g(c['act'], 2)}", flush=True)

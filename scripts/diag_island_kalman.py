@@ -36,7 +36,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import run_kai_tendency as R  # noqa: E402
-from diag_island_noise import VARS, get_state, run_days, set_state  # noqa: E402
+from diag_island_noise import VARS, get_state, max_diff, run_days, set_state  # noqa: E402
 from pgcfm import contract  # noqa: E402
 from pgcfm.kai_tend import DYN, TISR  # noqa: E402
 
@@ -311,9 +311,7 @@ def main():
     spec = a.tag + (f"-{a.stage2}_{n1}" if a.stage2 else "")
     path = os.path.join(a.out, f"fc_{spec}_{year}.npy")
     if os.path.exists(path) and not a.max_ics:
-        ref = np.load(path).astype(np.float32)
-        cen_all = np.concatenate(cen_fc).astype(np.float32)
-        out["central_vs_cache"] = float(np.abs(cen_all - ref).max()) if ref.shape == cen_all.shape else None
+        out["central_vs_cache"] = max_diff(cen_fc, path)
         print("run without correction vs the cached forecast, max |difference|:", out["central_vs_cache"])
     print(f"== {base} without correction, day 1..{L} ({N} ICs of {year})\n nRMSE {g(c['nrmse'])}\n ACC   {g(c['acc'])}"
           f"\n act   {g(c['act'], 2)}", flush=True)
