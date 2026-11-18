@@ -69,18 +69,32 @@ def test_stgg_starts_as_the_loop_with_the_given_weights():
 
 def test_every_stage_and_the_gate_get_a_gradient_and_the_gate_stays_a_mix():
     x, doy = batch()
-    m = model("stgg", FakeCore(), gate_init=0.0)  # at the lower bound: the gradient must still pass the clamp
+    m = model("stgg", FakeCore(), gate_init=0.0)  # at the lower bound: a gradient that moves it inward must pass
     m.core_grad = True
     y = m.rollout(x, doy, 2)
     y.square().mean().backward()
     # the first step from zero: only the output layer of each new path has a gradient (the 1x1 convs are zero)
     assert all(float(q.weight.grad.abs().sum()) > 0 for q in m.projs)
     assert float(m.gate_head.weight.grad.abs().sum()) > 0 and float(m.gate.grad.abs().sum()) > 0
+    assert float(m.gate.grad.max()) <= 0  # ... and none that would move the weight below 0 (descent: g -= grad)
     with torch.no_grad():
         m.gate_head.bias.fill_(5.0)
     m.gate_log = []
     m(x, doy)
     assert float(m.gate_log[0].min()) == 1.0  # the weight never leaves [0, 1]: the output stays a mix
+
+
+def test_a_weight_beyond_its_bound_is_only_pulled_back():
+    """The gradient of the output mix can not push the raw weight (and the features it is computed from) further
+    out of [0, 1]: the divergence of the first stcg training."""
+    x, doy = batch()
+    for bias, sign in ((5.0, 1.0), (-5.0, -1.0)):
+        m = model("stgg", FakeCore(), gate_init=0.5)
+        with torch.no_grad():
+            m.gate_head.bias.fill_(bias)  # the raw weight is far above 1 / below 0 everywhere
+        m(x, doy).square().mean().backward()
+        for g in (m.gate.grad, m.gate_head.bias.grad):
+            assert float((sign * g).min()) >= 0 and float(g.abs().sum()) > 0  # descent moves it toward [0, 1] only
 
 
 def test_switching_one_stage_off_changes_the_forecast_only_through_that_stage():

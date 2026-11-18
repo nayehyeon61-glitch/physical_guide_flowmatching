@@ -806,6 +806,31 @@ class CoreBase:
 
 
 # ------------------------------------------------------------------------------- KAI with the core inside
+class _ClampIn(torch.autograd.Function):
+    """clamp(g, 0, 1) for a mixing weight that is trained: the gradient passes inside [0, 1] and, at a bound or
+    outside, only where a descent step moves the weight back INTO [0, 1] (the projected gradient of a box).
+
+    torch.clamp's own gradient is zero at and beyond the bounds, where the loop's clipped weights start, so such a
+    weight could never move. Passing the gradient everywhere (straight through) is not an option either: beyond a
+    bound the output no longer changes with the weight, so its gradient keeps its sign and the raw weight, and with
+    it the features it is computed from, grow without limit (the first stcg training: KAI's last-stage features
+    grew 80-fold between iteration 300 and 500 and the forecast diverged)."""
+
+    @staticmethod
+    def forward(ctx, g):
+        ctx.save_for_backward(g)
+        return g.clamp(0.0, 1.0)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (g,) = ctx.saved_tensors
+        outward = ((g >= 1.0) & (grad < 0)) | ((g <= 0.0) & (grad > 0))  # a descent step moves g by -grad
+        return grad.masked_fill(outward, 0.0)
+
+
+clamp_in = _ClampIn.apply
+
+
 @dataclass
 class KAIPosConfig:
     depths: tuple = (3, 3, 15, 3)        # KAI.yaml / models.py default
@@ -954,11 +979,8 @@ class KAIPos(nn.Module):
         if cfg.form == "gate":
             return o + self.gate * self.keep * (c - o)
         if cfg.form == "sgate":
-            # every channel, as the loop: with its weights the orography and tisr are the core's (exact) ones.
-            # The value is clamped, the gradient is not (clamp's own gradient is zero AT the bounds, where the
-            # loop's clipped weights of many channels start).
-            g = self.gate + self.gate_head(h)
-            g = g + (g.clamp(0.0, 1.0) - g).detach()
+            # every channel, as the loop: with its weights the orography and tisr are the core's (exact) ones
+            g = clamp_in(self.gate + self.gate_head(h))
             if self.gate_log is not None:  # the weight actually used: mean per channel of this call
                 self.gate_log.append(g.detach().mean((0, 2, 3)))
             return o + g * (c - o)
