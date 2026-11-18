@@ -62,6 +62,8 @@ def main():
     p.add_argument("--kal-open", action="store_true", help="--kal-days: correct the output only, no feedback to the core")
     p.add_argument("--kai-fc", nargs="?", const="save", default=None, choices=["save", "only"],
                    help="also save KAI's forecasts of all leads (fc_<kalman>_<year>.npy); only: nothing else")
+    p.add_argument("--isl-inc", default=None, help="npy (ICs, channels, H, W), z-scored: added to the island state after the "
+                   "correction (the matrix gain of scripts/diag_island_ensemble.py --save); the name gets +inc<stem>")
     p.add_argument("--amps", type=float, nargs="+", default=[0.0], help="noise after the island (0 = one run)")
     p.add_argument("--shape", default="err", choices=["err", "white"])
     p.add_argument("--members", type=int, default=8, help="even: symmetric pairs")
@@ -307,6 +309,12 @@ def main():
 
     base = a.tag + (f"+{a.stage2}" if a.stage2 else "")
     kal = (f"-K{a.gain}" + (f"t{a.robust:g}" if a.robust else "") + ktag.replace("_", "")) if kai is not None else ""
+    INC = None
+    if a.isl_inc:
+        assert kai is not None
+        INC = torch.from_numpy(np.load(a.isl_inc).astype(np.float32))
+        assert INC.shape[0] == N, (INC.shape, N)
+        kal += "+inc" + os.path.basename(a.isl_inc).split(".")[0].replace("isl_inc_", "").rsplit("_", 1)[0]
     names = {amp: f"isn-{base}{kal}-{a.shape}{amp:g}-m{M if amp else 1}" for amp in a.amps}
     kinds = [f"m{2 * k}" for k in range(1, M // 2 + 1)] + ["one"]
     acc = {"central": 0.0, "kai": 0.0, **{(amp, k): 0.0 for amp in a.amps for k in kinds}}
@@ -367,6 +375,8 @@ def main():
                 wt = (a.robust + 1) / (a.robust + d ** 2 / vd) if a.robust else torch.ones_like(d)
                 wsum = wsum + float(wt[:nb].mean()) * nb
                 xa = xa + Kx * wt * d
+                if INC is not None:
+                    xa[:nb] = xa[:nb] + INC[i:i + nb] * keep
                 zz = cen.clone()
                 zz[:, :n1] = (zs * keep5 + ya0 * (1 - keep5))[:nb]
                 acc["kai"] = acc["kai"] + sums(zz, Tb, Cb)                       # only its days 1 .. n1 are KAI's
