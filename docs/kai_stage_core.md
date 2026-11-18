@@ -84,7 +84,7 @@ core는 물리 변수 67개의 상태에서 하루 경향을 계산하도록 학
 - `stg`: core가 **입력 x에서** 낸 경향 τ(x) 하나를 네 stage에 넣습니다(`P_i`만 있음). `stc`에서 a_i를 모두 0으로 둔 것과 같습니다. `stc : stg`가 stage마다 합쳐서 core에 넣는 것의 몫입니다.
 - `stgg`: `stg` + 학습되는 출력 혼합. `stcg`의 대조입니다.
 - `outg`: 학습되는 출력 혼합만 있고 stage에는 아무것도 넣지 않습니다. stage 삽입 전체의 대조입니다.
-- 출력 혼합의 가중 g는 값만 [0, 1]로 자르고 기울기는 그대로 둡니다(straight-through). loop의 가중은 여러 채널에서 0이나 1에 붙어 있고 `clamp`의 기울기는 경계에서 0이라, 그대로 두면 그 채널의 가중이 움직이지 않습니다.
+- 출력 혼합의 가중 g는 값을 [0, 1]로 자릅니다. 기울기는 [0, 1] 안에서는 그대로 지나가고, 경계나 그 바깥에서는 가중을 안쪽으로 되돌리는 방향일 때만 지나갑니다(`clamp_in`, 상자 제약의 투영 기울기). `clamp`의 기울기는 경계에서 0이라 loop의 잘린 가중이 움직이지 못하고, 기울기를 무조건 통과시키면(straight-through) 경계 밖에서 부호가 바뀌지 않는 기울기가 가중과 그 입력인 stage 4 특징을 끝없이 키웁니다. 첫 `stcg` 학습이 이렇게 300~500 iteration 사이에 발산했습니다(4절).
 
 ### 1.4 전에 실패한 안쪽 삽입과 다른 점
 
@@ -137,8 +137,8 @@ wait; bash scripts/run_kai_stage.sh
 python scripts/wb2_to_kai.py --out data/era5_5p625 --daily-mean --no-climode --years 2012 2013 2014 2015 2016 2017
 R="python scripts/run_kai_tendency.py --out runs/kaitend"
 $R --arm kai --tag kai --log-every 250
-$R --arm core --core-norm gn --iters 3000 --log-every 250 --tag core_gn
-GRID=5.625 C=core_gn bash scripts/run_kai_stage.sh
+$R --arm core --core-norm gn --iters 3000 --log-every 250 --core-gfeat --core-mem 8 --core-mz --resume --tag core_gngmz8
+GRID=5.625 bash scripts/run_kai_stage.sh                       # core = core_gngmz8 (물리항 G(x) + 8일 기억)
 ```
 
 - driver는 단계마다 결과 파일이 있으면 건너뛰고, 끊긴 학습은 이어서 합니다(`--resume`).
