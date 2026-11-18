@@ -18,7 +18,9 @@ keeps the distance travelled per solver step and ``--core-ckpt`` the memory of a
               forecast, one weight per channel (--init kai: the trained KAI is kept, g starts at 0)
        stg    tau at the entry of ALL four stages    stgg   stg + an output mix with the core forecast whose
        outg   that learned output mix alone                 weight KAI computes per channel and grid point
-              (the control of stgg's stages)                (--gate-init: its start, e.g. the loop's weights)
+              (the control of the stages)                   (--gate-init: its start, e.g. the loop's weights)
+       stc    the core INSIDE every stage: the stage's channels merged to the 67 variables, the core's step from
+              that state, its tendency split to the stage's channels again and added     stcg   stc + the output mix
    ``--init <tag> --rollout 2 3``: fine-tuning in the model's own rollout (the gradient passes through the
    frozen core's input). A memory core inside KAI is warmed up on the days before every batch's IC.
 3. ``--score <tags>``: paired rollouts on the test year: RMSE / ACC per channel and lead, zonal spectra,
@@ -52,6 +54,7 @@ from pgcfm.kai_tend import (ARMS, DYN, N_STAGES, CachedFeatures, CoreBase, KAIPo
                             operator_features)
 
 EPS = contract.KAI_STD_EPS
+NEW_PARTS = ("projs", "decs", "gate_head")  # what the stage arms add to KAI (kai_tend.KAIPos), zero at the start
 LAZY_BYTES = 2 ** 30  # a year of daily fields larger than this stays on disk (1.5 deg: 2.9 GB; 5.625 deg: 0.2 GB)
 
 
@@ -538,16 +541,19 @@ def train(a, arm):
         if a.init:  # fine-tuning (e.g. --rollout 2 3 from a single-step checkpoint)
             miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location=dev,
                                                 weights_only=False)["state"], strict=False)
-            new = {"dyn", "gate"} | {k for k in m.state_dict() if k.split(".")[0] in ("projs", "gate_head")}
+            new = {"dyn", "gate"} | {k for k in m.state_dict() if k.split(".")[0] in NEW_PARTS}
             assert set(miss.missing_keys) <= new and not miss.unexpected_keys, miss
         cur = a.rollout  # [1] = KAI's single-step training
         m.core_grad = max(cur) > 1 and not a.core_nograd
         m.grad_ckpt = bool(a.kai_ckpt)  # the activations of a block are recomputed in the backward pass
-        if core is not None and m.core_grad:  # ... and of the frozen core's substeps, where the gradient passes it
-            core.grad_ckpt = bool(a.core_ckpt)
+        if core is not None and (m.core_grad or m.cfg.inject == "dec"):  # ... and of the frozen core's substeps,
+            core.grad_ckpt = bool(a.core_ckpt)                           # where the gradient passes it
         gate = [q for k, q in m.named_parameters() if k == "gate"]
-        rest = [q for k, q in m.named_parameters() if k != "gate"]
-        opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else []),
+        # the layers a stage arm adds to a trained KAI start at zero: their own learning rate (--new-lr)
+        new = [q for k, q in m.named_parameters() if k.split(".")[0] in NEW_PARTS] if a.new_lr else []
+        rest = [q for k, q in m.named_parameters() if k != "gate" and not any(q is n for n in new)]
+        opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else [])
+                                + ([dict(params=new, lr=a.new_lr)] if new else []),
                                 lr=a.lr)  # KAI's trainer; the 67 gate weights move on their own scale
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
@@ -1167,9 +1173,11 @@ def score(a, tags):
             return m.rollout(x, d, L, t, prev=pv, **kw)
         arm_fn.mem = m.mem  # a memory core inside: the days before the IC (rollout)
         fns[tag] = arm_fn
-        staged = m.cfg.inject == "all"
+        staged = m.cfg.inject in ("all", "dec")
         if staged:
             m.stage_log = [[] for _ in range(N_STAGES)]
+        if m.cfg.inject == "dec":
+            m.dec_log = [[] for _ in range(N_STAGES)]
         if m.cfg.form == "sgate":
             m.gate_log = []
         pred = rollout(fns[tag], tez, ics)
@@ -1178,6 +1186,10 @@ def score(a, tags):
         if staged:  # what every stage receives from the core, relative to its own features (RMS, mean over calls)
             res[tag]["stage_ratio"] = np.array([np.mean(v) for v in m.stage_log], dtype=np.float32)
             m.stage_log = None
+        if m.cfg.inject == "dec":  # where each stage's merged state sits: (RMS distance from the input in increment
+            # std, the part of the model's own step it has taken), mean over the calls
+            res[tag]["stage_state"] = np.array([np.mean(v, 0) for v in m.dec_log], dtype=np.float32)
+            m.dec_log = None
         if m.cfg.form == "sgate":  # the weight of the core the model actually used, per channel
             res[tag]["gate_used"] = torch.stack(m.gate_log).mean(0).cpu().numpy()
             m.gate_log = None
@@ -1194,7 +1206,7 @@ def score(a, tags):
                     m.stage_off = (i,)
                     res[f"{tag}~ns{i + 1}"] = scored(arm_fn, spectra=False)
                 m.stage_off = ()
-            if m.cfg.form == "full" and m.uses_core:  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
+            if m.cfg.form == "full" and m.uses_core and m.cfg.inject != "dec":  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
                 open_fn = lambda x, d, t, pv=None: arm_fn(x, d, t, pv, open_loop=True)  # noqa: E731
                 open_fn.mem = m.mem
                 res[f"{tag}~open"] = scored(open_fn)
@@ -1474,6 +1486,7 @@ def summarize(a, res, std, ics):
     out["gates"] = {k: d["gate"].tolist() for k, d in res.items() if "gate" in d}
     out["gates_used"] = {k: d["gate_used"].tolist() for k, d in res.items() if "gate_used" in d}
     out["stage_ratio"] = {k: d["stage_ratio"].tolist() for k, d in res.items() if "stage_ratio" in d}
+    out["stage_state"] = {k: d["stage_state"].tolist() for k, d in res.items() if "stage_state" in d}
     # paired bootstrap over ICs of the RMSE change vs kai: per channel and lead, and for the 65-channel mean
     if "kai" in res:
         base = res["kai"]["mse"]
@@ -1560,6 +1573,9 @@ def parser():
     p.add_argument("--gate-init", default="0",
                    help="arms stgg, outg: the start of the core's weight in the output mix, a number or "
                         "<score json>:<blend name> (1 - that blend's day-1 KAI weights = its loop's weights)")
+    p.add_argument("--new-lr", type=float, default=0.0,
+                   help="stage arms: learning rate of the layers they add to the trained KAI (they start at zero); "
+                        "0 = --lr")
     p.add_argument("--core-nograd", action="store_true",
                    help="position arms with --rollout > 1: no gradient through the frozen core's input (less memory "
                         "and time; the default lets a later day's loss pass through the core)")

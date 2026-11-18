@@ -33,9 +33,24 @@ instead of being mixed with KAI's finished output):
                       g0 = the loop's fixed weights (--gate-init), the conv starts at zero: the model starts as the
                       loop and learns where to depart from its fixed weights
 
-    arms    stg   = (full, all)    the core in the four stages only, KAI's own output
-            stgg  = (sgate, all)   the four stages and the learned output mix
-            outg  = (sgate, none)  the learned output mix alone (the control of stgg's stages)
+            dec       the core INSIDE every stage (owner 2026-11-18 22:50 KST: "the variables split into the
+                      stage's channels are merged again, put into our tendency core, split again and blended in
+                      every stage"). At the entry of stage i (48 / 96 / 192 / 288 channels at KAI's size):
+                          merge   x_i = x + s * D_i(h_i)        D_i = 1x1 conv, stage channels -> 67 variables
+                          core    tau_i = (c(x_i) - x_i) / s    the frozen core's own one-day step from x_i
+                          split   e_i = P_i(tau_i)              P_i = 1x1 conv, 67 -> stage channels
+                          blend   h_i <- h_i + e_i              then the stage's blocks
+                      D_i and P_i start at zero: every stage's state starts as the input x, the model as the KAI it
+                      was initialized from, and ``all`` is the case D_i = 0 (the core evaluated at x only). The
+                      gradient passes through the frozen core, so each D_i learns which state the core is asked at.
+                      A linear P_i of the core's increment is the blend of the stage's state with the core's
+                      forecast from it, the weight being part of P_i (c - x_i is what a weight would multiply).
+
+    arms    stg   = (full, all)    the core's tendency of x in the four stages, KAI's own output
+            stgg  = (sgate, all)   the same and the learned output mix
+            outg  = (sgate, none)  the learned output mix alone (the control of the stages)
+            stc   = (full, dec)    the core inside the four stages (merge, core, split, blend), KAI's own output
+            stcg  = (sgate, dec)   the same and the learned output mix
 
 Memory (the owner's Mori-Zwanzig reading, 2026-11-10): the daily 5.625 deg state is a projection of the
 atmosphere, so its exact equation is  dx/dt = Markov term f(x) + memory integral over the past + noise.
@@ -77,7 +92,9 @@ ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2
         # control of ``out``: the frozen first stage is not the tendency core but a trained KAI (arm res)
         "stack": ("core", "none"),
         # the core in every stage (inject all) and / or a state-dependent output mix (form sgate)
-        "stg": ("full", "all"), "stgg": ("sgate", "all"), "outg": ("sgate", "none")}
+        "stg": ("full", "all"), "stgg": ("sgate", "all"), "outg": ("sgate", "none"),
+        # the core inside every stage: the stage's features merged to the variables, the core, split again (inject dec)
+        "stc": ("full", "dec"), "stcg": ("sgate", "dec")}
 N_STAGES = 4
 
 
@@ -762,6 +779,16 @@ class CoreBase:
             self.core.prev = None if prev is None else prev[:, self.dyn]
         return x.index_copy(1, self.dyn, core_step(self.core, x[:, self.dyn], doy, tisr_next))  # orog copied
 
+    def at(self, x, doy, tisr_next=None):
+        """The core's one-day forecast from ANOTHER state of the same day (the merged variables of a KAI stage,
+        inject dec). A memory core reads the memory of the trajectory it is stepped along (the call above, once a
+        day) and does not advance it."""
+        if self.hist:
+            raise NotImplementedError("a history core holds one trend: it is not evaluated at a stage's state")
+        xd = x[:, self.dyn]
+        y = self.core._advance(xd, doy.float() * 24.0, tisr_next) if self.mem else core_step(self.core, xd, doy, tisr_next)
+        return x.index_copy(1, self.dyn, y)
+
 
 # ------------------------------------------------------------------------------- KAI with the core inside
 @dataclass
@@ -804,9 +831,11 @@ class KAIPos(nn.Module):
             self.gate_head = nn.Conv2d(cfg.dims[-1], n, 1)
             nn.init.zeros_(self.gate_head.weight)
             nn.init.zeros_(self.gate_head.bias)
-        if cfg.inject == "all":
+        if cfg.inject in ("all", "dec"):
             self.projs = nn.ModuleList(nn.Conv2d(n, d, 1) for d in cfg.dims)
-            for q in self.projs:
+            if cfg.inject == "dec":  # the stage's features merged back to the 67 variables
+                self.decs = nn.ModuleList(nn.Conv2d(d, n, 1) for d in cfg.dims)
+            for q in list(self.projs) + list(getattr(self, "decs", [])):
                 nn.init.zeros_(q.weight)
                 nn.init.zeros_(q.bias)
         elif cfg.inject.startswith("s"):
@@ -819,6 +848,11 @@ class KAIPos(nn.Module):
         keep[OROG] = 0
         self.register_buffer("keep", keep.view(1, -1, 1, 1))
         self.register_buffer("dyn", torch.tensor(DYN))
+        # inject dec: the channels of a stage's merged state that may leave the input's (not the orography, not the
+        # forcing tisr); not saved: a constant of the channel order
+        free = keep.clone()
+        free[TISR] = 0
+        self.register_buffer("free", free.view(1, -1, 1, 1), persistent=False)
         self._core = [core]
         self.last_core = None
         self.ablate = False  # diagnostic: zero the injected tau (the output anchor of form "core" is kept)
@@ -834,9 +868,13 @@ class KAIPos(nn.Module):
         # a memory core (CoreBase(core, stateful=True)) is stepped along one batch of trajectories: ``rollout``
         # warms its memory up on the ``mem`` days before the IC and every step advances it with the model's state
         self.mem = getattr(core, "mem", 0) if self.uses_core else 0
-        # inject all, diagnostics: stages whose injection is switched off (0-based), and the size of what every
+        # inject all / dec, diagnostics: stages whose injection is switched off (0-based), and the size of what every
         # stage receives relative to its features (RMS ratio per call; a list per stage when switched on)
         self.stage_off, self.stage_log, self.gate_log = (), None, None
+        # inject dec, diagnostic (a list per stage when switched on): where the stage's merged state x_i sits. Per
+        # call (RMS of (x_i - x) / s, the part of the model's own step it has taken: the projection of x_i - x on
+        # y - x in units of s; 0 = the input, 1 = the model's forecast)
+        self.dec_log = None
 
     def core_next(self, x, doy, tisr_next, prev=None):
         with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
@@ -856,10 +894,18 @@ class KAIPos(nn.Module):
             tau = torch.zeros_like(tau)
         m = self.kai.core_model
         h = torch.cat([x, tau], 1) if cfg.inject in ("in", "hist") else x
+        merged = []
         for i in range(N_STAGES):
             h = m.downsample_layers[i](h)
-            if cfg.inject == "all" and i not in self.stage_off:
-                d = self.projs[i](tau)
+            if cfg.inject in ("all", "dec") and i not in self.stage_off:
+                ti = tau
+                if cfg.inject == "dec":  # merge the stage's channels to the variables, the core's step from there
+                    xi = x + self.decs[i](h) * self.s * self.free
+                    ti = (self._core[0].at(xi, doy, tisr_next) - xi) / self.s
+                    if self.ablate:
+                        ti = torch.zeros_like(ti)
+                    merged.append((i, xi))
+                d = self.projs[i](ti)
                 if self.stage_log is not None:
                     self.stage_log[i].append(float((d.detach().pow(2).mean() / h.detach().pow(2).mean()).sqrt()))
                 h = h + d
@@ -872,6 +918,18 @@ class KAIPos(nn.Module):
                 h = h + self.proj(tau)
         o = m.head(h)
         self.last_core = c
+        y = self._output(x, o, c, h)
+        if self.dec_log is not None:
+            with torch.no_grad():
+                dy = (y - x) / self.s * self.free
+                for i, xi in merged:
+                    dx = (xi - x) / self.s
+                    self.dec_log[i].append((float(dx.pow(2).sum() / self.free.sum() / dx[:, :1].numel()) ** 0.5,
+                                            float((dx * dy).sum() / dy.pow(2).sum().clamp_min(1e-30))))
+        return y
+
+    def _output(self, x, o, c, h):
+        cfg = self.cfg
         if cfg.form == "full":
             return o
         if cfg.form == "gate":

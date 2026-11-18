@@ -5,16 +5,19 @@
 # docs/kai_tendency.md sec. 8.3 at 5.625 deg). Nothing of them is changed. Every model below is the SAME rollout
 # fine-tuning of kai (2 to 3 days, $RO_ITERS iterations), so the only difference between them is where the core is:
 #   kai_ro   no core                                              (the control of the fine-tuning itself; reused if there)
-#   stg      the core's tendency at the entry of all four stages, KAI's own output
-#   stgg     the four stages + an output mix with the core forecast, its weight computed by KAI per channel and
-#            grid point; starts as the loop (KAI, core) with the loop's fixed weights
-#   outg     that learned output mix alone                        (the control of stgg's stages)
+#   stc      the core INSIDE every stage: at the entry of each of the four stages its channels are merged to the 67
+#            variables, the core steps from that state, its tendency is split to the stage's channels and added
+#   stcg     stc + an output mix with the core forecast, its weight computed by KAI per channel and grid point;
+#            starts as the loop (KAI, core) with the loop's fixed weights
+#   stg      control of stc: the core is asked at the input x only, the same tendency enters all four stages
+#   stgg     control of stcg: stg + the learned output mix
+#   outg     the learned output mix alone                         (the control of the stages)
 # and the existing connections of the same two models are scored next to them: blend_$C, loop_$C on kai and kai_ro.
 #
 #   bash scripts/run_kai_stage.sh                                 # 1.5 deg, the folders of SRC=daily run_kai_plus.sh
 #   C=core_plus_u64 SFX=_u64 bash scripts/run_kai_stage.sh        # another core: tags stg_u64, stgg_u64, outg_u64
 #   GRID=5.625 C=core_gn bash scripts/run_kai_stage.sh            # the CPU test of docs/kai_stage_core.md
-#   ARMS="stgg" ...                                               # only some of the new models
+#   ARMS="stcg stgg" ...                                          # only some of the new models
 #   CORE_GRAD=0 ...                                               # no gradient through the frozen core (less memory, time)
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
@@ -35,9 +38,11 @@ fi
 TRAIN_YEARS=${TRAIN_YEARS:-"2012 2013 2014 2015"}; VAL_YEAR=${VAL_YEAR:-2016}; TEST_YEAR=${TEST_YEAR:-2017}
 RO_ITERS=${RO_ITERS:-1000}; RO_LR=${RO_LR:-3e-4}
 GATE_LR=${GATE_LR:-1e-3}              # the 67 base weights of the output mix start at a fitted value: a small step
-CORE_GRAD=${CORE_GRAD:-1}
+NEW_LR=${NEW_LR:-1e-3}                # the layers added to KAI start at zero: KAI's own from-scratch learning rate
+CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the core between the days (stc / stcg keep the one
+                                      #    through the core inside the stages: their merge layers learn through it)
 IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}; LOGK=${LOGK:-250}
-ARMS=${ARMS:-"stg stgg outg"}
+ARMS=${ARMS:-"stcg stc stgg stg outg"}
 SFX=${SFX:-}                           # suffix of the new tags (another core in the same folder)
 SC=stage$SFX
 BL=blend_$C; LP=loop_$C; [ "$C" = core ] && { BL=blend; LP=loop; }
@@ -70,7 +75,8 @@ step kai_ro "$OUT/kai_ro.pt" $R --arm kai --tag kai_ro $FT
 
 # 2. the same fine-tuning with the core inside
 for arm in $ARMS; do
-    step $arm$SFX "$OUT/$arm$SFX.pt" $R --arm $arm --tag $arm$SFX $FT $CG --gate-lr $GATE_LR --gate-init "$W0:$BL"
+    step $arm$SFX "$OUT/$arm$SFX.pt" $R --arm $arm --tag $arm$SFX $FT $CG --gate-lr $GATE_LR --new-lr $NEW_LR \
+        --gate-init "$W0:$BL"
 done
 
 # 3. score: every new model with its diagnostics (~notau, ~ns1..4: one stage's tau off), the output mixes on both KAIs
@@ -81,8 +87,10 @@ for arm in $ARMS; do
     for i in 1 2 3 4; do [ "$arm" = outg ] || PAIRS="$PAIRS $t~ns$i:$t"; done
     [ "$arm" = outg ] || PAIRS="$PAIRS $t~notau:$t"
 done
-case " $ARMS " in *" stgg "*) case " $ARMS " in *" outg "*) PAIRS="$PAIRS stgg$SFX:outg$SFX";; esac
-                              case " $ARMS " in *" stg "*) PAIRS="$PAIRS stgg$SFX:stg$SFX";; esac;; esac
+# between the new models: the core inside the stages vs its tendency of x, the stages vs the output mix alone
+for ab in stcg:stgg stc:stg stcg:outg stgg:outg stcg:stc stgg:stg; do
+    case " $ARMS " in *" ${ab%:*} "*) case " $ARMS " in *" ${ab#*:} "*) PAIRS="$PAIRS ${ab%:*}$SFX:${ab#*:}$SFX";; esac;; esac
+done
 step $SC "$OUT/score_$SC.json" bash -c "$R --score kai kai_ro $TAGS --score-cores $C --blend-bases kai kai_ro \
     --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --pairs $PAIRS \
     && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"

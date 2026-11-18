@@ -131,3 +131,76 @@ def test_a_real_memory_core_runs_inside_the_stages():
     y = m.rollout(x, doy, 2, tisr=torch.zeros(2, 2, H, W), prev=torch.randn(2, 2, N, H, W))
     y.square().mean().backward()
     assert torch.isfinite(y).all() and all(q.weight.grad is not None for q in m.projs)
+
+
+class FlowCore(FakeCore):
+    """A core whose step depends on the state it is asked at (nonlinear), with ``at`` for a stage's state."""
+
+    def __call__(self, x, doy, tisr_next=None, prev=None):
+        self.calls += 1
+        return x + 0.3 * torch.tanh(torch.roll(x, 1, -1))
+
+    def at(self, x, doy, tisr_next=None):
+        self.asked.append(x)
+        return x + 0.3 * torch.tanh(torch.roll(x, 1, -1))
+
+
+def test_the_core_inside_the_stages_starts_as_kai_and_is_asked_at_every_stage():
+    x, doy = batch()
+    core = FlowCore()
+    core.asked = []
+    kai, m = model("kai"), model("stc", core)
+    miss = m.load_state_dict(kai.state_dict(), strict=False)
+    assert {k.split(".")[0] for k in miss.missing_keys} == {"projs", "decs"}
+    assert [q.in_channels for q in m.decs] == list(DIMS) and all(q.out_channels == N for q in m.decs)
+    assert torch.equal(m(x, doy), kai(x, doy))
+    assert len(core.asked) == N_STAGES and all(torch.equal(v, x) for v in core.asked)  # every stage's state = x
+
+
+def test_a_stage_state_leaves_the_input_only_in_the_free_channels_and_the_decoder_learns_through_the_core():
+    x, doy = batch()
+    core = FlowCore()
+    core.asked = []
+    m = model("stcg", core, gate_init=0.3)
+    with torch.no_grad():
+        for q in list(m.projs) + list(m.decs):
+            q.weight.normal_(std=0.05)
+    m.dec_log = [[] for _ in range(N_STAGES)]
+    y = m(x, doy)
+    held = [contract.CHANNEL_INDEX["orog"], contract.CHANNEL_INDEX["tisr"]]
+    for v in core.asked:
+        assert torch.equal(v[:, held], x[:, held]) and not torch.allclose(v, x)
+    assert all(len(v) == 1 and v[0][0] > 0 for v in m.dec_log)
+    y.square().mean().backward()
+    assert all(float(q.weight.grad.abs().sum()) > 0 for q in m.decs)  # the gradient came through the core
+    m.ablate = True  # the stages' tendency off: what is left is the output mix on the same KAI
+    out = model("outg", core, gate_init=0.3)
+    out.load_state_dict({k: v for k, v in m.state_dict().items() if k.split(".")[0] not in ("projs", "decs")})
+    assert torch.allclose(m(x, doy), out(x, doy), atol=1e-6)
+
+
+def test_a_real_memory_core_is_asked_at_the_stages_without_advancing_its_memory():
+    lat = np.linspace(-78.75, 78.75, H)
+    contract.register_latitudes(lat)
+    core = make_core(torch.zeros(8, H, W), INC, np.zeros(N), np.ones(N), lat, hidden=8, blocks=(1, 1), norm="gn", mem=2,
+                     mem_ch=4, mz=True)
+    for q in core.parameters():
+        q.requires_grad_(False)
+    with torch.no_grad():  # a core with a tendency (its head starts at zero = persistence)
+        core.net.head.weight.normal_(std=0.2)
+    base = CoreBase(core.eval(), stateful=True)
+    m = model("stc", base)
+    with torch.no_grad():
+        for q in list(m.projs) + list(m.decs):
+            q.weight.normal_(std=0.05)
+    x, doy = batch()
+    hist, tisr = torch.randn(2, 2, N, H, W), torch.zeros(2, 1, H, W)
+    y = m.rollout(x, doy, 1, tisr=tisr, prev=hist)
+    mem_after, fc = core.m.clone(), core.fc.clone()
+    y.square().mean().backward()
+    assert all(q.weight.grad is not None and float(q.weight.grad.abs().sum()) > 0 for q in m.decs)
+    # the same day again by the core alone: the four stage calls left its memory and its own forecast untouched
+    with torch.no_grad():
+        base.start(hist, doy, x)
+        base(x, doy, tisr[:, 0])
+    assert torch.allclose(core.m, mem_after) and torch.allclose(core.fc, fc)
