@@ -35,14 +35,27 @@ instead of being mixed with KAI's finished output):
 
             dec       the core INSIDE every stage (owner 2026-11-18 22:50 KST: "the variables split into the
                       stage's channels are merged again, put into our tendency core, split again and blended in
-                      every stage"). At the entry of stage i (48 / 96 / 192 / 288 channels at KAI's size):
-                          merge   x_i = x + s * D_i(h_i)        D_i = 1x1 conv, stage channels -> 67 variables
-                          core    tau_i = (c(x_i) - x_i) / s    the frozen core's own one-day step from x_i
-                          split   e_i = P_i(tau_i)              P_i = 1x1 conv, 67 -> stage channels
-                          blend   h_i <- h_i + e_i              then the stage's blocks
-                      D_i and P_i start at zero: every stage's state starts as the input x, the model as the KAI it
-                      was initialized from, and ``all`` is the case D_i = 0 (the core evaluated at x only). The
-                      gradient passes through the frozen core, so each D_i learns which state the core is asked at.
+                      every stage"; 23:14 KST: "merge them correctly, only then the core has an effect").
+                      At the entry of stage i (48 / 96 / 192 / 288 channels at KAI's size):
+                          merge   x_i = x + a_i * s * D_i(h_i)   the physical state the stage has reached
+                          core    tau_i = (c(x_i) - x_i) / s     the frozen core's own one-day step from x_i
+                          split   e_i = P_i(tau_i)               P_i = 1x1 conv, 67 -> stage channels
+                          blend   h_i <- h_i + e_i               then the stage's blocks
+                      The merge. KAI's split is not invertible (the stem maps 67 variables to FEWER channels and
+                      normalizes them per grid point), so the channels alone give the variables back with an error
+                      of more than one day's change (measured, docs/kai_stage_core.md): the core would compute
+                      its tendency from that error. A correct merge therefore keeps the variables themselves, the
+                      input x, and takes from the channels what they add to it: D_i, of the form of KAI's own
+                      merge to the variables (its head: 3x3 conv, GELU, 1x1 conv), is the stage's estimate of the
+                      day's change (x(t+1) - x(t)) / s. Stage i stands at the part a_i = (i - 1) / 4 of the day
+                      (MERGE_AT), so its state is the input plus that part of the estimated change: stage 1 is
+                      asked at the input itself (the exact merge of the stem's split), stage 4 three quarters on.
+                      D_i is trained ONLY by its error against the data (the trainer's merge loss on
+                      ``merge_pred``; its input and its output are detached): the merged state is the best
+                      estimate of a real state, not whatever state makes the core's answer useful, and KAI's own
+                      weights see the forecast loss only, as in every other arm.
+                      D_i (last layer) and P_i start at zero: every stage's state starts as the input x and the
+                      model as the KAI it was initialized from; ``all`` is the case a_i = 0 (the core at x only).
                       A linear P_i of the core's increment is the blend of the stage's state with the core's
                       forecast from it, the weight being part of P_i (c - x_i is what a weight would multiply).
 
@@ -96,6 +109,8 @@ ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2
         # the core inside every stage: the stage's features merged to the variables, the core, split again (inject dec)
         "stc": ("full", "dec"), "stcg": ("sgate", "dec")}
 N_STAGES = 4
+# inject dec: where on the way from today's state x(t) to tomorrow's x(t+1) each stage's merged state stands
+MERGE_AT = (0.0, 0.25, 0.5, 0.75)
 
 
 def needs_core(arm: str) -> bool:
@@ -833,11 +848,18 @@ class KAIPos(nn.Module):
             nn.init.zeros_(self.gate_head.bias)
         if cfg.inject in ("all", "dec"):
             self.projs = nn.ModuleList(nn.Conv2d(n, d, 1) for d in cfg.dims)
-            if cfg.inject == "dec":  # the stage's features merged back to the 67 variables
-                self.decs = nn.ModuleList(nn.Conv2d(d, n, 1) for d in cfg.dims)
-            for q in list(self.projs) + list(getattr(self, "decs", [])):
+            for q in self.projs:
                 nn.init.zeros_(q.weight)
                 nn.init.zeros_(q.bias)
+            if cfg.inject == "dec":
+                # the merge of a stage's channels to the 67 variables, in the form of KAI's own (its head); none
+                # where the stage stands at the input itself (MERGE_AT 0: the merge is x)
+                self.decs = nn.ModuleDict({str(i): nn.Sequential(nn.Conv2d(d, d, 3, padding=1), nn.GELU(),
+                                                                 nn.Conv2d(d, n, 1))
+                                           for i, d in enumerate(cfg.dims) if MERGE_AT[i] > 0})
+                for q in self.decs.values():
+                    nn.init.zeros_(q[-1].weight)
+                    nn.init.zeros_(q[-1].bias)
         elif cfg.inject.startswith("s"):
             self.stage = int(cfg.inject[1]) - 1
             self.proj = nn.Conv2d(n, cfg.dims[self.stage], 1)
@@ -871,10 +893,10 @@ class KAIPos(nn.Module):
         # inject all / dec, diagnostics: stages whose injection is switched off (0-based), and the size of what every
         # stage receives relative to its features (RMS ratio per call; a list per stage when switched on)
         self.stage_off, self.stage_log, self.gate_log = (), None, None
-        # inject dec, diagnostic (a list per stage when switched on): where the stage's merged state x_i sits. Per
-        # call (RMS of (x_i - x) / s, the part of the model's own step it has taken: the projection of x_i - x on
-        # y - x in units of s; 0 = the input, 1 = the model's forecast)
-        self.dec_log = None
+        # inject dec (a list when switched on): per call, every merging stage's own estimate of the next day
+        # x + s D_i(h_i), with the gradient of the merge layers only. The trainer's merge loss and the scoring's
+        # check of the merge compare it with the data.
+        self.merge_pred = None
 
     def core_next(self, x, doy, tisr_next, prev=None):
         with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
@@ -894,17 +916,20 @@ class KAIPos(nn.Module):
             tau = torch.zeros_like(tau)
         m = self.kai.core_model
         h = torch.cat([x, tau], 1) if cfg.inject in ("in", "hist") else x
-        merged = []
+        est = []
         for i in range(N_STAGES):
             h = m.downsample_layers[i](h)
             if cfg.inject in ("all", "dec") and i not in self.stage_off:
                 ti = tau
-                if cfg.inject == "dec":  # merge the stage's channels to the variables, the core's step from there
-                    xi = x + self.decs[i](h) * self.s * self.free
-                    ti = (self._core[0].at(xi, doy, tisr_next) - xi) / self.s
-                    if self.ablate:
-                        ti = torch.zeros_like(ti)
-                    merged.append((i, xi))
+                if cfg.inject == "dec" and MERGE_AT[i] > 0 and not self.ablate:
+                    # merge: the input and the part a_i of the day's change this stage's channels hold; the core's
+                    # own step from that state (the gradient of a later day passes the core as it does at x)
+                    inc = self.decs[str(i)](h.detach()) * self.free
+                    if self.merge_pred is not None:
+                        est.append(x.detach() + self.s * inc)
+                    xi = x + MERGE_AT[i] * self.s * inc.detach()
+                    with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
+                        ti = (self._core[0].at(xi, doy, tisr_next) - xi) / self.s
                 d = self.projs[i](ti)
                 if self.stage_log is not None:
                     self.stage_log[i].append(float((d.detach().pow(2).mean() / h.detach().pow(2).mean()).sqrt()))
@@ -918,15 +943,9 @@ class KAIPos(nn.Module):
                 h = h + self.proj(tau)
         o = m.head(h)
         self.last_core = c
-        y = self._output(x, o, c, h)
-        if self.dec_log is not None:
-            with torch.no_grad():
-                dy = (y - x) / self.s * self.free
-                for i, xi in merged:
-                    dx = (xi - x) / self.s
-                    self.dec_log[i].append((float(dx.pow(2).sum() / self.free.sum() / dx[:, :1].numel()) ** 0.5,
-                                            float((dx * dy).sum() / dy.pow(2).sum().clamp_min(1e-30))))
-        return y
+        if est:
+            self.merge_pred.append(est)
+        return self._output(x, o, c, h)
 
     def _output(self, x, o, c, h):
         cfg = self.cfg
@@ -972,4 +991,4 @@ def config_dict(cfg) -> dict:
 
 
 __all__ = ["ARMS", "ConvGRUCell", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "stateless_norm", "core_step", "core_rollout", "needs_core",
-           "config_dict", "TISR", "OROG", "DYN", "TISR_DYN", "operator_features", "CachedFeatures"]
+           "config_dict", "MERGE_AT", "N_STAGES", "TISR", "OROG", "DYN", "TISR_DYN", "operator_features", "CachedFeatures"]

@@ -6,7 +6,9 @@
 # fine-tuning of kai (2 to 3 days, $RO_ITERS iterations), so the only difference between them is where the core is:
 #   kai_ro   no core                                              (the control of the fine-tuning itself; reused if there)
 #   stc      the core INSIDE every stage: at the entry of each of the four stages its channels are merged to the 67
-#            variables, the core steps from that state, its tendency is split to the stage's channels and added
+#            variables, the core steps from that state, its tendency is split to the stage's channels and added.
+#            The merge keeps the input's variables and adds the part of the day's change the stage's channels hold;
+#            it is trained by its own error against the data, and the score checks it (stage_merge in the json)
 #   stcg     stc + an output mix with the core forecast, its weight computed by KAI per channel and grid point;
 #            starts as the loop (KAI, core) with the loop's fixed weights
 #   stg      control of stc: the core is asked at the input x only, the same tendency enters all four stages
@@ -19,6 +21,9 @@
 #   GRID=5.625 C=core_gn bash scripts/run_kai_stage.sh            # the CPU test of docs/kai_stage_core.md
 #   ARMS="stcg stgg" ...                                          # only some of the new models
 #   CORE_GRAD=0 ...                                               # no gradient through the frozen core (less memory, time)
+#   SCORE=0 ARMS="stcg stgg" ...                                  # train only: several of these side by side (one per
+#                                                                 #   GPU, after a first SCORE=0 ARMS=" " run made the
+#                                                                 #   start weights and kai_ro), then one run that scores
 #   DRYRUN=1 ...                                                  # print the commands only
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -39,8 +44,7 @@ TRAIN_YEARS=${TRAIN_YEARS:-"2012 2013 2014 2015"}; VAL_YEAR=${VAL_YEAR:-2016}; T
 RO_ITERS=${RO_ITERS:-1000}; RO_LR=${RO_LR:-3e-4}
 GATE_LR=${GATE_LR:-1e-3}              # the 67 base weights of the output mix start at a fitted value: a small step
 NEW_LR=${NEW_LR:-1e-3}                # the layers added to KAI start at zero: KAI's own from-scratch learning rate
-CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the core between the days (stc / stcg keep the one
-                                      #    through the core inside the stages: their merge layers learn through it)
+CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the frozen core between the days of a rollout
 IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}; LOGK=${LOGK:-250}
 ARMS=${ARMS:-"stcg stc stgg stg outg"}
 SFX=${SFX:-}                           # suffix of the new tags (another core in the same folder)
@@ -78,6 +82,8 @@ for arm in $ARMS; do
     step $arm$SFX "$OUT/$arm$SFX.pt" $R --arm $arm --tag $arm$SFX $FT $CG --gate-lr $GATE_LR --new-lr $NEW_LR \
         --gate-init "$W0:$BL"
 done
+
+[ "${SCORE:-1}" = 1 ] || { echo "[stage] SCORE=0: trained, not scored"; exit 0; }
 
 # 3. score: every new model with its diagnostics (~notau, ~ns1..4: one stage's tau off), the output mixes on both KAIs
 TAGS=""; PAIRS="$LP@kai_ro:kai_ro"

@@ -49,9 +49,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
-from pgcfm.kai_tend import (ARMS, DYN, N_STAGES, CachedFeatures, CoreBase, KAIPos, KAIPosConfig, LpLoss, OROG,  # noqa: E402
-                            TISR, config_dict, core_continue, core_rollout, hand_memory, make_core, needs_core,
-                            operator_features)
+from pgcfm.kai_tend import (ARMS, DYN, MERGE_AT, N_STAGES, CachedFeatures, CoreBase, KAIPos, KAIPosConfig,  # noqa: E402
+                            LpLoss, OROG, TISR, config_dict, core_continue, core_rollout, hand_memory, make_core,
+                            needs_core, operator_features)
 
 EPS = contract.KAI_STD_EPS
 NEW_PARTS = ("projs", "decs", "gate_head")  # what the stage arms add to KAI (kai_tend.KAIPos), zero at the start
@@ -546,8 +546,8 @@ def train(a, arm):
         cur = a.rollout  # [1] = KAI's single-step training
         m.core_grad = max(cur) > 1 and not a.core_nograd
         m.grad_ckpt = bool(a.kai_ckpt)  # the activations of a block are recomputed in the backward pass
-        if core is not None and (m.core_grad or m.cfg.inject == "dec"):  # ... and of the frozen core's substeps,
-            core.grad_ckpt = bool(a.core_ckpt)                           # where the gradient passes it
+        if core is not None and m.core_grad:     # ... and of the frozen core's substeps, where the gradient
+            core.grad_ckpt = bool(a.core_ckpt)   # passes it
         gate = [q for k, q in m.named_parameters() if k == "gate"]
         # the layers a stage arm adds to a trained KAI start at zero: their own learning rate (--new-lr)
         new = [q for k, q in m.named_parameters() if k.split(".")[0] in NEW_PARTS] if a.new_lr else []
@@ -557,6 +557,10 @@ def train(a, arm):
                                 lr=a.lr)  # KAI's trainer; the 67 gate weights move on their own scale
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
+    merging = not is_core and m.cfg.inject == "dec"  # the stages' merge layers have their own loss (below)
+    if merging:
+        merge_par = list(m.decs.parameters())
+        model_par = [q for q in m.parameters() if not any(q is v for v in merge_par)]
     years = sorted(trz)
     era_in = is_core and getattr(m, "era_in", False)
     sb_on = is_core and a.sb_members > 1
@@ -862,17 +866,28 @@ def train(a, arm):
                     loss = loss + a.sb_ssr_lam * (torch.relu(lo - ssr) ** 2 + torch.relu(ssr - hi) ** 2).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
-        elif K == 1:
-            loss = lp(one_step(x, doy, tg[:, 0], prev[0]), tg[:, 0])
-        else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
-            y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
-            loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
+        else:
+            if merging:
+                m.merge_pred = []
+            if K == 1:
+                loss = lp(one_step(x, doy, tg[:, 0], prev[0]), tg[:, 0])
+            else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
+                y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
+                loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
+            if merging:
+                # the merge of the stages' channels to the variables is trained by its own error against the data:
+                # every merging stage's estimate of the next day, on every day of the rollout. Only the merge
+                # layers have a gradient of it (KAIPos.forward), so the forecast loss above is KAI's as before.
+                mloss = sum(lp(e, tg[:, k]) for k, est in enumerate(m.merge_pred) for e in est) / (K * len(m.decs))
+                m.merge_pred = None
         if sit % A == 1 or A == 1:
             opt.zero_grad()
-        (loss / A if A > 1 else loss).backward()
+        ((loss + mloss if merging else loss) / A).backward()
         if sit % A:
             continue
-        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(m.parameters() if not merging else model_par, 1.0)
+        if merging:  # on their own: the merge layers' gradient does not change the clipping of the model's
+            torch.nn.utils.clip_grad_norm_(merge_par, 1.0)
         if is_core and mj is not None:
             torch.nn.utils.clip_grad_norm_(mj_par, 1.0)
             if ent_par:
@@ -881,6 +896,8 @@ def train(a, arm):
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
+            if merging:  # the merge layers' loss: the stages' estimates of the next day (relative L2, as the loss)
+                log[-1]["merge"] = float(mloss.detach())
             if is_core and getattr(getattr(m, "features", None), "store", None):  # states served by the dycore store
                 log[-1]["dycore_hits"] = m.features.hits
             if sb_log is not None:  # control energy and activity per rollout day of the last batch
@@ -1051,6 +1068,30 @@ def score(a, tags):
         fn.mem = W1
         return fn
 
+    def merge_check(m, xz, ics):
+        """The core inside the stages (inject dec): is every stage's merged state a real state? One step from every
+        IC: the error of the merged state x_i = x + a_i s D_i(h_i) against the data's state at the stage's part
+        a_i of the day, x + a_i (x(t+1) - x), next to the error of the input x there (what the core would be asked
+        at without the merge: a_i * persistence). Per-channel RMSE in units of the daily-increment std, mean over
+        the scored channels. One row per stage: (a_i, merged, input)."""
+        sc = [c for c in range(contract.N_CHANNELS) if c not in (OROG, TISR)]
+        se, pe, n = 0.0, 0.0, 0
+        with torch.no_grad():
+            for i in range(0, len(ics), a.score_batch):
+                j = ics[i:i + a.score_batch]
+                x, y = torch.from_numpy(xz[j]).to(dev), torch.from_numpy(xz[j + 1]).to(dev)
+                pv = None
+                if m.mem:  # the days before the IC for the core's memory, as in ``rollout``
+                    pv = torch.from_numpy(np.stack([xz[np.maximum(j - k, 0)] for k in range(m.mem, 0, -1)], 1)).to(dev)
+                m.merge_pred = []
+                m.rollout(x, torch.tensor(j, device=dev), 1, y[:, None, TISR], prev=pv)
+                se = se + torch.stack([((e - y) / m.s)[:, sc].pow(2).sum((0, 2, 3)) for e in m.merge_pred[0]])
+                pe = pe + ((x - y) / m.s)[:, sc].pow(2).sum((0, 2, 3))
+                n += x[:, 0].numel()
+        m.merge_pred = None
+        est, per = iter((se / n).sqrt().mean(1).tolist()), float((pe / n).sqrt().mean())
+        return np.array([(al, al * next(est) if al > 0 else 0.0, al * per) for al in MERGE_AT], dtype=np.float32)
+
     def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with
         ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location=dev, weights_only=False)
         arm = tag.split("_")[0]
@@ -1176,8 +1217,6 @@ def score(a, tags):
         staged = m.cfg.inject in ("all", "dec")
         if staged:
             m.stage_log = [[] for _ in range(N_STAGES)]
-        if m.cfg.inject == "dec":
-            m.dec_log = [[] for _ in range(N_STAGES)]
         if m.cfg.form == "sgate":
             m.gate_log = []
         pred = rollout(fns[tag], tez, ics)
@@ -1186,10 +1225,8 @@ def score(a, tags):
         if staged:  # what every stage receives from the core, relative to its own features (RMS, mean over calls)
             res[tag]["stage_ratio"] = np.array([np.mean(v) for v in m.stage_log], dtype=np.float32)
             m.stage_log = None
-        if m.cfg.inject == "dec":  # where each stage's merged state sits: (RMS distance from the input in increment
-            # std, the part of the model's own step it has taken), mean over the calls
-            res[tag]["stage_state"] = np.array([np.mean(v, 0) for v in m.dec_log], dtype=np.float32)
-            m.dec_log = None
+        if m.cfg.inject == "dec":  # is each stage's merged state a real state? (against the data, one step)
+            res[tag]["stage_merge"] = merge_check(m, tez, ics)
         if m.cfg.form == "sgate":  # the weight of the core the model actually used, per channel
             res[tag]["gate_used"] = torch.stack(m.gate_log).mean(0).cpu().numpy()
             m.gate_log = None
@@ -1486,7 +1523,7 @@ def summarize(a, res, std, ics):
     out["gates"] = {k: d["gate"].tolist() for k, d in res.items() if "gate" in d}
     out["gates_used"] = {k: d["gate_used"].tolist() for k, d in res.items() if "gate_used" in d}
     out["stage_ratio"] = {k: d["stage_ratio"].tolist() for k, d in res.items() if "stage_ratio" in d}
-    out["stage_state"] = {k: d["stage_state"].tolist() for k, d in res.items() if "stage_state" in d}
+    out["stage_merge"] = {k: d["stage_merge"].tolist() for k, d in res.items() if "stage_merge" in d}
     # paired bootstrap over ICs of the RMSE change vs kai: per channel and lead, and for the 65-channel mean
     if "kai" in res:
         base = res["kai"]["mse"]
