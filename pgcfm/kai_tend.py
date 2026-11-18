@@ -22,6 +22,21 @@ The core is trained first and frozen. Its one-day forecast c(x) and tendency tau
 A further position needs no training: a lead-wise blend of the two finished forecasts
 (scripts/run_kai_tendency.py, ``blend``; ``loop`` = the same weights applied every step and fed back).
 
+The core inside every stage (docs/kai_stage_core.md, owner 2026-11-18: the core is to act in each of KAI's stages
+instead of being mixed with KAI's finished output):
+
+    inject  all       tau added at the ENTRY of each of the four stages (after the stage's stem / transition
+                      layer, before its blocks), each through its own zero-initialized 1x1 conv, so every stage's
+                      blocks process the core's tendency at that stage's width
+    form    sgate     k(x) + g(x) * (c(x) - k(x)),  g = clamp(g0 + 1x1 conv of KAI's last-stage features, 0, 1):
+                      the output mix of ``gate`` with a weight per channel AND grid point that KAI computes itself;
+                      g0 = the loop's fixed weights (--gate-init), the conv starts at zero: the model starts as the
+                      loop and learns where to depart from its fixed weights
+
+    arms    stg   = (full, all)    the core in the four stages only, KAI's own output
+            stgg  = (sgate, all)   the four stages and the learned output mix
+            outg  = (sgate, none)  the learned output mix alone (the control of stgg's stages)
+
 Memory (the owner's Mori-Zwanzig reading, 2026-11-10): the daily 5.625 deg state is a projection of the
 atmosphere, so its exact equation is  dx/dt = Markov term f(x) + memory integral over the past + noise.
 DynCore is the Markov term alone. ``make_core(hist=True)`` adds one lag (the observed trend),
@@ -60,12 +75,15 @@ ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2
         # control of a history core: KAI itself gets the observed trend (x - x_prev) / s as input, no core
         "kaih": ("full", "hist"),
         # control of ``out``: the frozen first stage is not the tendency core but a trained KAI (arm res)
-        "stack": ("core", "none")}
+        "stack": ("core", "none"),
+        # the core in every stage (inject all) and / or a state-dependent output mix (form sgate)
+        "stg": ("full", "all"), "stgg": ("sgate", "all"), "outg": ("sgate", "none")}
+N_STAGES = 4
 
 
 def needs_core(arm: str) -> bool:
     form, inject = ARMS[arm]
-    return form in ("core", "gate") or inject not in ("none", "hist")
+    return form in ("core", "gate", "sgate") or inject not in ("none", "hist")
 
 
 # ------------------------------------------------------------------------------------- the tendency core
@@ -765,7 +783,9 @@ class KAIPos(nn.Module):
     ``core`` is the frozen first stage, a callable (x, doy, tisr_next) -> next state: CoreBase(tendency core),
     or a trained KAI for the control arm ``stack`` (not a submodule: neither trained nor saved with KAI)."""
 
-    def __init__(self, cfg: KAIPosConfig, inc_std: np.ndarray, core=None):
+    def __init__(self, cfg: KAIPosConfig, inc_std: np.ndarray, core=None, gate_init=0.0):
+        """``gate_init`` (form sgate): the start g0 of the core's weight in the output mix, a number or one value
+        per channel (67); 0 = the model starts as KAI, the loop's weights = it starts as the loop."""
         super().__init__()
         self.cfg = cfg
         n = contract.N_CHANNELS
@@ -777,7 +797,19 @@ class KAIPos(nn.Module):
             nn.init.zeros_(last.bias)
         if cfg.form == "gate":
             self.gate = nn.Parameter(torch.zeros(1, n, 1, 1))
-        if cfg.inject.startswith("s"):
+        if cfg.form == "sgate":
+            g0 = torch.as_tensor(gate_init, dtype=torch.float32).expand(n) if np.ndim(gate_init) == 0 \
+                else torch.as_tensor(gate_init, dtype=torch.float32)
+            self.gate = nn.Parameter(g0.clone().view(1, n, 1, 1))
+            self.gate_head = nn.Conv2d(cfg.dims[-1], n, 1)
+            nn.init.zeros_(self.gate_head.weight)
+            nn.init.zeros_(self.gate_head.bias)
+        if cfg.inject == "all":
+            self.projs = nn.ModuleList(nn.Conv2d(n, d, 1) for d in cfg.dims)
+            for q in self.projs:
+                nn.init.zeros_(q.weight)
+                nn.init.zeros_(q.bias)
+        elif cfg.inject.startswith("s"):
             self.stage = int(cfg.inject[1]) - 1
             self.proj = nn.Conv2d(n, cfg.dims[self.stage], 1)
             nn.init.zeros_(self.proj.weight)
@@ -796,9 +828,15 @@ class KAIPos(nn.Module):
         # gradient checkpointing per block: KAI keeps the full grid in all four stages, so on a fine grid the
         # stored activations of a training step (about 12 x dim maps per block) are the memory limit
         self.grad_ckpt = False
-        self.uses_core = cfg.form in ("core", "gate") or cfg.inject not in ("none", "hist")
+        self.uses_core = cfg.form in ("core", "gate", "sgate") or cfg.inject not in ("none", "hist")
         if self.uses_core and core is None:
             raise ValueError("this arm needs the frozen tendency core")
+        # a memory core (CoreBase(core, stateful=True)) is stepped along one batch of trajectories: ``rollout``
+        # warms its memory up on the ``mem`` days before the IC and every step advances it with the model's state
+        self.mem = getattr(core, "mem", 0) if self.uses_core else 0
+        # inject all, diagnostics: stages whose injection is switched off (0-based), and the size of what every
+        # stage receives relative to its features (RMS ratio per call; a list per stage when switched on)
+        self.stage_off, self.stage_log, self.gate_log = (), None, None
 
     def core_next(self, x, doy, tisr_next, prev=None):
         with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
@@ -818,8 +856,13 @@ class KAIPos(nn.Module):
             tau = torch.zeros_like(tau)
         m = self.kai.core_model
         h = torch.cat([x, tau], 1) if cfg.inject in ("in", "hist") else x
-        for i in range(4):
+        for i in range(N_STAGES):
             h = m.downsample_layers[i](h)
+            if cfg.inject == "all" and i not in self.stage_off:
+                d = self.projs[i](tau)
+                if self.stage_log is not None:
+                    self.stage_log[i].append(float((d.detach().pow(2).mean() / h.detach().pow(2).mean()).sqrt()))
+                h = h + d
             if self.grad_ckpt and torch.is_grad_enabled() and h.requires_grad:
                 for blk in m.stages[i]:  # a block's activations are recomputed in the backward pass
                     h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False)
@@ -833,6 +876,15 @@ class KAIPos(nn.Module):
             return o
         if cfg.form == "gate":
             return o + self.gate * self.keep * (c - o)
+        if cfg.form == "sgate":
+            # every channel, as the loop: with its weights the orography and tisr are the core's (exact) ones.
+            # The value is clamped, the gradient is not (clamp's own gradient is zero AT the bounds, where the
+            # loop's clipped weights of many channels start).
+            g = self.gate + self.gate_head(h)
+            g = g + (g.clamp(0.0, 1.0) - g).detach()
+            if self.gate_log is not None:  # the weight actually used: mean per channel of this call
+                self.gate_log.append(g.detach().mean((0, 2, 3)))
+            return o + g * (c - o)
         return (x if cfg.form == "res" else c) + o * self.s * self.keep
 
     def rollout(self, x0, doy0, steps, tisr=None, open_loop=False, prev=None):
@@ -840,8 +892,13 @@ class KAIPos(nn.Module):
 
         ``open_loop`` (diagnostic, inject arms): the core runs on its OWN trajectory from x0 and only its tau
         enters KAI, so KAI's output never feeds the core (closed loop = the trained coupling, the default).
-        ``prev``: the state one day before x0; later steps use the trajectory's own previous state."""
+        ``prev``: the state one day before x0; later steps use the trajectory's own previous state. With a
+        memory core: the ``mem`` states before x0 (B, mem, 67, H, W), oldest first (None = an empty memory)."""
         x, xc, p, out = x0, x0, prev, []
+        if self.mem:
+            with torch.no_grad():  # the days before the IC are data: no gradient goes into the warm-up
+                self._core[0].start(prev, doy0, x0)
+            p = None if prev is None else prev[:, -1]
         for k in range(steps):
             y = self(x, doy0 + k, None if tisr is None else tisr[:, k], xc if open_loop else None, prev=p)
             p = xc if open_loop else x  # the state the next step's trend starts from
