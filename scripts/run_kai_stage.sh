@@ -49,6 +49,9 @@ RO=${RO:-kai_ro}                      # tag of the no-core control of this fine-
 EXTRA_TAGS=${EXTRA_TAGS:-}            # models of another run scored in the same paired score (e.g. "kai_ro stcg")
 EXTRA_PAIRS=${EXTRA_PAIRS:-}          # ... and their pairs a:b (e.g. "stcg_r5:stcg kai_ro5:kai_ro")
 EXTRA_BASES=${EXTRA_BASES:-}          # ... and further KAIs the existing blend / loop is scored on (e.g. "kai_ro")
+B0=${B0-kai}                          # the single-step KAI as a base of the existing blend / loop too; B0= leaves it
+                                      #   out, one base less in the score's memory (the long-rollout score at 5.625 deg
+                                      #   peaks at 11 GB even so: run it alone, not next to a training)
 EXTRA_PLAIN=${EXTRA_PLAIN-$EXTRA_TAGS} # ... those of them scored without the stage diagnostics (default: all of them)
 EXTRA_CORES=${EXTRA_CORES:-}          # further cores scored alone, e.g. the core of a hot model: "stcg_hot.core"
 GATE_LR=${GATE_LR:-1e-3}              # the 67 base weights of the output mix start at a fitted value: a small step
@@ -114,7 +117,7 @@ for t in $EXTRA_TAGS; do  # an extra stage model scored with its diagnostics: it
 done
 XC=""; [ -n "$EXTRA_CORES" ] && XC="--blend-cores $C"   # the extra cores are scored alone, not mixed with the KAIs
 step $SC "$OUT/score_$SC.json" bash -c "$R --score kai $RO $TAGS $EXTRA_TAGS --score-cores $C $EXTRA_CORES $XC \
-    --blend-bases kai $RO $EXTRA_BASES \
+    --blend-bases $B0 $RO $EXTRA_BASES \
     --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --score-plain $EXTRA_PLAIN \
     --pairs $PAIRS $EXTRA_PAIRS \
     && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"
