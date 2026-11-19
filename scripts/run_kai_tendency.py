@@ -1225,11 +1225,11 @@ def score(a, tags):
         if staged:  # what every stage receives from the core, relative to its own features (RMS, mean over calls)
             res[tag]["stage_ratio"] = np.array([np.mean(v) for v in m.stage_log], dtype=np.float32)
             m.stage_log = None
-        if m.cfg.inject == "dec":  # is each stage's merged state a real state? (against the data, one step)
-            res[tag]["stage_merge"] = merge_check(m, tez, ics)
-        if m.cfg.form == "sgate":  # the weight of the core the model actually used, per channel
+        if m.cfg.form == "sgate":  # the weight of the core the model actually used, per channel (this rollout only)
             res[tag]["gate_used"] = torch.stack(m.gate_log).mean(0).cpu().numpy()
             m.gate_log = None
+        if m.cfg.inject == "dec":  # is each stage's merged state a real state? (against the data, one step)
+            res[tag]["stage_merge"] = merge_check(m, tez, ics)
         if hasattr(m, "gate"):
             res[tag]["gate"] = m.gate.detach().view(-1).cpu().numpy().copy()
         if tag in a.blend_bases or tag in a.blend_with:
