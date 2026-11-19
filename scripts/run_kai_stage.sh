@@ -21,6 +21,8 @@
 #   GRID=5.625 bash scripts/run_kai_stage.sh                      # the CPU test of docs/kai_stage_core.md (core_gngmz8)
 #   ROLLOUT="2 3 5" RO=kai_ro5 SFX=_r5 ARMS=stcg ...              # a longer rollout curriculum, with its own control
 #   CORE_TRAIN=1 SFX=_hot ARMS=stcg ...                           # hot core: trained along with KAI (tags stcg_hot)
+#   CORE_TRAIN=1 HOT_LR=3e-5 CORE_LOSS=1 ...                      # ... its own learning rate, its own forecast loss
+#   SC_NAME=stage_stx ...                                         # another name of the score files
 #   ARMS="stcg stgg" ...                                          # only some of the new models
 #   CORE_GRAD=0 ...                                               # no gradient through the frozen core (less memory, time)
 #   SCORE=0 ARMS="stcg stgg" ...                                  # train only: several of these side by side (one per
@@ -59,10 +61,11 @@ NEW_LR=${NEW_LR:-1e-3}                # the layers added to KAI start at zero: K
 CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the frozen core between the days of a rollout
 CORE_TRAIN=${CORE_TRAIN:-0}           # 1: hot core, its learned parts are trained along with KAI (default: frozen)
 HOT_LR=${HOT_LR:-0}                   # ... with this learning rate (0 = RO_LR)
+CORE_LOSS=${CORE_LOSS:-0}             # ... and this weight of the core's own forecast loss (0 = none; keeps it a core)
 IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}; LOGK=${LOGK:-250}
 ARMS=${ARMS:-"stcg stc stgg stg outg"}
 SFX=${SFX:-}                           # suffix of the new tags (another core in the same folder)
-SC=stage$SFX
+SC=${SC_NAME:-stage$SFX}               # name of the score files (default: stage + the suffix)
 BL=blend_$C; LP=loop_$C; [ "$C" = core ] && { BL=blend; LP=loop; }
 
 step() {  # step <name> <done file> <command...>: skipped when the done file exists, log to $OUT/<name>.log
@@ -82,6 +85,7 @@ R="python scripts/run_kai_tendency.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS -
 KC=""; [ "$KAI_CKPT" = 1 ] && KC="--kai-ckpt --core-ckpt"
 CG=""; [ "$CORE_GRAD" = 1 ] || CG="--core-nograd"
 [ "$CORE_TRAIN" = 1 ] && CG="--core-train --hot-lr $HOT_LR"
+[ "$CORE_TRAIN" = 1 ] && [ "$CORE_LOSS" != 0 ] && CG="$CG --core-loss $CORE_LOSS"
 FT="--init kai --rollout $ROLLOUT --lr $RO_LR --iters $RO_ITERS --batch $RO_BATCH --log-every $LOGK --resume $KC"
 
 # 0. the weights of the loop (KAI, core): the day-1 weights per channel of the lead-wise blend, validation year

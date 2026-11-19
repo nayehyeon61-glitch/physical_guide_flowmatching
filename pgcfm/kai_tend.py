@@ -64,6 +64,22 @@ instead of being mixed with KAI's finished output):
             outg  = (sgate, none)  the learned output mix alone (the control of the stages)
             stc   = (full, dec)    the core inside the four stages (merge, core, split, blend), KAI's own output
             stcg  = (sgate, dec)   the same and the learned output mix
+            stx   = (full, adv)    the core advances the state through the stages (below), KAI's own output
+            stxg  = (sgate, adv)   the same and the learned output mix with the state the stages reached
+
+            adv       the core ADVANCES the state through the four stages (owner 2026-11-19 19:23 KST, candidate 3
+                      of docs/kai_stage_core.md sec. 5): its solver step of one day is cut into four parts of a
+                      quarter day (Heun with h = 1/4), one per stage, and the state goes on from stage to stage:
+                          x_1 = x
+                          core    y_i = x_i advanced by the core a quarter of the day (the day's memory)
+                          split   h_i <- h_i + P_i(4 (y_i - x_i) / s)     then the stage's blocks
+                          correct x_{i+1} = y_i + s C_i(h_i)              C_i: 3x3 conv, GELU, 1x1 conv (KAI's head form)
+                      so the state of a later stage is the core's integration plus KAI's corrections, not KAI's
+                      estimate of the change (inject dec). x_5 is the day's state of this path; form sgate mixes it
+                      with KAI's own output o: o + g (x_5 - o). P_i and the last layer of C_i start at zero: the
+                      model starts as KAI with the core's four-part day as the second forecast (the loop's weights).
+                      C_i is trained by the forecast loss through the path (the data are daily: there is no truth of
+                      the quarter days to train it against).
 
 Memory (the owner's Mori-Zwanzig reading, 2026-11-10): the daily 5.625 deg state is a projection of the
 atmosphere, so its exact equation is  dx/dt = Markov term f(x) + memory integral over the past + noise.
@@ -107,7 +123,9 @@ ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2
         # the core in every stage (inject all) and / or a state-dependent output mix (form sgate)
         "stg": ("full", "all"), "stgg": ("sgate", "all"), "outg": ("sgate", "none"),
         # the core inside every stage: the stage's features merged to the variables, the core, split again (inject dec)
-        "stc": ("full", "dec"), "stcg": ("sgate", "dec")}
+        "stc": ("full", "dec"), "stcg": ("sgate", "dec"),
+        # the core ADVANCES the state through the stages, a quarter of its day per stage (inject adv)
+        "stx": ("full", "adv"), "stxg": ("sgate", "adv")}
 N_STAGES = 4
 # inject dec: where on the way from today's state x(t) to tomorrow's x(t+1) each stage's merged state stands
 MERGE_AT = (0.0, 0.25, 0.5, 0.75)
@@ -541,6 +559,25 @@ def _mem_core_class():
                 x = torch.utils.checkpoint.checkpoint(sub(i), x, hours, *state, use_reentrant=False)
             return DynCore.finish(self, x, tisr_next)
 
+        def part(self, x, hours, i, n):
+            """Substep i of a day cut into n (inject adv), with the memory of this day; recomputed in the backward
+            pass under ``grad_ckpt`` as in ``_advance`` (the memory state it reads is handed over as arguments)."""
+            if not (self.grad_ckpt and torch.is_grad_enabled()):
+                return DynCore.substep(self, x, hours, i, n)
+            names = [k for k in ("m", "z", "M") if getattr(self, k) is not None]
+
+            def f(x, hours, *state):
+                keep = [getattr(self, k) for k in names]
+                for k, v in zip(names, state):
+                    setattr(self, k, v)
+                try:
+                    return DynCore.substep(self, x, hours, i, n)
+                finally:
+                    for k, v in zip(names, keep):
+                        setattr(self, k, v)
+            return torch.utils.checkpoint.checkpoint(f, x, hours, *[getattr(self, k) for k in names],
+                                                     use_reentrant=False)
+
         def step(self, x, hours, tisr_next):
             if not (self.freeze_mem and self.started):
                 self.remember(x)  # the time integral of the past first, then the prediction in time
@@ -794,6 +831,33 @@ class CoreBase:
             self.core.prev = None if prev is None else prev[:, self.dyn]
         return x.index_copy(1, self.dyn, core_step(self.core, x[:, self.dyn], doy, tisr_next))  # orog copied
 
+    def part(self, x, doy, i, n, tisr_next=None):
+        """inject adv: part i of n of the core's day from the full state x (its solver substeps cut into n equal
+        parts, e.g. Heun with h = 1/4). Part 0 first advances a memory core's memory with x, once a day as a full
+        step does; the last part ends the day (forcing tisr_next, positive mass) and is the core's last forecast
+        (the innovation of a Mori-Zwanzig memory is measured against it)."""
+        if self.hist:
+            raise NotImplementedError("a history core holds one trend: it is not stepped in parts")
+        core, y, hours = self.core, x[:, self.dyn], doy.float() * 24.0
+        if i == 0 and self.mem:
+            if not (getattr(core, "freeze_mem", False) and core.started):
+                core.remember(y)
+            core.started = True
+        ns = core.n_sub()
+        for j in range(i * ns, (i + 1) * ns):
+            if self.mem:
+                y = core.part(y, hours, j, n * ns)
+            elif getattr(core, "grad_ckpt", False) and torch.is_grad_enabled():
+                y = torch.utils.checkpoint.checkpoint(lambda v, h, j=j: core.substep(v, h, j, n * ns), y, hours,
+                                                      use_reentrant=False)
+            else:
+                y = core.substep(y, hours, j, n * ns)
+        if i == n - 1:
+            y = core.finish(y, tisr_next)
+            if self.mem:
+                core.fc = y
+        return x.index_copy(1, self.dyn, y)
+
     def at(self, x, doy, tisr_next=None):
         """The core's one-day forecast from ANOTHER state of the same day (the merged variables of a KAI stage,
         inject dec). A memory core reads the memory of the trajectory it is stepped along (the call above, once a
@@ -871,7 +935,14 @@ class KAIPos(nn.Module):
             self.gate_head = nn.Conv2d(cfg.dims[-1], n, 1)
             nn.init.zeros_(self.gate_head.weight)
             nn.init.zeros_(self.gate_head.bias)
-        if cfg.inject in ("all", "dec"):
+        if cfg.inject == "adv":
+            # the stage's correction of the state the core advanced, in the form of KAI's head; zero at the start
+            self.advs = nn.ModuleList(nn.Sequential(nn.Conv2d(d, d, 3, padding=1), nn.GELU(), nn.Conv2d(d, n, 1))
+                                      for d in cfg.dims)
+            for q in self.advs:
+                nn.init.zeros_(q[-1].weight)
+                nn.init.zeros_(q[-1].bias)
+        if cfg.inject in ("all", "dec", "adv"):
             self.projs = nn.ModuleList(nn.Conv2d(n, d, 1) for d in cfg.dims)
             for q in self.projs:
                 nn.init.zeros_(q.weight)
@@ -943,6 +1014,8 @@ class KAIPos(nn.Module):
         """``core_state``: evaluate the core on this state instead of x (the open-loop diagnostic of ``rollout``).
         ``prev``: the state one day before (a history core's trend, or arm kaih's own input); None = no trend."""
         cfg, c, tau = self.cfg, None, None
+        if cfg.inject == "adv":
+            return self._forward_adv(x, doy, tisr_next)
         if self.uses_core:
             xc = x if core_state is None else core_state
             c = self.core_next(xc, doy, tisr_next, prev)
@@ -983,6 +1056,31 @@ class KAIPos(nn.Module):
         if est:
             self.merge_pred.append(est)
         return self._output(x, o, c, h)
+
+    def _forward_adv(self, x, doy, tisr_next):
+        """inject adv (see the module's docstring): the core advances the state a quarter of its day per stage, each
+        stage gets the core's step as its injection and corrects the state; the end state is the second forecast."""
+        m, base, n = self.kai.core_model, self._core[0], N_STAGES
+        grad = self.core_grad and torch.is_grad_enabled()
+        h, xi = x, x
+        for i in range(n):
+            h = m.downsample_layers[i](h)
+            with torch.set_grad_enabled(grad):
+                yi = base.part(xi, doy, i, n, tisr_next if i == n - 1 else None)
+            if i not in self.stage_off and not self.ablate:
+                d = self.projs[i]((yi - xi) / self.s * n)  # the quarter day's step, in units of the daily change
+                if self.stage_log is not None:
+                    self.stage_log[i].append(float((d.detach().pow(2).mean() / h.detach().pow(2).mean()).sqrt()))
+                h = h + d
+            if self.grad_ckpt and torch.is_grad_enabled() and h.requires_grad:
+                for blk in m.stages[i]:
+                    h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False)
+            else:
+                h = m.stages[i](h)
+            xi = yi + self.s * self.advs[i](h) * self.free  # the stage's correction; orography and tisr stay
+        o = m.head(h)
+        self.last_core = xi
+        return self._output(x, o, xi, h)
 
     def _output(self, x, o, c, h):
         cfg = self.cfg

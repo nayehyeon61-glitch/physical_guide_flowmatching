@@ -54,7 +54,7 @@ from pgcfm.kai_tend import (ARMS, DYN, MERGE_AT, N_STAGES, CachedFeatures, CoreB
                             needs_core, operator_features)
 
 EPS = contract.KAI_STD_EPS
-NEW_PARTS = ("projs", "decs", "gate_head")  # what the stage arms add to KAI (kai_tend.KAIPos), zero at the start
+NEW_PARTS = ("projs", "decs", "advs", "gate_head")  # what the stage arms add to KAI (kai_tend.KAIPos), zero at the start
 LAZY_BYTES = 2 ** 30  # a year of daily fields larger than this stays on disk (1.5 deg: 2.9 GB; 5.625 deg: 0.2 GB)
 
 
@@ -685,6 +685,7 @@ def train(a, arm):
         n1 = a.stage1_days if (is_core and s1 is not None) else 0
         nj = a.stage1_days if (is_core and mj is not None) else 0
         x, tg, doy = batch(K + n1 + nj)
+        closs = None  # --core-loss: the hot core's own forecast loss of this batch
         if n1:
             x, tg, doy, s2_0 = stage1_start(x, tg, doy, n1)
             m.ent_init = s2_0
@@ -880,6 +881,16 @@ def train(a, arm):
             if K == 1:
                 loss = lp(one_step(x, doy, tg[:, 0], prev[0]), tg[:, 0])
             else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
+                if core_par and a.core_loss > 0:
+                    # --core-loss: the hot core's OWN forecast from the data, so it stays a tendency core that
+                    # forecasts on its own while it is trained along (without it the hot core became a part of
+                    # KAI: alone it lost 25 % at day 1). Its memory is warmed up on the days before the IC without
+                    # gradient, as in the model's rollout, which starts the memory again right after.
+                    nc = min(K, a.core_loss_days)
+                    with torch.no_grad():
+                        core.reset(pdyn(prev[0]), doy.float() * 24.0, x[:, dyn])
+                    yc = core_continue(core, x[:, dyn], doy, nc, tg[:, :nc, TISR])
+                    closs = sum(lp(yc[:, k], tg[:, k].index_select(1, dyn)) for k in range(nc)) / nc
                 y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
                 loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
             if merging:
@@ -890,7 +901,10 @@ def train(a, arm):
                 m.merge_pred = None
         if sit % A == 1 or A == 1:
             opt.zero_grad()
-        ((loss + mloss if merging else loss) / A).backward()
+        total = loss + mloss if merging else loss
+        if closs is not None:
+            total = total + a.core_loss * closs
+        (total / A).backward()
         if sit % A:
             continue
         torch.nn.utils.clip_grad_norm_(m.parameters() if not merging else model_par, 1.0)
@@ -908,6 +922,8 @@ def train(a, arm):
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
             if merging:  # the merge layers' loss: the stages' estimates of the next day (relative L2, as the loss)
                 log[-1]["merge"] = float(mloss.detach())
+            if closs is not None:  # the hot core's own forecast loss (--core-loss)
+                log[-1]["core_loss"] = float(closs.detach())
             if is_core and getattr(getattr(m, "features", None), "store", None):  # states served by the dycore store
                 log[-1]["dycore_hits"] = m.features.hits
             if sb_log is not None:  # control energy and activity per rollout day of the last batch
@@ -1233,7 +1249,7 @@ def score(a, tags):
             return m.rollout(x, d, L, t, prev=pv, **kw)
         arm_fn.mem = m.mem  # a memory core inside: the days before the IC (rollout)
         fns[tag] = arm_fn
-        staged = m.cfg.inject in ("all", "dec")
+        staged = m.cfg.inject in ("all", "dec", "adv")
         if staged:
             m.stage_log = [[] for _ in range(N_STAGES)]
         if m.cfg.form == "sgate":
@@ -1262,7 +1278,7 @@ def score(a, tags):
                     m.stage_off = (i,)
                     res[f"{tag}~ns{i + 1}"] = scored(arm_fn, spectra=False)
                 m.stage_off = ()
-            if m.cfg.form == "full" and m.uses_core and m.cfg.inject != "dec":  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
+            if m.cfg.form == "full" and m.uses_core and m.cfg.inject not in ("dec", "adv"):  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
                 open_fn = lambda x, d, t, pv=None: arm_fn(x, d, t, pv, open_loop=True)  # noqa: E731
                 open_fn.mem = m.mem
                 res[f"{tag}~open"] = scored(open_fn)
@@ -1638,6 +1654,10 @@ def parser():
                         "loss; the physical terms G(x) and the solver have no parameters and stay. The trained core "
                         "is saved in the model's checkpoint (core_state) and as <tag>.core.pt")
     p.add_argument("--hot-lr", type=float, default=0.0, help="--core-train: the core's learning rate (0 = --lr)")
+    p.add_argument("--core-loss", type=float, default=0.0,
+                   help="--core-train: weight of the core's own forecast loss (its rollout of --core-loss-days from the "
+                        "data, relative L2 as the model's), next to the model's loss; 0 = none")
+    p.add_argument("--core-loss-days", type=int, default=1, help="--core-loss: days of the core's own rollout")
     p.add_argument("--core-nograd", action="store_true",
                    help="position arms with --rollout > 1: no gradient through the frozen core's input (less memory "
                         "and time; the default lets a later day's loss pass through the core)")
