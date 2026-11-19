@@ -18,7 +18,8 @@
 #
 #   bash scripts/run_kai_stage.sh                                 # 1.5 deg, the folders of SRC=daily run_kai_plus.sh
 #   C=core_plus_u64 SFX=_u64 bash scripts/run_kai_stage.sh        # another core: tags stg_u64, stgg_u64, outg_u64
-#   GRID=5.625 C=core_gn bash scripts/run_kai_stage.sh            # the CPU test of docs/kai_stage_core.md
+#   GRID=5.625 bash scripts/run_kai_stage.sh                      # the CPU test of docs/kai_stage_core.md (core_gngmz8)
+#   ROLLOUT="2 3 5" RO=kai_ro5 SFX=_r5 ARMS=stcg ...              # a longer rollout curriculum, with its own control
 #   ARMS="stcg stgg" ...                                          # only some of the new models
 #   CORE_GRAD=0 ...                                               # no gradient through the frozen core (less memory, time)
 #   SCORE=0 ARMS="stcg stgg" ...                                  # train only: several of these side by side (one per
@@ -42,6 +43,11 @@ else
 fi
 TRAIN_YEARS=${TRAIN_YEARS:-"2012 2013 2014 2015"}; VAL_YEAR=${VAL_YEAR:-2016}; TEST_YEAR=${TEST_YEAR:-2017}
 RO_ITERS=${RO_ITERS:-1000}; RO_LR=${RO_LR:-3e-4}
+ROLLOUT=${ROLLOUT:-"2 3"}             # rollout days of the fine-tuning, a curriculum over the iterations (e.g. "2 3 5")
+RO=${RO:-kai_ro}                      # tag of the no-core control of this fine-tuning (another ROLLOUT: another tag)
+EXTRA_TAGS=${EXTRA_TAGS:-}            # models of another run scored in the same paired score (e.g. "kai_ro stcg")
+EXTRA_PAIRS=${EXTRA_PAIRS:-}          # ... and their pairs a:b (e.g. "stcg_r5:stcg kai_ro5:kai_ro")
+EXTRA_BASES=${EXTRA_BASES:-}          # ... and further KAIs the existing blend / loop is scored on (e.g. "kai_ro")
 GATE_LR=${GATE_LR:-1e-3}              # the 67 base weights of the output mix start at a fitted value: a small step
 NEW_LR=${NEW_LR:-1e-3}                # the layers added to KAI start at zero: KAI's own from-scratch learning rate
 CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the frozen core between the days of a rollout
@@ -67,15 +73,15 @@ D="$D --val-year $VAL_YEAR --test-year $TEST_YEAR --device $DEVICE --threads $TH
 R="python scripts/run_kai_tendency.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS --core-tag $C"
 KC=""; [ "$KAI_CKPT" = 1 ] && KC="--kai-ckpt --core-ckpt"
 CG=""; [ "$CORE_GRAD" = 1 ] || CG="--core-nograd"
-FT="--init kai --rollout 2 3 --lr $RO_LR --iters $RO_ITERS --batch $RO_BATCH --log-every $LOGK --resume $KC"
+FT="--init kai --rollout $ROLLOUT --lr $RO_LR --iters $RO_ITERS --batch $RO_BATCH --log-every $LOGK --resume $KC"
 
 # 0. the weights of the loop (KAI, core): the day-1 weights per channel of the lead-wise blend, validation year
-W0="$OUT/score_${SC}0.json"
+W0=${W0:-"$OUT/score_${SC}0.json"}   # the same KAI and core: the file of an earlier run can be given
 step ${SC}0 "$W0" bash -c "$R --score kai --score-cores $C --blend-bases kai --leads $LEADS --ic-stride $IC_STRIDE \
     --score-batch $SCORE_BATCH && cp $OUT/score.json $W0"
 
-# 1. the control of the fine-tuning: KAI in its own 2 to 3 day rollout, no core
-step kai_ro "$OUT/kai_ro.pt" $R --arm kai --tag kai_ro $FT
+# 1. the control of the fine-tuning: KAI in its own rollout ($ROLLOUT days), no core
+step $RO "$OUT/$RO.pt" $R --arm kai --tag $RO $FT
 
 # 2. the same fine-tuning with the core inside
 for arm in $ARMS; do
@@ -86,10 +92,10 @@ done
 [ "${SCORE:-1}" = 1 ] || { echo "[stage] SCORE=0: trained, not scored"; exit 0; }
 
 # 3. score: every new model with its diagnostics (~notau, ~ns1..4: one stage's tau off), the output mixes on both KAIs
-TAGS=""; PAIRS="$LP@kai_ro:kai_ro"
+TAGS=""; PAIRS="$LP@$RO:$RO"
 for arm in $ARMS; do
     t=$arm$SFX; TAGS="$TAGS $t"
-    PAIRS="$PAIRS $t:kai_ro $t:$LP@kai_ro $t:$BL@kai_ro"
+    PAIRS="$PAIRS $t:$RO $t:$LP@$RO $t:$BL@$RO"
     for i in 1 2 3 4; do [ "$arm" = outg ] || PAIRS="$PAIRS $t~ns$i:$t"; done
     [ "$arm" = outg ] || PAIRS="$PAIRS $t~notau:$t"
 done
@@ -97,16 +103,16 @@ done
 for ab in stcg:stgg stc:stg stcg:outg stgg:outg stcg:stc stgg:stg; do
     case " $ARMS " in *" ${ab%:*} "*) case " $ARMS " in *" ${ab#*:} "*) PAIRS="$PAIRS ${ab%:*}$SFX:${ab#*:}$SFX";; esac;; esac
 done
-step $SC "$OUT/score_$SC.json" bash -c "$R --score kai kai_ro $TAGS --score-cores $C --blend-bases kai kai_ro \
-    --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --pairs $PAIRS \
+step $SC "$OUT/score_$SC.json" bash -c "$R --score kai $RO $TAGS $EXTRA_TAGS --score-cores $C --blend-bases kai $RO $EXTRA_BASES \
+    --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --pairs $PAIRS $EXTRA_PAIRS \
     && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"
 
 # 4. the split of every gain into information and amplitude (a gain that is only a smoother field is not counted)
 if [ "${DRYRUN:-0}" != 1 ]; then
-    BP=("$LP@kai_ro:kai_ro=output mix fed back (loop) on the fine-tuned KAI vs the fine-tuned KAI")
+    BP=("$LP@$RO:$RO=output mix fed back (loop) on the fine-tuned KAI vs the fine-tuned KAI")
     for arm in $ARMS; do
         t=$arm$SFX
-        BP+=("$t:kai_ro=$t vs the fine-tuned KAI" "$t:$LP@kai_ro=$t vs the loop on the fine-tuned KAI")
+        BP+=("$t:$RO=$t vs the fine-tuned KAI" "$t:$LP@$RO=$t vs the loop on the fine-tuned KAI")
     done
     mkdir -p "$OUT/breakdown_$SC"
     python scripts/eval_kai_breakdown.py --stats "$OUT/stats.npz" "$OUT/score_$SC.json" "$OUT/score_${SC}_raw.npz" \
