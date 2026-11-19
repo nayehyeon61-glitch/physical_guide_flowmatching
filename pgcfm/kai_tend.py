@@ -923,6 +923,18 @@ class KAIPos(nn.Module):
         # check of the merge compare it with the data.
         self.merge_pred = None
 
+    def train_core(self):
+        """Hot core (``--core-train``): the core inside is no longer frozen. Its learned parts (the tendency network,
+        the positivity map, the memory) are trained along with KAI by the model's own loss, through every place the
+        core enters (the stages, the output mix). The physical terms G(x) have no parameters and the solver has
+        none either, so they stay what they are. Returns the core's parameters for the optimizer: they are not
+        this module's, and the trainer saves them next to the model's (``core_state``)."""
+        par = list(self._core[0].core.parameters())
+        for q in par:
+            q.requires_grad_(True)
+        self.core_grad = True
+        return par
+
     def core_next(self, x, doy, tisr_next, prev=None):
         with torch.set_grad_enabled(self.core_grad and torch.is_grad_enabled()):
             return self._core[0](x, doy, tisr_next, prev=prev)

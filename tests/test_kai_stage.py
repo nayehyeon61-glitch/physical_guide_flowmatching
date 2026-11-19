@@ -247,3 +247,38 @@ def test_a_real_memory_core_is_asked_at_the_stages_without_advancing_its_memory(
         base.start(hist, doy, x)
         base(x, doy, tisr[:, 0])
     assert torch.allclose(core.m, mem_after) and torch.allclose(core.fc, fc)
+
+
+def test_a_core_trained_along_gets_the_gradient_of_the_forecast_loss_and_a_frozen_one_does_not():
+    lat = np.linspace(-78.75, 78.75, H)
+    contract.register_latitudes(lat)
+    core = make_core(torch.zeros(8, H, W), INC, np.zeros(N), np.ones(N), lat, hidden=8, blocks=(1, 1), norm="gn", mem=2,
+                     mem_ch=4, mz=True)
+    for q in core.parameters():
+        q.requires_grad_(False)
+    with torch.no_grad():  # a core with a tendency (its head starts at zero = persistence)
+        core.net.head.weight.normal_(std=0.2)
+    m = model("stcg", CoreBase(core.eval(), stateful=True), gate_init=0.5)
+    m.core_grad = True
+    with torch.no_grad():
+        for q in list(m.projs) + [d[-1] for d in m.decs.values()]:
+            q.weight.normal_(std=0.05)
+    x, doy = batch()
+    hist, tisr = torch.randn(2, 2, N, H, W), torch.zeros(2, 2, H, W)
+
+    def grads():
+        for q in core.parameters():
+            q.grad = None
+        m.rollout(x, doy, 2, tisr=tisr, prev=hist).square().mean().backward()
+        return {k: None if q.grad is None else q.grad.clone() for k, q in core.named_parameters()}
+
+    assert all(g is None for g in grads().values())  # the frozen core: the loss passes it, nothing of it is trained
+    par = m.train_core()  # hot: the same core, trained along
+    assert len(par) == len(list(core.parameters())) and all(q.requires_grad for q in par)
+    g = grads()
+    for part in ("net", "enc", "gru"):  # the tendency network and the memory, every part of them
+        assert any(float(v.abs().sum()) > 0 for k, v in g.items() if k.split(".")[0] == part), part
+    assert not hasattr(core, "features") or not any(k.startswith("features") for k in g)  # no physical term is a parameter
+    core.grad_ckpt = m.grad_ckpt = True  # gradient checkpointing (the long rollouts): the same gradient
+    gc = grads()
+    assert all(torch.allclose(gc[k], g[k], atol=1e-6) for k in g)

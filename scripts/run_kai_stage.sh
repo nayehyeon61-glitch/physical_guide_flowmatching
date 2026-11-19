@@ -20,6 +20,7 @@
 #   C=core_plus_u64 SFX=_u64 bash scripts/run_kai_stage.sh        # another core: tags stg_u64, stgg_u64, outg_u64
 #   GRID=5.625 bash scripts/run_kai_stage.sh                      # the CPU test of docs/kai_stage_core.md (core_gngmz8)
 #   ROLLOUT="2 3 5" RO=kai_ro5 SFX=_r5 ARMS=stcg ...              # a longer rollout curriculum, with its own control
+#   CORE_TRAIN=1 SFX=_hot ARMS=stcg ...                           # hot core: trained along with KAI (tags stcg_hot)
 #   ARMS="stcg stgg" ...                                          # only some of the new models
 #   CORE_GRAD=0 ...                                               # no gradient through the frozen core (less memory, time)
 #   SCORE=0 ARMS="stcg stgg" ...                                  # train only: several of these side by side (one per
@@ -51,6 +52,8 @@ EXTRA_BASES=${EXTRA_BASES:-}          # ... and further KAIs the existing blend 
 GATE_LR=${GATE_LR:-1e-3}              # the 67 base weights of the output mix start at a fitted value: a small step
 NEW_LR=${NEW_LR:-1e-3}                # the layers added to KAI start at zero: KAI's own from-scratch learning rate
 CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the frozen core between the days of a rollout
+CORE_TRAIN=${CORE_TRAIN:-0}           # 1: hot core, its learned parts are trained along with KAI (default: frozen)
+HOT_LR=${HOT_LR:-0}                   # ... with this learning rate (0 = RO_LR)
 IC_STRIDE=${IC_STRIDE:-3}; LEADS=${LEADS:-10}; LOGK=${LOGK:-250}
 ARMS=${ARMS:-"stcg stc stgg stg outg"}
 SFX=${SFX:-}                           # suffix of the new tags (another core in the same folder)
@@ -73,6 +76,7 @@ D="$D --val-year $VAL_YEAR --test-year $TEST_YEAR --device $DEVICE --threads $TH
 R="python scripts/run_kai_tendency.py $D --depths $KAI_DEPTHS --dims $KAI_DIMS --core-tag $C"
 KC=""; [ "$KAI_CKPT" = 1 ] && KC="--kai-ckpt --core-ckpt"
 CG=""; [ "$CORE_GRAD" = 1 ] || CG="--core-nograd"
+[ "$CORE_TRAIN" = 1 ] && CG="--core-train --hot-lr $HOT_LR"
 FT="--init kai --rollout $ROLLOUT --lr $RO_LR --iters $RO_ITERS --batch $RO_BATCH --log-every $LOGK --resume $KC"
 
 # 0. the weights of the loop (KAI, core): the day-1 weights per channel of the lead-wise blend, validation year
@@ -104,7 +108,8 @@ for ab in stcg:stgg stc:stg stcg:outg stgg:outg stcg:stc stgg:stg; do
     case " $ARMS " in *" ${ab%:*} "*) case " $ARMS " in *" ${ab#*:} "*) PAIRS="$PAIRS ${ab%:*}$SFX:${ab#*:}$SFX";; esac;; esac
 done
 step $SC "$OUT/score_$SC.json" bash -c "$R --score kai $RO $TAGS $EXTRA_TAGS --score-cores $C --blend-bases kai $RO $EXTRA_BASES \
-    --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --pairs $PAIRS $EXTRA_PAIRS \
+    --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --score-plain $EXTRA_TAGS \
+    --pairs $PAIRS $EXTRA_PAIRS \
     && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"
 
 # 4. the split of every gain into information and amplitude (a gain that is only a smoother field is not counted)

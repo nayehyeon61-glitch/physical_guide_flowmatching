@@ -548,12 +548,18 @@ def train(a, arm):
         m.grad_ckpt = bool(a.kai_ckpt)  # the activations of a block are recomputed in the backward pass
         if core is not None and m.core_grad:     # ... and of the frozen core's substeps, where the gradient
             core.grad_ckpt = bool(a.core_ckpt)   # passes it
+        # --core-train (hot core): the core's learned parts are trained along by the model's loss
+        core_par = m.train_core() if a.core_train and core is not None else []
+        if core_par:
+            assert max(cur) > 1 and not a.core_nograd, "--core-train needs the model's rollout loss (--rollout >= 2)"
+            core.grad_ckpt = bool(a.core_ckpt)
         gate = [q for k, q in m.named_parameters() if k == "gate"]
         # the layers a stage arm adds to a trained KAI start at zero: their own learning rate (--new-lr)
         new = [q for k, q in m.named_parameters() if k.split(".")[0] in NEW_PARTS] if a.new_lr else []
         rest = [q for k, q in m.named_parameters() if k != "gate" and not any(q is n for n in new)]
         opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else [])
-                                + ([dict(params=new, lr=a.new_lr)] if new else []),
+                                + ([dict(params=new, lr=a.new_lr)] if new else [])
+                                + ([dict(params=core_par, lr=a.hot_lr or a.lr, weight_decay=1e-3)] if core_par else []),
                                 lr=a.lr)  # KAI's trainer; the 67 gate weights move on their own scale
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
@@ -664,6 +670,8 @@ def train(a, arm):
         m.load_state_dict(ck["state"])
         if is_core and mj is not None:
             mj.load_state_dict(ck["state2"])
+        if not is_core and core_par:
+            core.load_state_dict(ck["core_state"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         rng.bit_generator.state = ck["rng"]
@@ -888,6 +896,8 @@ def train(a, arm):
         torch.nn.utils.clip_grad_norm_(m.parameters() if not merging else model_par, 1.0)
         if merging:  # on their own: the merge layers' gradient does not change the clipping of the model's
             torch.nn.utils.clip_grad_norm_(merge_par, 1.0)
+        if not is_core and core_par:  # ... and neither does the hot core's
+            torch.nn.utils.clip_grad_norm_(core_par, 1.0)
         if is_core and mj is not None:
             torch.nn.utils.clip_grad_norm_(mj_par, 1.0)
             if ent_par:
@@ -918,15 +928,21 @@ def train(a, arm):
             if a.resume and it < a.iters:
                 torch.save(dict(state=m.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), it=it, log=log,
                                 rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), sec=time.time() - t0,
-                                **(dict(state2=mj.state_dict()) if is_core and mj is not None else {})),
+                                **(dict(state2=mj.state_dict()) if is_core and mj is not None else {}),
+                                **(dict(core_state=core.state_dict()) if not is_core and core_par else {})),
                            part + ".tmp")
                 os.replace(part + ".tmp", part)
                 if it == a.stop_at:
                     sys.exit(3)
+    hot = dict(core_state=core.state_dict(), core_params=sum(q.numel() for q in core_par)) if not is_core and core_par else {}
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
-                    core_opts=getattr(m, "opts", None),
+                    core_opts=getattr(m, "opts", None), **hot,
                     params=sum(p.numel() for p in m.parameters()), train_seconds=time.time() - t0),
                os.path.join(a.out, f"{a.tag or arm}.pt"))
+    if hot:  # the core as it left the joint training, as a core checkpoint of its own (--score-cores <tag>.core)
+        ck0 = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
+        ck0["state"] = {k: v.cpu() for k, v in core.state_dict().items()}
+        torch.save(ck0, os.path.join(a.out, f"{a.tag or arm}.core.pt"))
     if is_core and mj is not None:  # the second stage trained along, under its own name
         torch.save(dict(state=mj.state_dict(), cfg=config_dict(mj.cfg), log=log, args=vars(a), core_opts=mj.opts,
                         params=sum(p.numel() for p in mj.parameters()), train_seconds=time.time() - t0),
@@ -1096,6 +1112,9 @@ def score(a, tags):
         ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location=dev, weights_only=False)
         arm = tag.split("_")[0]
         core = get_core(ck["args"].get("core_tag", "core")) if needs_core(arm) and arm != "stack" else None
+        if ck.get("core_state") is not None:  # a core trained along with KAI (--core-train): this model's own copy
+            core = build_core(a, mean, std, inc, lat, tag=ck["args"].get("core_tag", "core"))
+            core.load_state_dict(ck["core_state"])
         m = build(a, arm, inc, core)
         missing = m.load_state_dict(ck["state"], strict=False)
         assert set(missing.missing_keys) <= {"dyn"} and not missing.unexpected_keys, missing
@@ -1234,7 +1253,7 @@ def score(a, tags):
             res[tag]["gate"] = m.gate.detach().view(-1).cpu().numpy().copy()
         if tag in a.blend_bases or tag in a.blend_with:
             keep[tag] = pred
-        if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
+        if m.cfg.inject != "none" and tag not in a.score_plain:  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
             res[f"{tag}~notau"] = scored(arm_fn, spectra=False)
             m.ablate = False
@@ -1613,10 +1632,19 @@ def parser():
     p.add_argument("--new-lr", type=float, default=0.0,
                    help="stage arms: learning rate of the layers they add to the trained KAI (they start at zero); "
                         "0 = --lr")
+    p.add_argument("--core-train", action="store_true",
+                   help="position arms with a core, rollout fine-tuning: the core is NOT frozen (hot core). Its learned "
+                        "parts (tendency network, positivity map, memory) are trained along with KAI by the model's "
+                        "loss; the physical terms G(x) and the solver have no parameters and stay. The trained core "
+                        "is saved in the model's checkpoint (core_state) and as <tag>.core.pt")
+    p.add_argument("--hot-lr", type=float, default=0.0, help="--core-train: the core's learning rate (0 = --lr)")
     p.add_argument("--core-nograd", action="store_true",
                    help="position arms with --rollout > 1: no gradient through the frozen core's input (less memory "
                         "and time; the default lets a later day's loss pass through the core)")
     p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
+    p.add_argument("--score-plain", nargs="*", default=[],
+                   help="--score: these tags without their diagnostics (~notau, ~ns1..4, ~open), e.g. models of an "
+                        "earlier score that are here for the pairs only")
     p.add_argument("--score-stages", nargs="*", default=[],
                    help="NAME=A>B@n: score the two-stage forecast (core A to day n, then core B from A's state; with "
                         "--stage1-m2 the second-moment tables of a B with 48 such channels) under NAME, alone and in "
