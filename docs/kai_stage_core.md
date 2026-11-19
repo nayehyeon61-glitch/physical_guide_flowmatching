@@ -454,6 +454,16 @@ RMSE 이득 %, 1 / 3 / 5 / 7 / 10일(기준 `blend@kai_ro`):
 2. **hot core 안정시키기**: `stcg_hot5lr`는 core의 학습률만 1/10(3e-5), `stcg_hot5cl`은 `--core-loss 1`(core 단독의 1일 예보 loss를 자료의 다음 날과 비교해 합친 모델의 loss에 더함, `run_kai_tendency.py`)입니다. 둘 다 rollout 2 → 3 → 5일입니다.
 3. **core가 stage마다 상태를 전진** (`stxg_hot5`, rollout 2 → 3 → 5일): 5절의 첫 후보를 구현한 arm `stxg`(출력 혼합 sgate + inject `adv`, `pgcfm/kai_tend.py`)입니다. core의 하루 적분을 1/4일씩 네 부분으로 나눠(`CoreBase.part`, 기억은 하루에 한 번), stage i에는 그 부분의 경향 4(y_i − x_i)/s를 투영해 넣고(P_i), 다음 stage의 상태는 x_{i+1} = y_i + s·C_i(h_i)로 넘깁니다. y_i는 core가 x_i에서 1/4일 전진시킨 상태, C_i는 stage i의 특징 h_i에서 낸 보정(0에서 시작, 6시간 간격의 정답이 없어서 예보 loss로만 학습)입니다. 출력은 KAI의 출력과 마지막 상태 x_5를 학습된 가중으로 섞습니다. 1/4일씩 네 번 부르는 core는 하루 한 번 학습된 것이라 시작 시점의 1일 val loss가 0.31이 아니라 0.37이었습니다.
 
+   ```
+   x_1 = x(t)
+   stage i = 1 .. 4:
+     y_i     = core가 x_i를 1/4일 전진시킨 상태 (Heun, 8일 기억은 하루에 한 번 갱신)
+     h_i     = stage_i( down_i(h_{i-1}) + P_i( 4 (y_i - x_i) / s ) )      # 그 1/4일의 경향을 stage에 넣기
+     x_{i+1} = y_i + s * C_i(h_i)                                       # 다음 stage로 넘기는 상태
+   예보 = o + g * (x_5 - o),   o = head(h_4),   g = 출력 가중 (KAI가 계산, sgate)
+   ```
+   stcg와의 차이: stcg는 stage i의 상태를 KAI의 채널에서 추정하고(합치기 D_i) 그 상태에서 core를 하루씩 부르지만, stxg는 core가 적분한 상태 자체를 다음 stage로 넘기고 stage는 그 상태를 보정 C_i로 고칩니다. stage별 기여(경향을 끈 진단)는 P_i의 입력만 끄고 상태의 전진은 그대로 둡니다. 그래프 페이지의 구조도에서 stxg를 고르면 같은 그림이 있습니다.
+
 | 모델 | nRMSE 1 / 3 / 5 / 7 / 10일 | ACC 1 / 3 / 5 / 7 / 10일 |
 | --- | --- | --- |
 | `blend@kai_ro` | 0.178 / 0.314 / 0.401 / 0.458 / 0.505 | 0.928 / 0.757 / 0.575 / 0.412 / 0.238 |
