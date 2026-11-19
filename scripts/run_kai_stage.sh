@@ -49,6 +49,8 @@ RO=${RO:-kai_ro}                      # tag of the no-core control of this fine-
 EXTRA_TAGS=${EXTRA_TAGS:-}            # models of another run scored in the same paired score (e.g. "kai_ro stcg")
 EXTRA_PAIRS=${EXTRA_PAIRS:-}          # ... and their pairs a:b (e.g. "stcg_r5:stcg kai_ro5:kai_ro")
 EXTRA_BASES=${EXTRA_BASES:-}          # ... and further KAIs the existing blend / loop is scored on (e.g. "kai_ro")
+EXTRA_PLAIN=${EXTRA_PLAIN-$EXTRA_TAGS} # ... those of them scored without the stage diagnostics (default: all of them)
+EXTRA_CORES=${EXTRA_CORES:-}          # further cores scored alone, e.g. the core of a hot model: "stcg_hot.core"
 GATE_LR=${GATE_LR:-1e-3}              # the 67 base weights of the output mix start at a fitted value: a small step
 NEW_LR=${NEW_LR:-1e-3}                # the layers added to KAI start at zero: KAI's own from-scratch learning rate
 CORE_GRAD=${CORE_GRAD:-1}             # 0: no gradient through the frozen core between the days of a rollout
@@ -107,8 +109,13 @@ done
 for ab in stcg:stgg stc:stg stcg:outg stgg:outg stcg:stc stgg:stg; do
     case " $ARMS " in *" ${ab%:*} "*) case " $ARMS " in *" ${ab#*:} "*) PAIRS="$PAIRS ${ab%:*}$SFX:${ab#*:}$SFX";; esac;; esac
 done
-step $SC "$OUT/score_$SC.json" bash -c "$R --score kai $RO $TAGS $EXTRA_TAGS --score-cores $C --blend-bases kai $RO $EXTRA_BASES \
-    --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --score-plain $EXTRA_TAGS \
+for t in $EXTRA_TAGS; do  # an extra stage model scored with its diagnostics: its stages' pairs too
+    case " $EXTRA_PLAIN " in *" $t "*) ;; *) for i in ns1 ns2 ns3 ns4 notau; do PAIRS="$PAIRS $t~$i:$t"; done;; esac
+done
+XC=""; [ -n "$EXTRA_CORES" ] && XC="--blend-cores $C"   # the extra cores are scored alone, not mixed with the KAIs
+step $SC "$OUT/score_$SC.json" bash -c "$R --score kai $RO $TAGS $EXTRA_TAGS --score-cores $C $EXTRA_CORES $XC \
+    --blend-bases kai $RO $EXTRA_BASES \
+    --loop-blend $C --leads $LEADS --ic-stride $IC_STRIDE --score-batch $SCORE_BATCH --score-plain $EXTRA_PLAIN \
     --pairs $PAIRS $EXTRA_PAIRS \
     && cp $OUT/score.json $OUT/score_$SC.json && cp $OUT/score_raw.npz $OUT/score_${SC}_raw.npz"
 
