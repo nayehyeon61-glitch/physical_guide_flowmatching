@@ -139,12 +139,23 @@ R="python scripts/run_kai_tendency.py --out runs/kaitend"
 $R --arm kai --tag kai --log-every 250
 $R --arm core --core-norm gn --iters 3000 --log-every 250 --core-gfeat --core-mem 8 --core-mz --resume --tag core_gngmz8
 GRID=5.625 bash scripts/run_kai_stage.sh                       # core = core_gngmz8 (물리항 G(x) + 8일 기억)
+
+# 긴 rollout: 미세조정의 rollout을 2 → 3 → 5일로, core 없는 대조도 같은 rollout으로 따로 (kai_ro5)
+GRID=5.625 KAI_CKPT=1 ROLLOUT="2 3 5" RO=kai_ro5 SFX=_r5 ARMS="stcg outg" W0=runs/kaitend/score_stage0.json \
+  EXTRA_TAGS="kai_ro stcg" EXTRA_BASES="kai_ro" EXTRA_PAIRS="stcg_r5:stcg kai_ro5:kai_ro" bash scripts/run_kai_stage.sh
+
+# hot core: core의 학습되는 부분을 KAI와 함께 학습 (tag stcg_hot, 긴 rollout은 stcg_hot5)
+GRID=5.625 KAI_CKPT=1 CORE_TRAIN=1 SFX=_hot ARMS=stcg SCORE=0 bash scripts/run_kai_stage.sh
+GRID=5.625 KAI_CKPT=1 CORE_TRAIN=1 ROLLOUT="2 3 5" RO=kai_ro5 SFX=_hot5 ARMS=stcg W0=runs/kaitend/score_stage0.json \
+  EXTRA_TAGS="kai_ro stcg stcg_r5 stcg_hot" EXTRA_PLAIN="kai_ro stcg stcg_r5" EXTRA_BASES="kai_ro" \
+  EXTRA_CORES="stcg_hot.core stcg_hot5.core" EXTRA_PAIRS="stcg_hot5:stcg_r5 stcg_hot:stcg" bash scripts/run_kai_stage.sh
 ```
 
 - driver는 단계마다 결과 파일이 있으면 건너뛰고, 끊긴 학습은 이어서 합니다(`--resume`).
 - 0단계는 KAI와 core의 선행일별 혼합 가중을 검증 연도에서 구해 `score_stage0.json`에 둡니다. 출력 혼합의 g0가 여기서 옵니다(`--gate-init score_stage0.json:blend_<core>`).
 - 1.5°의 `kai_ro.pt`가 이미 있으면 그대로 씁니다. 새 모델의 미세조정 설정(`RO_ITERS=1000`, `RO_BATCH=4`, `RO_LR=3e-4`)은 그 `kai_ro`의 것과 같습니다.
-- 결과: `score_stage.json`, `stage.log`(모델별 nRMSE와 ACC, 쌍별 차이), `breakdown_stage/breakdown_stage.txt`. 학습 log의 `merge`는 합치는 층의 loss입니다.
+- 결과: `score_stage.json`, `stage.log`(모델별 nRMSE와 ACC, 쌍별 차이), `breakdown_stage/breakdown_stage.txt`. 학습 log의 `merge`는 합치는 층의 loss입니다. `SFX`를 주면 파일 이름에도 붙습니다(`score_stage_r5.json`, `stage_r5.log`, ...).
+- driver의 변수: `ROLLOUT`(미세조정의 rollout 일수, 기본 `"2 3"`), `RO`(그 rollout의 core 없는 대조의 tag, 기본 `kai_ro`), `W0`(0단계 가중 파일, 같은 KAI와 core면 앞선 것을 그대로), `KAI_CKPT=1`(기울기 checkpoint: 5일 rollout의 메모리 12 GB → 4.8 GB, loss 수치는 같음), `CORE_TRAIN=1`(hot core, 학습률은 `HOT_LR`, 기본은 KAI와 같은 `RO_LR`). 다른 실행의 모델을 같은 채점에 넣을 때는 `EXTRA_TAGS`(모델), `EXTRA_PLAIN`(그 가운데 stage 진단 없이 채점할 것, 기본은 전부), `EXTRA_BASES`(기존 blend / loop을 올릴 KAI), `EXTRA_CORES`(단독으로 채점할 core, 예: hot 모델에서 꺼낸 `stcg_hot.core`), `EXTRA_PAIRS`(쌍별 차이)를 줍니다.
 - **1.5°에서는 아직 돌리지 않았습니다.** 메모리와 시간의 어림: `stc` / `stcg`는 하루에 core를 네 번 부릅니다(x에서 한 번, stage 2, 3, 4의 상태에서 한 번씩). `kai_ro`의 학습(1,000 iteration, 0.35시간, 10 GB)에 core의 순전파와 역전파 네 번이 더해집니다. core를 지나는 기울기는 substep 단위 checkpoint로 계산합니다(`--core-ckpt`). 메모리가 모자라면 `CORE_GRAD=0`이나 `RO_BATCH=2`를 주세요.
 
 ## 4. 결과 (5.625°, CPU, 2026-11-19)
