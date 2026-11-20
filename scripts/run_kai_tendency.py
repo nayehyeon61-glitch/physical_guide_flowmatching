@@ -16,13 +16,19 @@ keeps the distance travelled per solver step and ``--core-ckpt`` the memory of a
        s1-s4  tau added after stage 1..4             out    core forecast + s net(x)
        gate   KAI's own output mixed with the core   inout  out with tau at the input
               forecast, one weight per channel (--init kai: the trained KAI is kept, g starts at 0)
+       stg    tau at the entry of ALL four stages    stgg   stg + an output mix with the core forecast whose
+       outg   that learned output mix alone                 weight KAI computes per channel and grid point
+              (the control of the stages)                   (--gate-init: its start, e.g. the loop's weights)
+       stc    the core INSIDE every stage: the stage's channels merged to the 67 variables, the core's step from
+              that state, its tendency split to the stage's channels again and added     stcg   stc + the output mix
    ``--init <tag> --rollout 2 3``: fine-tuning in the model's own rollout (the gradient passes through the
-   frozen core's input).
+   frozen core's input). A memory core inside KAI is warmed up on the days before every batch's IC.
 3. ``--score <tags>``: paired rollouts on the test year: RMSE / ACC per channel and lead, zonal spectra,
    bootstrap vs ``kai``; plus ``core`` alone, ``blend`` (lead-wise blend of the kai and core forecasts, weights
    from the validation year) and, for every arm with an injected tau, the same rollout with tau = 0
    (``<arm>~notau``: how much the trained KAI relies on the core at that position) and with the core running
-   open loop on its own trajectory (``<arm>~open``: is a diverging rollout the KAI <-> core feedback?).
+   open loop on its own trajectory (``<arm>~open``: is a diverging rollout the KAI <-> core feedback?); for the
+   arms with the core in every stage, the same rollout with ONE stage's tau switched off (``<arm>~ns1`` .. ``~ns4``).
 
     python scripts/run_kai_tendency.py --arm core --iters 3000
     python scripts/run_kai_tendency.py --arm s2
@@ -43,11 +49,12 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pgcfm import contract  # noqa: E402
-from pgcfm.kai_tend import (ARMS, DYN, CachedFeatures, CoreBase, KAIPos, KAIPosConfig, LpLoss, OROG, TISR,  # noqa: E402
-                            config_dict, core_continue, core_rollout, hand_memory, make_core, needs_core,
-                            operator_features)
+from pgcfm.kai_tend import (ARMS, DYN, MERGE_AT, N_STAGES, CachedFeatures, CoreBase, KAIPos, KAIPosConfig,  # noqa: E402
+                            LpLoss, OROG, TISR, config_dict, core_continue, core_rollout, hand_memory, make_core,
+                            needs_core, operator_features)
 
 EPS = contract.KAI_STD_EPS
+NEW_PARTS = ("projs", "decs", "advs", "gate_head")  # what the stage arms add to KAI (kai_tend.KAIPos), zero at the start
 LAZY_BYTES = 2 ** 30  # a year of daily fields larger than this stays on disk (1.5 deg: 2.9 GB; 5.625 deg: 0.2 GB)
 
 
@@ -377,8 +384,20 @@ def build(a, arm, inc, core):
         for p in base.parameters():
             p.requires_grad_(False)
     elif needs_core(arm):
-        base = CoreBase(core)
-    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, base).to(a.device)
+        base = CoreBase(core, stateful=bool(getattr(core, "mem", 0)))  # a memory core: KAIPos.rollout starts it
+    return KAIPos(KAIPosConfig.arm(arm, a.depths, a.dims), inc, base, gate_init=gate_init_of(a)).to(a.device)
+
+
+def gate_init_of(a):
+    """--gate-init (arms stgg, outg): the start of the core's weight in the output mix. A number, or
+    <score json>:<blend name> = 1 - the day-1 KAI weights of that scored blend, per channel: the weights its loop
+    feeds back every day (e.g. runs/kaitend/score.json:blend@kai_ro)."""
+    g = a.gate_init
+    if ":" not in g:
+        return float(g)
+    path, name = g.rsplit(":", 1)
+    with open(path) as f:
+        return 1.0 - np.asarray(json.load(f)["blend_weights"][name][0], dtype=np.float32)
 
 
 def train(a, arm):
@@ -402,7 +421,8 @@ def train(a, arm):
     # does the model see the state one step before (the observed trend)? a history core, alone or inside KAI,
     # or arm kaih
     hist = (a.core_hist or a.core_mem > 0) if is_core else (ARMS[arm][1] == "hist" or getattr(core, "hist", False))
-    W = a.core_mem if is_core else 0  # memory core: the W steps before the batch's start warm the memory up
+    # memory core (alone or inside KAI): the W steps before the batch's start warm the memory up
+    W = a.core_mem if is_core else getattr(core, "mem", 0)
     if is_core:
         if st > 1:  # the tendency unit of a long-scale core: std of the st-day increment
             inc = np.sqrt(np.mean(np.stack([((trz[y][st:] - trz[y][:-st]) ** 2).mean((0, 2, 3)).numpy() for y in trz]), 0))
@@ -529,16 +549,32 @@ def train(a, arm):
         if a.init:  # fine-tuning (e.g. --rollout 2 3 from a single-step checkpoint)
             miss = m.load_state_dict(torch.load(os.path.join(a.out, f"{a.init}.pt"), map_location=dev,
                                                 weights_only=False)["state"], strict=False)
-            assert set(miss.missing_keys) <= {"dyn", "gate"} and not miss.unexpected_keys, miss
+            new = {"dyn", "gate"} | {k for k in m.state_dict() if k.split(".")[0] in NEW_PARTS}
+            assert set(miss.missing_keys) <= new and not miss.unexpected_keys, miss
         cur = a.rollout  # [1] = KAI's single-step training
-        m.core_grad = max(cur) > 1
+        m.core_grad = max(cur) > 1 and not a.core_nograd
         m.grad_ckpt = bool(a.kai_ckpt)  # the activations of a block are recomputed in the backward pass
+        if core is not None and m.core_grad:     # ... and of the frozen core's substeps, where the gradient
+            core.grad_ckpt = bool(a.core_ckpt)   # passes it
+        # --core-train (hot core): the core's learned parts are trained along by the model's loss
+        core_par = m.train_core() if a.core_train and core is not None else []
+        if core_par:
+            assert max(cur) > 1 and not a.core_nograd, "--core-train needs the model's rollout loss (--rollout >= 2)"
+            core.grad_ckpt = bool(a.core_ckpt)
         gate = [q for k, q in m.named_parameters() if k == "gate"]
-        rest = [q for k, q in m.named_parameters() if k != "gate"]
-        opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else []),
+        # the layers a stage arm adds to a trained KAI start at zero: their own learning rate (--new-lr)
+        new = [q for k, q in m.named_parameters() if k.split(".")[0] in NEW_PARTS] if a.new_lr else []
+        rest = [q for k, q in m.named_parameters() if k != "gate" and not any(q is n for n in new)]
+        opt = torch.optim.AdamW([dict(params=rest)] + ([dict(params=gate, lr=a.gate_lr, weight_decay=0.0)] if gate else [])
+                                + ([dict(params=new, lr=a.new_lr)] if new else [])
+                                + ([dict(params=core_par, lr=a.hot_lr or a.lr, weight_decay=1e-3)] if core_par else []),
                                 lr=a.lr)  # KAI's trainer; the 67 gate weights move on their own scale
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.iters)
     lp = LpLoss(d=2, p=2, size_average=True, reduction=True)
+    merging = not is_core and m.cfg.inject == "dec"  # the stages' merge layers have their own loss (below)
+    if merging:
+        merge_par = list(m.decs.parameters())
+        model_par = [q for q in m.parameters() if not any(q is v for v in merge_par)]
     years = sorted(trz)
     era_in = is_core and getattr(m, "era_in", False)
     sb_on = is_core and a.sb_members > 1
@@ -599,6 +635,8 @@ def train(a, arm):
     def one_step(x, doy, t, pv=None):
         if is_core:
             return x.index_copy(1, dyn, core_rollout(m, x[:, dyn], doy, 1, t[:, None, TISR], prev=pdyn(pv))[:, 0])
+        if m.mem:  # a memory core inside KAI: started on the days before x
+            return m.rollout(x, doy, 1, t[:, None, TISR], prev=pv)[:, 0]
         return m(x, doy, t[:, TISR], prev=pv)
 
     def val():  # KAI's validation loss (single step, relative L2) on 64 days of the validation year
@@ -640,6 +678,8 @@ def train(a, arm):
         m.load_state_dict(ck["state"])
         if is_core and mj is not None:
             mj.load_state_dict(ck["state2"])
+        if not is_core and core_par:
+            core.load_state_dict(ck["core_state"])
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         rng.bit_generator.state = ck["rng"]
@@ -653,6 +693,7 @@ def train(a, arm):
         n1 = a.stage1_days if (is_core and s1 is not None) else 0
         nj = a.stage1_days if (is_core and mj is not None) else 0
         x, tg, doy = batch(K + n1 + nj)
+        closs = None  # --core-loss: the hot core's own forecast loss of this batch
         if n1:
             x, tg, doy, s2_0 = stage1_start(x, tg, doy, n1)
             m.ent_init = s2_0
@@ -842,17 +883,43 @@ def train(a, arm):
                     loss = loss + a.sb_ssr_lam * (torch.relu(lo - ssr) ** 2 + torch.relu(ssr - hi) ** 2).mean()
             if a.core_zm > 0:  # the zonal mean of the error on its own (a drift is small in the full MSE)
                 loss = loss + a.core_zm * ((err.mean(-1, keepdim=True) ** 2) * wl).mean()
-        elif K == 1:
-            loss = lp(m(x, doy, tg[:, 0, TISR], prev=prev[0]), tg[:, 0])
-        else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
-            y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
-            loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
+        else:
+            if merging:
+                m.merge_pred = []
+            if K == 1:
+                loss = lp(one_step(x, doy, tg[:, 0], prev[0]), tg[:, 0])
+            else:  # the connected model in its own rollout (the frozen core runs on KAI's states)
+                if core_par and a.core_loss > 0:
+                    # --core-loss: the hot core's OWN forecast from the data, so it stays a tendency core that
+                    # forecasts on its own while it is trained along (without it the hot core became a part of
+                    # KAI: alone it lost 25 % at day 1). Its memory is warmed up on the days before the IC without
+                    # gradient, as in the model's rollout, which starts the memory again right after.
+                    nc = min(K, a.core_loss_days)
+                    with torch.no_grad():
+                        core.reset(pdyn(prev[0]), doy.float() * 24.0, x[:, dyn])
+                    yc = core_continue(core, x[:, dyn], doy, nc, tg[:, :nc, TISR])
+                    closs = sum(lp(yc[:, k], tg[:, k].index_select(1, dyn)) for k in range(nc)) / nc
+                y = m.rollout(x, doy, K, tg[:, :, TISR], prev=prev[0])
+                loss = sum(lp(y[:, k], tg[:, k]) for k in range(K)) / K
+            if merging:
+                # the merge of the stages' channels to the variables is trained by its own error against the data:
+                # every merging stage's estimate of the next day, on every day of the rollout. Only the merge
+                # layers have a gradient of it (KAIPos.forward), so the forecast loss above is KAI's as before.
+                mloss = sum(lp(e, tg[:, k]) for k, est in enumerate(m.merge_pred) for e in est) / (K * len(m.decs))
+                m.merge_pred = None
         if sit % A == 1 or A == 1:
             opt.zero_grad()
-        (loss / A if A > 1 else loss).backward()
+        total = loss + mloss if merging else loss
+        if closs is not None:
+            total = total + a.core_loss * closs
+        (total / A).backward()
         if sit % A:
             continue
-        torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(m.parameters() if not merging else model_par, 1.0)
+        if merging:  # on their own: the merge layers' gradient does not change the clipping of the model's
+            torch.nn.utils.clip_grad_norm_(merge_par, 1.0)
+        if not is_core and core_par:  # ... and neither does the hot core's
+            torch.nn.utils.clip_grad_norm_(core_par, 1.0)
         if is_core and mj is not None:
             torch.nn.utils.clip_grad_norm_(mj_par, 1.0)
             if ent_par:
@@ -861,6 +928,10 @@ def train(a, arm):
         sched.step()
         if it % a.log_every == 0 or it == a.iters:
             log.append(dict(it=it, K=K, loss=float(loss.detach()), val=val(), sec=time.time() - t0))
+            if merging:  # the merge layers' loss: the stages' estimates of the next day (relative L2, as the loss)
+                log[-1]["merge"] = float(mloss.detach())
+            if closs is not None:  # the hot core's own forecast loss (--core-loss)
+                log[-1]["core_loss"] = float(closs.detach())
             if is_core and getattr(getattr(m, "features", None), "store", None):  # states served by the dycore store
                 log[-1]["dycore_hits"] = m.features.hits
             if sb_log is not None:  # control energy and activity per rollout day of the last batch
@@ -881,15 +952,21 @@ def train(a, arm):
             if a.resume and it < a.iters:
                 torch.save(dict(state=m.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), it=it, log=log,
                                 rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), sec=time.time() - t0,
-                                **(dict(state2=mj.state_dict()) if is_core and mj is not None else {})),
+                                **(dict(state2=mj.state_dict()) if is_core and mj is not None else {}),
+                                **(dict(core_state=core.state_dict()) if not is_core and core_par else {})),
                            part + ".tmp")
                 os.replace(part + ".tmp", part)
                 if it == a.stop_at:
                     sys.exit(3)
+    hot = dict(core_state=core.state_dict(), core_params=sum(q.numel() for q in core_par)) if not is_core and core_par else {}
     torch.save(dict(state=m.state_dict(), cfg=config_dict(m.cfg), log=log, args=vars(a),
-                    core_opts=getattr(m, "opts", None),
+                    core_opts=getattr(m, "opts", None), **hot,
                     params=sum(p.numel() for p in m.parameters()), train_seconds=time.time() - t0),
                os.path.join(a.out, f"{a.tag or arm}.pt"))
+    if hot:  # the core as it left the joint training, as a core checkpoint of its own (--score-cores <tag>.core)
+        ck0 = torch.load(os.path.join(a.out, f"{a.core_tag}.pt"), map_location="cpu", weights_only=False)
+        ck0["state"] = {k: v.cpu() for k, v in core.state_dict().items()}
+        torch.save(ck0, os.path.join(a.out, f"{a.tag or arm}.core.pt"))
     if is_core and mj is not None:  # the second stage trained along, under its own name
         torch.save(dict(state=mj.state_dict(), cfg=config_dict(mj.cfg), log=log, args=vars(a), core_opts=mj.opts,
                         params=sum(p.numel() for p in mj.parameters()), train_seconds=time.time() - t0),
@@ -1031,10 +1108,37 @@ def score(a, tags):
         fn.mem = W1
         return fn
 
+    def merge_check(m, xz, ics):
+        """The core inside the stages (inject dec): is every stage's merged state a real state? One step from every
+        IC: the error of the merged state x_i = x + a_i s D_i(h_i) against the data's state at the stage's part
+        a_i of the day, x + a_i (x(t+1) - x), next to the error of the input x there (what the core would be asked
+        at without the merge: a_i * persistence). Per-channel RMSE in units of the daily-increment std, mean over
+        the scored channels. One row per stage: (a_i, merged, input)."""
+        sc = [c for c in range(contract.N_CHANNELS) if c not in (OROG, TISR)]
+        se, pe, n = 0.0, 0.0, 0
+        with torch.no_grad():
+            for i in range(0, len(ics), a.score_batch):
+                j = ics[i:i + a.score_batch]
+                x, y = torch.from_numpy(xz[j]).to(dev), torch.from_numpy(xz[j + 1]).to(dev)
+                pv = None
+                if m.mem:  # the days before the IC for the core's memory, as in ``rollout``
+                    pv = torch.from_numpy(np.stack([xz[np.maximum(j - k, 0)] for k in range(m.mem, 0, -1)], 1)).to(dev)
+                m.merge_pred = []
+                m.rollout(x, torch.tensor(j, device=dev), 1, y[:, None, TISR], prev=pv)
+                se = se + torch.stack([((e - y) / m.s)[:, sc].pow(2).sum((0, 2, 3)) for e in m.merge_pred[0]])
+                pe = pe + ((x - y) / m.s)[:, sc].pow(2).sum((0, 2, 3))
+                n += x[:, 0].numel()
+        m.merge_pred = None
+        est, per = iter((se / n).sqrt().mean(1).tolist()), float((pe / n).sqrt().mean())
+        return np.array([(al, al * next(est) if al > 0 else 0.0, al * per) for al in MERGE_AT], dtype=np.float32)
+
     def load(tag):  # the arm is the part before '_'; the core is the one the checkpoint was trained with
         ck = torch.load(os.path.join(a.out, f"{tag}.pt"), map_location=dev, weights_only=False)
         arm = tag.split("_")[0]
         core = get_core(ck["args"].get("core_tag", "core")) if needs_core(arm) and arm != "stack" else None
+        if ck.get("core_state") is not None:  # a core trained along with KAI (--core-train): this model's own copy
+            core = build_core(a, mean, std, inc, lat, tag=ck["args"].get("core_tag", "core"))
+            core.load_state_dict(ck["core_state"])
         m = build(a, arm, inc, core)
         missing = m.load_state_dict(ck["state"], strict=False)
         assert set(missing.missing_keys) <= {"dyn"} and not missing.unexpected_keys, missing
@@ -1148,20 +1252,44 @@ def score(a, tags):
     for tag in tags:
         m, ck = load(tag)
         models[tag] = m
-        fns[tag] = lambda x, d, t, pv=None, m=m: m.rollout(x, d, L, t, prev=pv)
+
+        def arm_fn(x, d, t, pv=None, m=m, **kw):
+            return m.rollout(x, d, L, t, prev=pv, **kw)
+        arm_fn.mem = m.mem  # a memory core inside: the days before the IC (rollout)
+        fns[tag] = arm_fn
+        staged = m.cfg.inject in ("all", "dec", "adv")
+        if staged:
+            m.stage_log = [[] for _ in range(N_STAGES)]
+        if m.cfg.form == "sgate":
+            m.gate_log = []
         pred = rollout(fns[tag], tez, ics)
         res[tag] = metrics(pred)
         res[tag].update(train_seconds=ck["train_seconds"], params=ck["params"])
+        if staged:  # what every stage receives from the core, relative to its own features (RMS, mean over calls)
+            res[tag]["stage_ratio"] = np.array([np.mean(v) for v in m.stage_log], dtype=np.float32)
+            m.stage_log = None
+        if m.cfg.form == "sgate":  # the weight of the core the model actually used, per channel (this rollout only)
+            res[tag]["gate_used"] = torch.stack(m.gate_log).mean(0).cpu().numpy()
+            m.gate_log = None
+        if m.cfg.inject == "dec":  # is each stage's merged state a real state? (against the data, one step)
+            res[tag]["stage_merge"] = merge_check(m, tez, ics)
         if hasattr(m, "gate"):
             res[tag]["gate"] = m.gate.detach().view(-1).cpu().numpy().copy()
         if tag in a.blend_bases or tag in a.blend_with:
             keep[tag] = pred
-        if m.cfg.inject != "none":  # reliance on the core at this position: the same rollout with tau = 0
+        if m.cfg.inject != "none" and tag not in a.score_plain:  # reliance on the core at this position: the same rollout with tau = 0
             m.ablate = True
-            res[f"{tag}~notau"] = scored(lambda x, d, t, pv=None: m.rollout(x, d, L, t, prev=pv), spectra=False)
+            res[f"{tag}~notau"] = scored(arm_fn, spectra=False)
             m.ablate = False
-            if m.cfg.form == "full" and m.uses_core:  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
-                res[f"{tag}~open"] = scored(lambda x, d, t, pv=None: m.rollout(x, d, L, t, open_loop=True, prev=pv))
+            if staged:  # ... and of each stage: the same rollout with that stage's tau switched off
+                for i in range(N_STAGES):
+                    m.stage_off = (i,)
+                    res[f"{tag}~ns{i + 1}"] = scored(arm_fn, spectra=False)
+                m.stage_off = ()
+            if m.cfg.form == "full" and m.uses_core and m.cfg.inject not in ("dec", "adv"):  # is a diverging rollout the KAI <-> core feedback? the core on its own trajectory
+                open_fn = lambda x, d, t, pv=None: arm_fn(x, d, t, pv, open_loop=True)  # noqa: E731
+                open_fn.mem = m.mem
+                res[f"{tag}~open"] = scored(open_fn)
         drop(pred)
         del pred
         print("scored", tag, flush=True)
@@ -1436,6 +1564,9 @@ def summarize(a, res, std, ics):
         out["blend_kai_weight"] = res["blend"]["kai_weight"].tolist()
     out["global_bias"] = {k: d["gbias"].tolist() for k, d in res.items() if "gbias" in d}
     out["gates"] = {k: d["gate"].tolist() for k, d in res.items() if "gate" in d}
+    out["gates_used"] = {k: d["gate_used"].tolist() for k, d in res.items() if "gate_used" in d}
+    out["stage_ratio"] = {k: d["stage_ratio"].tolist() for k, d in res.items() if "stage_ratio" in d}
+    out["stage_merge"] = {k: d["stage_merge"].tolist() for k, d in res.items() if "stage_merge" in d}
     # paired bootstrap over ICs of the RMSE change vs kai: per channel and lead, and for the 65-channel mean
     if "kai" in res:
         base = res["kai"]["mse"]
@@ -1519,7 +1650,29 @@ def parser():
                         "(-1 at its start, +1 at its end; forecasts use +1), so that a long period is not learned as "
                         "one stationary climate")
     p.add_argument("--gate-lr", type=float, default=1e-2, help="arm gate: learning rate of the 67 mixing weights")
+    p.add_argument("--gate-init", default="0",
+                   help="arms stgg, outg: the start of the core's weight in the output mix, a number or "
+                        "<score json>:<blend name> (1 - that blend's day-1 KAI weights = its loop's weights)")
+    p.add_argument("--new-lr", type=float, default=0.0,
+                   help="stage arms: learning rate of the layers they add to the trained KAI (they start at zero); "
+                        "0 = --lr")
+    p.add_argument("--core-train", action="store_true",
+                   help="position arms with a core, rollout fine-tuning: the core is NOT frozen (hot core). Its learned "
+                        "parts (tendency network, positivity map, memory) are trained along with KAI by the model's "
+                        "loss; the physical terms G(x) and the solver have no parameters and stay. The trained core "
+                        "is saved in the model's checkpoint (core_state) and as <tag>.core.pt")
+    p.add_argument("--hot-lr", type=float, default=0.0, help="--core-train: the core's learning rate (0 = --lr)")
+    p.add_argument("--core-loss", type=float, default=0.0,
+                   help="--core-train: weight of the core's own forecast loss (its rollout of --core-loss-days from the "
+                        "data, relative L2 as the model's), next to the model's loss; 0 = none")
+    p.add_argument("--core-loss-days", type=int, default=1, help="--core-loss: days of the core's own rollout")
+    p.add_argument("--core-nograd", action="store_true",
+                   help="position arms with --rollout > 1: no gradient through the frozen core's input (less memory "
+                        "and time; the default lets a later day's loss pass through the core)")
     p.add_argument("--blend-cores", nargs="*", default=None, help="cores that are blended (default: all scored)")
+    p.add_argument("--score-plain", nargs="*", default=[],
+                   help="--score: these tags without their diagnostics (~notau, ~ns1..4, ~open), e.g. models of an "
+                        "earlier score that are here for the pairs only")
     p.add_argument("--score-stages", nargs="*", default=[],
                    help="NAME=A>B@n: score the two-stage forecast (core A to day n, then core B from A's state; with "
                         "--stage1-m2 the second-moment tables of a B with 48 such channels) under NAME, alone and in "
