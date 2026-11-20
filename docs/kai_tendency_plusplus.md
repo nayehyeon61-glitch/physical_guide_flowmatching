@@ -198,3 +198,35 @@ GPU 한 장으로 차례로 돌리면 약 15일, core 둘을 GPU 두 장에 나�
 - `GAP`의 읽는 법: 하루 loss의 "처음 보는 해 / 학습한 해 − 1"이 3 % 아래면 용량이나 반복 수가 모자란 것이라 연도를 더 늘려도 그만큼이 상한이고, `ARCH`를 키우거나 반복 수를 늘릴 차례입니다. 5 % 위면 자료가 모자란 것이라 연도가 이득을 줍니다. 이 경계는 5.625° 시험의 두 점에서 잡은 것이고, 해마다 난이도가 1 ~ 2 % 다르므로 한두 해가 아니라 여러 해로 봐야 합니다(`GAP_YEARS="1985 1995 2005 2011 2016 2017"`처럼 직접 줄 수 있고, `GAP_DAYS`는 해마다 쓰는 날 수, 기본 30).
 - 따로 돌릴 때: `python scripts/kai_gap_diag.py --out <폴더> --data ... --cache ... --era5 ... --depths ... --dims ... --device cuda --kai kai kai_ro --cores core_plus_w128 --years ... --days 30 --gap-leads 3`.
 - 시험: dry run(32년에서 KAI 160000, core + 24000, 확장 core 48000이 나오는 것, 4년에서 그대로인 것), 1.5° smoke 폴더에서 3단계 실행(CPU, 3분), 5.625°에서 고친 진단이 이전 숫자를 그대로 내는 것(32년 KAI 2015년 0.1785, 2016년 0.1840). GPU에서는 돌려 보지 못했습니다.
+
+## 9. 1.5° GPU 실행 결과 (학습 2012~2015): KAI, 미세조정 KAI, 가장 좋은 혼합 모델 (2026-11-13)
+
+`ARCH=u64`(다중 규모 U-Net core, seed 0과 1)로 학습과 채점을 마쳤습니다(11-12 20:46 ~ 11-13 22:20, GPU 하나, core 하나에 약 12시간). 아래 그림은 세 모델만 놓고 봅니다: 원본 KAI(`kai`), 미세조정 KAI(`kai_ro`), RMSE가 가장 작은 혼합 모델(`blend_core_plus_u64+core_plus_u64_s1@kai_ro`: 미세조정 KAI와 U-Net core 둘의 혼합). 2017년 초기장 119개, 일평균 1.5°, 이득은 모두 + = 좋아짐입니다.
+
+```bash
+python scripts/plot_kai_pp_compare.py runs/kaiplus_1p5_daily docs/kai_tendency_plusplus_1p5_daily/figures
+```
+
+![변수별 RMSE](kai_tendency_plusplus_1p5_daily/figures/cmp1_rmse_by_variable.png)
+
+![선행 시간별 skill](kai_tendency_plusplus_1p5_daily/figures/cmp2_skill_vs_lead.png)
+
+![주요 변수 heatmap](kai_tendency_plusplus_1p5_daily/figures/cmp3_heatmap_headline.png)
+
+![모든 변수 x 고도 x 선행 heatmap](kai_tendency_plusplus_1p5_daily/figures/cmp4_heatmap_all.png)
+
+![변수 묶음별 heatmap](kai_tendency_plusplus_1p5_daily/figures/cmp5_heatmap_by_group.png)
+
+65채널 nRMSE 이득(%, 선행 1 / 3 / 5 / 7 / 10일):
+
+| 비교 | 1일 | 3일 | 5일 | 7일 | 10일 |
+| --- | --- | --- | --- | --- | --- |
+| 미세조정 KAI : KAI | -1.0 | +1.9 | +2.8 | +2.9 | +3.1 |
+| 혼합 : KAI | +3.5 | +6.1 | +9.8 | +13.2 | +15.9 |
+| 혼합 : 미세조정 KAI | +4.5 | +4.2 | +7.2 | +10.6 | +13.2 |
+| 혼합 : 미세조정 KAI를 기후값으로 감쇠 | +4.5 | +3.3 | +3.4 | +2.1 | -2.4 |
+
+- 혼합 모델은 KAI와 미세조정 KAI 둘 다에 대해 변수 x 고도 x 선행 650칸 가운데 유의하게 나쁜 칸이 없습니다(KAI 대비 648칸, 미세조정 KAI 대비 650칸 모두 유의하게 좋음).
+- 미세조정만으로는 1일에 조금 나빠지고(-1.0 %) 3일부터 +2~3 %입니다.
+- 이득이 가장 큰 곳은 sp(+38~53 %), skt(+18~23 %), 1~2일의 z50 / z100입니다. sp와 skt의 이득 일부는 loss 가중 차이에서 옵니다(5절 6번).
+- **뒤쪽 선행의 이득은 대부분 감쇠입니다.** 미세조정 KAI를 기후값 쪽으로 줄이기만 한 대조와 비교하면 혼합의 이득은 1~7일에 +2~4.5 %이고, 9일부터는 대조가 더 좋습니다(10일 -2.4 %). 10일의 +13~16 %를 core의 정보로 읽으면 안 됩니다.
