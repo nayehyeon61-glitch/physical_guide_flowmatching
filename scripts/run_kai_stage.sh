@@ -23,6 +23,7 @@
 #   CORE_TRAIN=1 SFX=_hot ARMS=stcg ...                           # hot core: trained along with KAI (tags stcg_hot)
 #   CORE_TRAIN=1 HOT_LR=3e-5 CORE_LOSS=1 ...                      # ... its own learning rate, its own forecast loss
 #   SC_NAME=stage_stx ...                                         # another name of the score files
+#   ARMS=stxg23 SFX=_hot5 ...                                     # the core at stages 2 and 3 only (pgcfm/kai_tend.py ARM_STAGES)
 #   ARMS="stcg stgg" ...                                          # only some of the new models
 #   CORE_GRAD=0 ...                                               # no gradient through the frozen core (less memory, time)
 #   SCORE=0 ARMS="stcg stgg" ...                                  # train only: several of these side by side (one per

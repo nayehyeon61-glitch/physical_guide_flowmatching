@@ -125,8 +125,14 @@ ARMS = {"kai": ("full", "none"), "in": ("full", "in"), "s1": ("full", "s1"), "s2
         # the core inside every stage: the stage's features merged to the variables, the core, split again (inject dec)
         "stc": ("full", "dec"), "stcg": ("sgate", "dec"),
         # the core ADVANCES the state through the stages, a quarter of its day per stage (inject adv)
-        "stx": ("full", "adv"), "stxg": ("sgate", "adv")}
+        "stx": ("full", "adv"), "stxg": ("sgate", "adv"),
+        # the same, connected at stages 2 and 3 only (owner 2026-11-20 14:35 KST "2,3stage 연결"): ARM_STAGES
+        "stxg23": ("sgate", "adv"), "stcg23": ("sgate", "dec")}
 N_STAGES = 4
+# arms connected at some of the four stages only (0-based; every other arm: all four). Inject dec / all: the other
+# stages get nothing. Inject adv: the core's day is cut into as many parts as there are connected stages (two halves
+# for stages 2 and 3), each connected stage gets its part and corrects the state; the other stages are KAI's own.
+ARM_STAGES = {"stxg23": (1, 2), "stcg23": (1, 2)}
 # inject dec: where on the way from today's state x(t) to tomorrow's x(t+1) each stage's merged state stands
 MERGE_AT = (0.0, 0.25, 0.5, 0.75)
 
@@ -901,11 +907,13 @@ class KAIPosConfig:
     dims: tuple = (48, 96, 192, 288)
     form: str = "full"
     inject: str = "none"
+    stages: tuple = (0, 1, 2, 3)          # the stages the core is connected at (0-based; ARM_STAGES)
 
     @classmethod
     def arm(cls, name: str, depths, dims) -> "KAIPosConfig":
         form, inject = ARMS[name]
-        return cls(depths=tuple(depths), dims=tuple(dims), form=form, inject=inject)
+        return cls(depths=tuple(depths), dims=tuple(dims), form=form, inject=inject,
+                   stages=tuple(ARM_STAGES.get(name, range(N_STAGES))))
 
 
 class KAIPos(nn.Module):
@@ -1029,7 +1037,7 @@ class KAIPos(nn.Module):
         est = []
         for i in range(N_STAGES):
             h = m.downsample_layers[i](h)
-            if cfg.inject in ("all", "dec") and i not in self.stage_off:
+            if cfg.inject in ("all", "dec") and i in cfg.stages and i not in self.stage_off:
                 ti = tau
                 if cfg.inject == "dec" and MERGE_AT[i] > 0 and not self.ablate:
                     # merge: the input and the part a_i of the day's change this stage's channels hold; the core's
@@ -1060,27 +1068,35 @@ class KAIPos(nn.Module):
     def _forward_adv(self, x, doy, tisr_next):
         """inject adv (see the module's docstring): the core advances the state a quarter of its day per stage, each
         stage gets the core's step as its injection and corrects the state; the end state is the second forecast."""
-        m, base, n = self.kai.core_model, self._core[0], N_STAGES
+        m, base, on = self.kai.core_model, self._core[0], tuple(self.cfg.stages)
+        n = len(on)  # the core's day in as many parts as stages it is connected at (four: quarter days)
         grad = self.core_grad and torch.is_grad_enabled()
         h, xi = x, x
-        for i in range(n):
+        for i in range(N_STAGES):
             h = m.downsample_layers[i](h)
+            if i not in on:  # a stage the core is not connected at: KAI's own
+                h = self._stage(m, i, h)
+                continue
+            j = on.index(i)
             with torch.set_grad_enabled(grad):
-                yi = base.part(xi, doy, i, n, tisr_next if i == n - 1 else None)
+                yi = base.part(xi, doy, j, n, tisr_next if j == n - 1 else None)
             if i not in self.stage_off and not self.ablate:
                 d = self.projs[i]((yi - xi) / self.s * n)  # the quarter day's step, in units of the daily change
                 if self.stage_log is not None:
                     self.stage_log[i].append(float((d.detach().pow(2).mean() / h.detach().pow(2).mean()).sqrt()))
                 h = h + d
-            if self.grad_ckpt and torch.is_grad_enabled() and h.requires_grad:
-                for blk in m.stages[i]:
-                    h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False)
-            else:
-                h = m.stages[i](h)
+            h = self._stage(m, i, h)
             xi = yi + self.s * self.advs[i](h) * self.free  # the stage's correction; orography and tisr stay
         o = m.head(h)
         self.last_core = xi
         return self._output(x, o, xi, h)
+
+    def _stage(self, m, i, h):
+        if self.grad_ckpt and torch.is_grad_enabled() and h.requires_grad:
+            for blk in m.stages[i]:  # a block's activations are recomputed in the backward pass
+                h = torch.utils.checkpoint.checkpoint(blk, h, use_reentrant=False)
+            return h
+        return m.stages[i](h)
 
     def _output(self, x, o, c, h):
         cfg = self.cfg
@@ -1123,4 +1139,4 @@ def config_dict(cfg) -> dict:
 
 
 __all__ = ["ARMS", "ConvGRUCell", "CoreBase", "KAIPos", "KAIPosConfig", "LpLoss", "make_core", "stateless_norm", "core_step", "core_rollout", "needs_core",
-           "config_dict", "MERGE_AT", "N_STAGES", "TISR", "OROG", "DYN", "TISR_DYN", "operator_features", "CachedFeatures"]
+           "config_dict", "ARM_STAGES", "MERGE_AT", "N_STAGES", "TISR", "OROG", "DYN", "TISR_DYN", "operator_features", "CachedFeatures"]
