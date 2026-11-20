@@ -184,7 +184,9 @@ class DynCore(nn.Module):
         (and of what f reads), so a trainer can checkpoint it on its own (the tendency core +)."""
         h = 1.0 / n_sub  # in units of the 6 h step
         t = hours + i * HOURS_PER_STEP * h
-        g = self.features(x) if self.cfg.gfeat else None  # one operator evaluation per substep (k2 reuses it)
+        g = getattr(self, "g_day", None)  # a daily hint held over the day's substeps (day_hint)
+        if g is None and self.cfg.gfeat:
+            g = self.features(x)  # one operator evaluation per substep (k2 reuses it)
         if getattr(self, "gbase", False):
             # the forecast-base form (docs/kai_dycore_integration.md): the day's dycore integration D(x) - x is the
             # base of the step and the network gives the remaining tendency, Heun over the residual; zero head =
@@ -280,11 +282,24 @@ class DynCore(nn.Module):
             x = self.pm(x)
         return x
 
+    def day_hint(self, x: torch.Tensor, n_sub: int) -> Optional[torch.Tensor]:
+        """The hint of the step's start state when the features are a DAILY quantity (``features.daily``: the
+        dycore's 24 h integration of the day's state, docs/kai_island_plus.md) and the step has several substeps:
+        every substep of the day reads it, as the memory is held over the day (one integration a day instead of
+        one per substep). None otherwise (an instantaneous G(x) is evaluated at every substep)."""
+        if n_sub > 1 and self.cfg.gfeat and getattr(self.features, "daily", False):
+            return self.features(x)
+        return None
+
     def step(self, x: torch.Tensor, hours: torch.Tensor, tisr_next: Optional[torch.Tensor]) -> torch.Tensor:
         """One 6 h step of the solver; tisr_next (B, H, W) is the forcing at the end of the step."""
         n_sub = self.n_sub()
-        for i in range(n_sub):
-            x = self.substep(x, hours, i, n_sub)
+        self.g_day = self.day_hint(x, n_sub)
+        try:
+            for i in range(n_sub):
+                x = self.substep(x, hours, i, n_sub)
+        finally:
+            self.g_day = None
         if getattr(self.cfg, "entv", False) and self.v_log is not None:
             self.v_log.append(torch.log(self.ent_s2))
         return self.finish(x, tisr_next)

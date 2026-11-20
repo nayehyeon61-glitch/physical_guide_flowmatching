@@ -474,16 +474,17 @@ def _mem_core_class():
                 return DynCore.step(self, x, hours, tisr_next)
             names = [k for k in ("m", "z", "M") if getattr(self, k) is not None]
             n = self.n_sub()
+            gd = self.day_hint(x, n)  # a daily hint (no gradient): the same in the forward pass and its recomputation
 
             def sub(i):
                 def f(x, hours, *state):
-                    keep = [getattr(self, k) for k in names]
-                    for k, v in zip(names, state):
+                    keep = [getattr(self, k) for k in names] + [getattr(self, "g_day", None)]
+                    for k, v in zip(names + ["g_day"], list(state) + [gd]):
                         setattr(self, k, v)
                     try:
                         return DynCore.substep(self, x, hours, i, n)
                     finally:
-                        for k, v in zip(names, keep):
+                        for k, v in zip(names + ["g_day"], keep):
                             setattr(self, k, v)
                 return f
             state = [getattr(self, k) for k in names]
@@ -663,9 +664,16 @@ def core_step(core, xd: torch.Tensor, doy: torch.Tensor, tisr_next: Optional[tor
     hours = doy.float() * 24.0
     if getattr(core, "grad_ckpt", False) and torch.is_grad_enabled() and not getattr(core, "hist", False):
         n, x = core.n_sub(), xd
+        gd = core.day_hint(xd, n)  # a daily hint, held over the substeps (also in their recomputation)
+
+        def sub(x, h, i):
+            keep, core.g_day = getattr(core, "g_day", None), gd
+            try:
+                return core.substep(x, h, i, n)
+            finally:
+                core.g_day = keep
         for i in range(n):
-            x = torch.utils.checkpoint.checkpoint(lambda x, h, i=i: core.substep(x, h, i, n), x, hours,
-                                                  use_reentrant=False)
+            x = torch.utils.checkpoint.checkpoint(lambda x, h, i=i: sub(x, h, i), x, hours, use_reentrant=False)
         return core.finish(x, tisr_next)
     return core.step(xd, hours, tisr_next)
 

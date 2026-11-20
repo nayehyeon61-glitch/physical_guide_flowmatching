@@ -51,13 +51,16 @@ def terms(pa, ta, w):
 
 
 def pool(x, k):
-    """Running mean over the latitude rows (dim -2) with k rows on each side, shorter at the two ends."""
+    """Running mean over the latitude rows (dim -2) with k rows on each side, shorter at the two ends.
+    The running sum is taken in float64: in float32 the small powers of the rows near the last pole (1.5 deg grid)
+    were lost in the difference of two large sums (pooled power 0, the match gain sqrt(P_arm / P_ctrl) ~1e8)."""
     if k <= 0:
         return x
     H = x.shape[-2]
-    cs = torch.cat([torch.zeros_like(x[..., :1, :]), x.cumsum(-2)], -2)
+    xd = x.double()
+    cs = torch.cat([torch.zeros_like(xd[..., :1, :]), xd.cumsum(-2)], -2)
     lo, hi = (torch.arange(H) - k).clamp(min=0), (torch.arange(H) + k + 1).clamp(max=H)
-    return (cs[..., hi, :] - cs[..., lo, :]) / (hi - lo).view(-1, 1)
+    return ((cs[..., hi, :] - cs[..., lo, :]) / (hi - lo).view(-1, 1)).to(x.dtype)
 
 
 def match(ctrl, arm, k):

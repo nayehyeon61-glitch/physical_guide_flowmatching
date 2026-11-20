@@ -19,7 +19,9 @@ torch.manual_seed(a.seed)
 tr = R.load_years(a, a.train_years); mean, std, inc, clim = R.stats(a, tr); del tr
 te = R.load_years(a, [a.test_year])[a.test_year]
 lat = R.lat_of(os.path.join(a.data, f"{a.test_year}.nc"), te.shape[-2], a.era5)
-tez = torch.from_numpy(R.zscore(te, mean, std)); cz = torch.from_numpy(R.zscore(clim, mean, std))[:, DYN]
+# a fine grid (1.5 deg) stays on disk and is normalized on access; the climatology of the days that are needed only
+tez = R.ZYear(te, mean, std, as_torch=True) if isinstance(te, np.memmap) else torch.from_numpy(R.zscore(te, mean, std))
+czd = lambda idx: torch.from_numpy(R.zscore(np.asarray(clim[idx]), mean, std))[:, DYN]  # noqa: E731
 L = a.leads; ics = np.arange(0, len(tez) - L, a.ic_stride); N = len(ics)
 w = torch.as_tensor(np.cos(np.deg2rad(lat)), dtype=torch.float32); w = (w / w.mean()).view(1, -1, 1)
 sc = [i for i, c in enumerate(DYN) if c != TISR]
@@ -33,8 +35,8 @@ Fc, Fa = fc(a.ctrl), {s: fc(s) for s in a.arms}
 keys = ("ctrl", "wiener_ctrl"); acc = {k: [] for k in keys}
 arm_acc = {s: {k: [] for k in ("arm", "match", "wiener_arm")} for s in a.arms}
 for l in range(L):
-    C = cz[(torch.tensor(ics) + l + 1) % len(cz)][:, None]
-    TA = tez[ics + l + 1][:, None][:, :, DYN] - C
+    C = czd((ics + l + 1) % len(clim))[:, None]
+    TA = tez[ics + l + 1][:, DYN][:, None] - C
     c = torch.from_numpy(np.asarray(Fc[:, l:l + 1], np.float32)) - C
     acc["ctrl"].append(D.terms(c, TA, w)); acc["wiener_ctrl"].append(D.terms(D.wiener(c, TA, fold, a.pool), TA, w))
     for s in a.arms:

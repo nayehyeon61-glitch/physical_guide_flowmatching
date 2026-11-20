@@ -116,6 +116,10 @@ class ZYear:
     def __len__(self):
         return len(self.x)
 
+    @property
+    def shape(self):
+        return tuple(self.x.shape)
+
     def __getitem__(self, i):
         t, rest = (i[0], tuple(i[1:])) if isinstance(i, tuple) else (i, ())
         y = ((np.asarray(self.x[t]) - self.m) / self.s).astype(np.float32)
@@ -269,6 +273,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None, add_opts=None):
             opts["entv"] = True
         if a.core_gdycore:  # only when asked for, as above
             opts["gsource"] = "dycore"
+            if a.core_dycore_grid:  # only when asked for: the coarse grid of the dycore on a fine data grid
+                opts["dyc_grid"] = a.core_dycore_grid
             if a.core_gbase:
                 opts["gbase"] = True
                 if a.core_noise:
@@ -320,7 +326,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None, add_opts=None):
             if opts.get("gsource", "op") in ("op", "both"):
                 op = operator_features(mean, std, xz[:1], states=None if load else xz[:, DYN])
             if opts.get("gsource", "op") in ("dycore", "both"):
-                dy = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64))
+                dy = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64), lat=lat, lon=lon,
+                                    coarse=opts.get("dyc_grid"))
                 if not load:
                     dy.scale = dy.estimate_scale(xz[:, DYN])
             feats = ComboFeatures(op, dy, opts.get("nz", 0), seed=a.seed, hnz=opts.get("hnz", 0.0))
@@ -328,7 +335,8 @@ def build_core(a, mean, std, inc, lat, load=True, tag=None, add_opts=None):
                 feats.scale = feats.scale_buffer()
         elif opts.get("gsource") == "dycore":
             from pgcfm.dycore_day import DycoreFeatures
-            feats = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64))
+            feats = DycoreFeatures(mean, std, np.asarray(yx[0, OROG], np.float64), lat=lat, lon=lon,
+                                   coarse=opts.get("dyc_grid"))
             if not load:
                 feats.scale = feats.estimate_scale(torch.from_numpy(zscore(yx[::4], mean, std))[:, DYN])
         elif load or not isinstance(yx, np.memmap) or H * W <= 8192:
@@ -1663,6 +1671,9 @@ def parser():
     p.add_argument("--core-hnz", type=float, default=0.0,
                    help="--core-gdycore --core-nz 48: the noise channels = the dycore's 24 h response to a perturbed start "
                         "(hint(x + a xi) - hint(x), a = this x the daily increment's std): noise inside the equations")
+    p.add_argument("--core-dycore-grid", type=int, default=0, choices=[0, 32, 64],
+                   help="--core-gdycore on a fine grid (1.5 deg): latitudes of the dycore's coarse grid, 32 = T21 on 64 x 32 "
+                        "(the default, the 5.625 deg hint), 64 = T42 on 128 x 64; the increment is interpolated back")
     p.add_argument("--core-gdycore", action="store_true",
                    help="--core-gfeat: the 48 physical terms = the 24 h INTEGRATED increment of u, v, T, q by NeuralGCM's "
                         "dycore (dinosaur, T21 on the data grid) instead of the instantaneous operator tendency G(x)")

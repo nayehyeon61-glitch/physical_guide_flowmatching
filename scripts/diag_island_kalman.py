@@ -33,6 +33,11 @@ Written per amplitude: the forecast in the cache format of scripts/diag_stage_fi
 a json / log (nRMSE, ACC, activity, five variables, KAI and the corrected state at the island) and the sums.
 
     python scripts/diag_island_kalman.py --out runs/kaitend --tag core_gndmz8 --stage2 core_s2c --kalman kai --amps 0
+
+A fine grid (1.5 deg, the Kalman island + version, scripts/run_kai_island_plus.sh): --device cuda runs the cores and
+KAI on the GPU (the sums stay on the CPU), the years are normalized on access (they stay on disk) and the forecasts are
+written into the cache file block by block (one cache of 119 ICs x 10 days is 4.6 GB at 1.5 deg). --table-only stops
+after the gain table; --no-central / --no-runs do not write the forecast without / with the correction.
 """
 import json
 import os
@@ -49,6 +54,25 @@ import run_kai_tendency as R  # noqa: E402
 from diag_island_noise import VARS, get_state, max_diff, run_days, set_state  # noqa: E402
 from pgcfm import contract  # noqa: E402
 from pgcfm.kai_tend import DYN, TISR, core_step, hand_memory  # noqa: E402
+
+
+class CacheWriter:
+    """A forecast cache (N, L, 66, H, W) float16 written block by block (np.lib.format.open_memmap): at 1.5 deg one
+    cache of 119 ICs is 4.6 GB, so the blocks are not kept in memory. The file gets its name when it is complete."""
+
+    def __init__(self, path, shape):
+        self.path, self.tmp, self.n = path, path[:-4] + ".part.npy", 0
+        self.mm = np.lib.format.open_memmap(self.tmp, mode="w+", dtype=np.float16, shape=tuple(shape))
+
+    def write(self, block):
+        self.mm[self.n:self.n + len(block)] = block
+        self.n += len(block)
+
+    def close(self):
+        assert self.n == len(self.mm), (self.n, self.mm.shape)
+        self.mm.flush()
+        del self.mm
+        os.replace(self.tmp, self.path)
 
 
 def main():
@@ -73,8 +97,12 @@ def main():
     p.add_argument("--gap", type=int, default=20)
     p.add_argument("--year", type=int, default=None, help="year of the forecasts (default: --test-year)")
     p.add_argument("--chunk", type=int, default=4, help="ICs per batch (x members)")
+    p.add_argument("--kai-chunk", type=int, default=16, help="ICs per batch of KAI's forecasts")
     p.add_argument("--max-ics", type=int, default=0)
     p.add_argument("--no-save", action="store_true")
+    p.add_argument("--no-central", action="store_true", help="do not write the forecast without the correction")
+    p.add_argument("--no-runs", action="store_true", help="do not write the forecasts with the correction")
+    p.add_argument("--table-only", action="store_true", help="stop after the gain table of the library year")
     p.add_argument("--json", default=None)
     a = p.parse_args()
     assert a.tag, "--tag: the first core"
@@ -86,8 +114,11 @@ def main():
     del tr
     data = R.load_years(a, sorted({year, lib_year}))
     lat = R.lat_of(os.path.join(a.data, f"{year}.nc"), data[year].shape[-2], a.era5)
-    Z = {y: torch.from_numpy(R.zscore(data[y], mean, std)) for y in data}
+    # a fine grid stays on disk and is normalized on access (R.ZYear), a coarse one is normalized here
+    Z = {y: (R.ZYear(data[y], mean, std, as_torch=True) if isinstance(data[y], np.memmap)
+             else torch.from_numpy(R.zscore(data[y], mean, std))) for y in data}
     del data
+    dev = torch.device(a.device)
     cz = torch.from_numpy(R.zscore(clim, mean, std))[:, DYN]
     L, n1, M, B0 = a.leads, a.n1, a.members, a.chunk
     core = R.build_core(a, mean, std, inc, lat, load=True, tag=a.tag)
@@ -118,6 +149,7 @@ def main():
         miss = kai.load_state_dict(ck["state"], strict=False)
         assert set(miss.missing_keys) <= {"dyn"} and not miss.unexpected_keys, miss
         kai.eval()
+        del ck
     keep = torch.ones(len(DYN))
     keep[DYN.index(TISR)] = 0
     keep = keep.view(1, -1, 1, 1)
@@ -131,9 +163,9 @@ def main():
     def batch(tez, j, size):
         """The ICs j, filled up to ``size`` with the last one (one batch shape = one compilation of the dycore)."""
         j = np.concatenate([j, np.repeat(j[-1:], size - len(j))])
-        x0, doy = tez[j][:, DYN], torch.tensor(j)
-        tis = torch.stack([tez[j + k + 1] for k in range(L)], 1)[:, :, TISR]
-        pv = torch.stack([tez[np.maximum(j - k, 0)] for k in range(W1, 0, -1)], 1)[:, :, DYN] if W1 else None
+        x0, doy = tez[j][:, DYN].to(dev), torch.tensor(j, device=dev)
+        tis = torch.stack([tez[j + k + 1][:, TISR] for k in range(L)], 1).to(dev)
+        pv = torch.stack([tez[np.maximum(j - k, 0)][:, DYN] for k in range(W1, 0, -1)], 1).to(dev) if W1 else None
         return j, x0, doy, tis, pv
 
     def start(x0, doy, pv):
@@ -144,22 +176,30 @@ def main():
         """(len(j), n, 66, H, W): KAI's forecasts of day 1 .. n (default n1) from the ICs j."""
         out, n = [], n or n1
         with torch.no_grad():
-            for i in range(0, len(j), 16):
-                q = j[i:i + 16]
-                tis = torch.stack([tez[q + k + 1] for k in range(n)], 1)[:, :, TISR]
-                out.append(kai.rollout(tez[q], torch.tensor(q), n, tis, prev=tez[np.maximum(q - 1, 0)])[:, :, DYN])
+            for i in range(0, len(j), a.kai_chunk):
+                q = j[i:i + a.kai_chunk]
+                tis = torch.stack([tez[q + k + 1][:, TISR] for k in range(n)], 1).to(dev)
+                out.append(kai.rollout(tez[q].to(dev), torch.tensor(q, device=dev), n, tis,
+                                       prev=tez[np.maximum(q - 1, 0)].to(dev))[:, :, DYN].cpu())
         return torch.cat(out)
 
     if a.kai_fc and kai is not None and not a.max_ics:   # KAI's own forecasts of every lead, in the cache format
         pk = os.path.join(a.out, f"fc_{a.kalman}_{year}.npy")
         if not os.path.exists(pk):
-            np.save(pk, kai_days(Z[year], np.arange(0, len(Z[year]) - L, a.ic_stride), L).numpy().astype(np.float16))
+            jk = np.arange(0, len(Z[year]) - L, a.ic_stride)
+            wk = None
+            for i in range(0, len(jk), a.kai_chunk):
+                b = kai_days(Z[year], jk[i:i + a.kai_chunk], L).numpy().astype(np.float16)
+                wk = wk or CacheWriter(pk, (len(jk),) + b.shape[1:])
+                wk.write(b)
+            wk.close()
             print(f"saved {pk}", flush=True)
         if a.kai_fc == "only":
             return
 
     early = sorted({d for d in a.kal_days if 0 < d < n1}) if a.kalman else []   # corrected days before the island
     feed, st1, keep5 = not a.kal_open, getattr(core, "stride", 1), keep.unsqueeze(1)
+    keep_d = keep.to(dev)
 
     def stage1(x0, doy, tis, zs, Kd):
         """Day 1 .. n1 of the first core with the corrections Kd (day -> gain) toward zs: (the forecasts as they
@@ -169,7 +209,7 @@ def main():
             x = core_step(core, x, doy + k * st1, tis[:, k])
             raw.append(x)
             if k + 1 in Kd:
-                xc = x + Kd[k + 1] * (zs[:, k] - x) * keep
+                xc = x + Kd[k + 1] * (zs[:, k] - x) * keep_d
                 outp.append(xc)
                 x = xc if feed else x
             else:
@@ -191,7 +231,7 @@ def main():
             _, x0, doy, tis, pv = batch(tez, j, B0 * M)
             with torch.no_grad():
                 start(x0, doy, pv)
-                y = run_days(core, x0, doy, range(n1), tis)[:len(j), -1]
+                y = run_days(core, x0, doy, range(n1), tis)[:len(j), -1].cpu()
             errs.append((y - tez[j + n1][:, DYN]) * keep)
             print(f"library {i + len(j)} / {len(ld)} {time.time() - t0:.0f} s", flush=True)
         lib, lib_d = torch.cat(errs), ld + n1
@@ -211,7 +251,7 @@ def main():
     if kai is not None:
         # ---- the gain: error statistics of the island in the library year, per channel and latitude
         zl = kai_days(tez, ld)
-        ezl = (zl - torch.stack([tez[ld + k + 1] for k in range(n1)], 1)[:, :, DYN]) * keep5
+        ezl = (zl - torch.stack([tez[ld + k + 1][:, DYN] for k in range(n1)], 1)) * keep5
         ez, lib_k = ezl[:, -1], lib
         m3 = lambda v: v.double().mean((0, -1), keepdim=True)  # noqa: E731  (1, 66, H, 1)
         if early:   # the gains of the days before the island, in sequence (every day sees the corrections before it)
@@ -222,11 +262,11 @@ def main():
                     j = ld[i:i + B0 * M]
                     jp, x0, doy, tis, pv = batch(tez, j, B0 * M)
                     zc = zl[i:i + len(j)]
-                    zc = torch.cat([zc, zc[-1:].expand(B0 * M - len(j), *zc.shape[1:])])
+                    zc = torch.cat([zc, zc[-1:].expand(B0 * M - len(j), *zc.shape[1:])]).to(dev)
                     with torch.no_grad():
                         start(x0, doy, pv)
-                        raw = stage1(x0, doy, tis, zc, Kd)[0][:len(j)]
-                    errs.append((raw - torch.stack([tez[j + k + 1] for k in range(n1)], 1)[:, :, DYN]) * keep5)
+                        raw = stage1(x0, doy, tis, zc, {d: v.to(dev) for d, v in Kd.items()})[0][:len(j)].cpu()
+                    errs.append((raw - torch.stack([tez[j + k + 1][:, DYN] for k in range(n1)], 1)) * keep5)
                 return torch.cat(errs)
 
             def gain_of(ef, ek):
@@ -268,8 +308,15 @@ def main():
             q = gs["vars"][v]
             print(f" {v:5s} K {q['K']:.3f} rho {q['rho']:.3f} RMSE core {q['rmse_core']:.2f} KAI {q['rmse_kai']:.2f} "
                   f"corrected (expected) {q['rmse_post']:.2f} info {q['info_nats']:.4f}", flush=True)
-        K, var_d, Pa_s = K.float(), var_d.float(), Pa.float()
-        Rv_f, rho_f = Rv.float(), rho.float().clamp(-0.99, 0.99)
+        K, var_d, Pa_s = K.float().to(dev), var_d.float().to(dev), Pa.float().to(dev)
+        Rv_f, rho_f = Rv.float().to(dev), rho.float().clamp(-0.99, 0.99).to(dev)
+        Ke = {d: v.to(dev) for d, v in Ke.items()}
+        del zl, ezl
+    if a.table_only:
+        json.dump(out, open(a.json or os.path.join(a.out, f"kal_tab_{a.tag}_{n1}_{lib_year}_s{a.lib_stride}{ktag}.json"), "w"), indent=1)
+        print("table only: done", flush=True)
+        return
+    post = post.to(dev)
 
     tez = Z[year]
     ics = np.arange(0, len(tez) - L, a.ic_stride)
@@ -312,7 +359,7 @@ def main():
     INC = None
     if a.isl_inc:
         assert kai is not None
-        INC = torch.from_numpy(np.load(a.isl_inc).astype(np.float32))
+        INC = np.load(a.isl_inc, mmap_mode="r")
         assert INC.shape[0] == N, (INC.shape, N)
         kal += "+inc" + os.path.basename(a.isl_inc).split(".")[0].replace("isl_inc_", "").rsplit("_", 1)[0]
     names = {amp: f"isn-{base}{kal}-{a.shape}{amp:g}-m{M if amp else 1}" for amp in a.amps}
@@ -320,8 +367,17 @@ def main():
     acc = {"central": 0.0, "kai": 0.0, **{(amp, k): 0.0 for amp in a.amps for k in kinds}}
     var = {amp: 0.0 for amp in a.amps}
     nans = {"central": 0, **{amp: 0 for amp in a.amps}}
-    keepfc = {amp: [] for amp in a.amps}
-    wsum, ksum, cen_fc, t0 = 0.0, 0.0, [], time.time()
+    wsum, ksum, t0 = 0.0, 0.0, time.time()
+    H_, W_ = Z[year][0].shape[-2:]
+    spec = a.tag + (f"-{a.stage2}_{n1}" if a.stage2 else "")
+    path = os.path.join(a.out, f"fc_{spec}_{year}.npy")
+    save = not a.no_save and not a.max_ics
+    shp = (N, L, len(DYN), H_, W_)
+    # the forecast without the correction: written when it is not cached yet (else compared with the cache)
+    wc = CacheWriter(path, shp) if save and not a.no_central and not os.path.exists(path) else None
+    cmp_blocks = [] if save and not a.no_central and os.path.exists(path) else None
+    wr = {amp: CacheWriter(os.path.join(a.out, f"fc_{names[amp]}_{year}.npy"), shp)
+          for amp in a.amps if save and not a.no_runs}
 
     def run2(x, doy_, tis_, fix=None):
         """The days after the island from x; an entropy second stage starts from ``fix`` = (log S, variance) or
@@ -334,12 +390,12 @@ def main():
         j = ics[i:i + B0]
         nb = len(j)
         jp, x0, doy, tis, pv = batch(tez, j, B0)
-        Tb = torch.stack([tez[j + k + 1] for k in range(L)], 1)[:, :, DYN]
+        Tb = torch.stack([tez[j + k + 1][:, DYN] for k in range(L)], 1)
         Cb = torch.stack([cz[(torch.tensor(j) + k + 1) % len(cz)] for k in range(L)], 1)
         P1 = None
         if any(a.amps):
             P1 = patterns(j)
-            P1 = torch.cat([P1, P1[-1:].expand(B0 - nb, *P1.shape[1:])])
+            P1 = torch.cat([P1, P1[-1:].expand(B0 - nb, *P1.shape[1:])]).to(dev)
         with torch.no_grad():
             n0 = nan()
             start(x0, doy, pv)
@@ -347,19 +403,22 @@ def main():
             state = get_state(core) if Wc else None
             if W2:
                 hand_memory(core, cont)
-            cen = torch.cat([ya, run2(ya[:, -1], doy, tis)], 1)[:nb]
+            cen = torch.cat([ya, run2(ya[:, -1], doy, tis)], 1)[:nb].cpu()
             nans["central"] += nan() - n0
             acc["central"] = acc["central"] + sums(cen, Tb, Cb)
-            cen_fc.append(cen.numpy().astype(np.float16))
+            if wc is not None:
+                wc.write(cen.numpy().astype(np.float16))
+            elif cmp_blocks is not None and len(cmp_blocks) < 4:   # the first blocks are enough for the comparison
+                cmp_blocks.append(cen.numpy().astype(np.float16))
             xa, fix = ya[:, -1], None
             if kai is not None:
-                zs = kai_days(tez, jp)
+                zs = kai_days(tez, jp).to(dev)
                 if early:   # again from the IC, with the corrections of the days before the island
                     start(x0, doy, pv)
                     raw, ya = stage1(x0, doy, tis, zs, Ke)
                     state, xa = get_state(core) if Wc else None, raw[:, -1]
                 z = zs[:, -1]                                                    # the correction at the island
-                d = (z - xa) * keep
+                d = (z - xa) * keep_d
                 Kx, vd, Pa_x, v0 = K, var_d, Pa_s.expand_as(xa), None
                 if ent2:
                     v0 = core2.island_entropy(xa, (doy + n1).float() * 24.0)     # log S(x), unit sd2
@@ -367,20 +426,20 @@ def main():
                     S_ = torch.exp(v0) * sd2
                     c_ = rho_f * torch.sqrt(S_ * Rv_f)
                     vd = (S_ + Rv_f - 2 * c_).clamp_min(1e-12)
-                    Kx = ((S_ - c_) / vd).clamp(0, 1) * keep
+                    Kx = ((S_ - c_) / vd).clamp(0, 1) * keep_d
                     Pa_x = ((1 - Kx) ** 2 * S_ + Kx ** 2 * Rv_f + 2 * Kx * (1 - Kx) * c_).clamp_min(1e-12)
-                    ksum = ksum + float(wm(Kx[:nb])[:, sc].mean()) * nb
+                    ksum = ksum + float(wm(Kx[:nb].cpu())[:, sc].mean()) * nb
                 if ent2:
                     fix = (v0, (Pa_x / sd2).clamp_min(1e-8))
                 wt = (a.robust + 1) / (a.robust + d ** 2 / vd) if a.robust else torch.ones_like(d)
                 wsum = wsum + float(wt[:nb].mean()) * nb
                 xa = xa + Kx * wt * d
                 if INC is not None:
-                    xa[:nb] = xa[:nb] + INC[i:i + nb] * keep
+                    xa[:nb] = xa[:nb] + torch.from_numpy(np.asarray(INC[i:i + nb], np.float32)).to(dev) * keep_d
                 zz = cen.clone()
-                zz[:, :n1] = (zs * keep5 + ya0 * (1 - keep5))[:nb]
+                zz[:, :n1] = (zs.cpu() * keep5 + ya0.cpu() * (1 - keep5))[:nb]
                 acc["kai"] = acc["kai"] + sums(zz, Tb, Cb)                       # only its days 1 .. n1 are KAI's
-            head = torch.cat([ya[:, :n1 - 1], xa[:, None]], 1)[:nb]              # day 1 .. n1, the island corrected
+            head = torch.cat([ya[:, :n1 - 1], xa[:, None]], 1)[:nb].cpu()        # day 1 .. n1, the island corrected
             for amp in a.amps:
                 n0 = nan()
                 Me = M if amp else 1
@@ -390,7 +449,7 @@ def main():
                 if Wc:  # the correction is an innovation for the memory, the noise is its own state
                     set_state(cont, state, Me, pert)
                 y = run2(rep(xa) + pert, rep(doy), rep(tis), None if fix is None else tuple(rep(v) for v in fix))
-                y = y.view(B0, Me, L - n1, len(DYN), *x0.shape[-2:])[:nb]
+                y = y.view(B0, Me, L - n1, len(DYN), *x0.shape[-2:])[:nb].cpu()
                 nans[amp] += nan() - n0
                 full = lambda v: torch.cat([head, v], 1)                         # noqa: E731
                 for k in range(1, M // 2 + 1):
@@ -398,19 +457,20 @@ def main():
                 acc[amp, "one"] = acc[amp, "one"] + sums(full(y[:, 0]), Tb, Cb)
                 if Me > 1:
                     var[amp] = var[amp] + wm(y.var(1, unbiased=True)).sum(0)
-                if not a.no_save and not a.max_ics:
-                    keepfc[amp].append(full(y.mean(1)).numpy().astype(np.float16))
+                if wr.get(amp) is not None:
+                    wr[amp].write(full(y.mean(1)).numpy().astype(np.float16))
         print(f"{i + nb} / {N} {time.time() - t0:.0f} s, failed dycore states {sum(nans.values())}", flush=True)
 
     out.update(ics=int(N), central=score(acc["central"]), nan_central=nans["central"], runs={})
     c = out["central"]
-    spec = a.tag + (f"-{a.stage2}_{n1}" if a.stage2 else "")
-    path = os.path.join(a.out, f"fc_{spec}_{year}.npy")
-    if os.path.exists(path) and not a.max_ics:
-        out["central_vs_cache"] = max_diff(cen_fc, path)
-        print("run without correction vs the cached forecast, max |difference|:", out["central_vs_cache"])
-    elif cen_fc and not a.max_ics and not a.no_save:  # the plain forecast in the cache format of diag_stage_filter.py
-        np.save(path, np.concatenate(cen_fc))
+    if wc is not None:   # the plain forecast in the cache format of diag_stage_filter.py
+        wc.close()
+    elif cmp_blocks:
+        ref = np.load(path, mmap_mode="r")
+        nb_ = sum(len(b) for b in cmp_blocks)
+        out["central_vs_cache"] = (float(np.abs(np.concatenate(cmp_blocks).astype(np.float32) - np.asarray(ref[:nb_], np.float32)).max())
+                                   if ref.shape[1:] == cmp_blocks[0].shape[1:] else None)
+        print(f"run without correction vs the cached forecast (first {nb_} ICs), max |difference|:", out["central_vs_cache"])
     print(f"== {base} without correction, day 1..{L} ({N} ICs of {year})\n nRMSE {g(c['nrmse'])}\n ACC   {g(c['acc'])}"
           f"\n act   {g(c['act'], 2)}", flush=True)
     if kai is not None:
@@ -449,8 +509,8 @@ def main():
             print(f" {q:5s} RMSE {g(m['vars'][q]['rmse'], 2)} | without {g(c['vars'][q]['rmse'], 2)}")
             print(f"       ACC  {g(m['vars'][q]['acc'])} | without {g(c['vars'][q]['acc'])}")
         sys.stdout.flush()
-        if keepfc[amp]:
-            np.save(os.path.join(a.out, f"fc_{name}_{year}.npy"), np.concatenate(keepfc[amp]))
+        if wr.get(amp) is not None:
+            wr[amp].close()
     js = a.json or os.path.join(a.out, f"diag_island_kalman_{base}{kal}_{a.shape}.json")
     json.dump(out, open(js, "w"), indent=1)
     np.savez(js[:-5] + "_sums.npz", central=(acc["central"] / N).numpy(),

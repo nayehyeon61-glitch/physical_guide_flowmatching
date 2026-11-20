@@ -18,6 +18,13 @@ SI units per second for u, v, T, q (the 48 channels of G, so that the two hints 
 forecast-base form, also for z (12 levels) and sp.
 
 The core is torch, the dycore JAX: the dycore runs without gradient on numpy arrays (a hint and a base, like G).
+
+A finer data grid (KAI's 1.5 deg, 121 x 240 with the poles; the Kalman island + version, docs/kai_island_plus.md):
+the state is averaged conservatively onto the dycore's own coarse grid (T21 on 64 x 32, the 5.625 deg grid, or T42 on
+128 x 64 with ``coarse=64``), integrated there as above, and the day's increment is interpolated back (bilinear in
+latitude and periodic longitude). The hint then carries the same large-scale, 24 h integrated tendency as on the
+5.625 deg grid, at the cost of one T21 day per state (0.37 s per 8 states on 4 CPU threads); the fine scales are
+KAI's and the core's.
 """
 
 import functools
@@ -43,6 +50,86 @@ OUT_VARS = ("u", "v", "t", "q", "z")
 _CONST = vertical_interpolation.vectorize_vertical_interpolation(vertical_interpolation.interp)
 
 
+def _cell_edges(c, lo, hi):
+    """Edges of the cells around ascending centres c, the outer ones clipped to [lo, hi]."""
+    c = np.asarray(c, np.float64)
+    return np.clip(np.concatenate([[c[0] - (c[1] - c[0]) / 2], (c[1:] + c[:-1]) / 2, [c[-1] + (c[-1] - c[-2]) / 2]]), lo, hi)
+
+
+def conservative_matrix(src, dst, periodic=False, sine=False):
+    """(len(dst), len(src)): the area-weighted average of the source cells over every destination cell (rows sum to
+    1). Latitudes with ``sine`` (area = d sin(lat)); longitudes ``periodic`` (360 deg)."""
+    src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
+    if periodic:
+        ds, dd = 360.0 / len(src), 360.0 / len(dst)
+        es = np.stack([src - ds / 2, src + ds / 2], 1)
+        ed = np.stack([dst - dd / 2, dst + dd / 2], 1)
+        M = np.zeros((len(dst), len(src)))
+        for sh in (-360.0, 0.0, 360.0):
+            lo = np.maximum(ed[:, None, 0], es[None, :, 0] + sh)
+            hi = np.minimum(ed[:, None, 1], es[None, :, 1] + sh)
+            M += np.clip(hi - lo, 0, None)
+    else:
+        es, ed = _cell_edges(src, -90.0, 90.0), _cell_edges(dst, -90.0, 90.0)
+        f = (lambda e: np.sin(np.deg2rad(e))) if sine else (lambda e: e)
+        lo = np.maximum(ed[:-1, None], es[None, :-1])
+        hi = np.minimum(ed[1:, None], es[None, 1:])
+        M = np.clip(f(np.maximum(hi, lo)) - f(lo), 0, None)
+    return M / M.sum(1, keepdims=True)
+
+
+def linear_matrix(src, dst, periodic=False):
+    """(len(dst), len(src)): linear interpolation from the source centres to the destination centres (constant
+    beyond the outer source centres; ``periodic``: longitudes over 360 deg)."""
+    src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
+    M = np.zeros((len(dst), len(src)))
+    if periodic:
+        d = 360.0 / len(src)
+        t = ((dst - src[0]) % 360.0) / d
+        i0 = np.floor(t).astype(int) % len(src)
+        r = t - np.floor(t)
+        M[np.arange(len(dst)), i0] += 1 - r
+        M[np.arange(len(dst)), (i0 + 1) % len(src)] += r
+        return M
+    for k, v in enumerate(dst):
+        if v <= src[0]:
+            M[k, 0] = 1.0
+        elif v >= src[-1]:
+            M[k, -1] = 1.0
+        else:
+            i = int(np.searchsorted(src, v)) - 1
+            r = (v - src[i]) / (src[i + 1] - src[i])
+            M[k, i], M[k, i + 1] = 1 - r, r
+    return M
+
+
+class CoarseGrid:
+    """A fine data grid (lat, lon) <-> the dycore's coarse equiangular grid of ``n_lat`` x 2 n_lat cells without
+    poles (centres -90 + (i + 1/2) 180 / n_lat, 0 + j 360 / (2 n_lat)): conservative averages down, linear back."""
+
+    def __init__(self, lat, lon, n_lat=32):
+        lat, lon = np.asarray(lat, np.float64), np.asarray(lon, np.float64)
+        self.flip = lat[0] > lat[-1]            # the dycore wants S -> N
+        latf = lat[::-1] if self.flip else lat
+        self.lat_c = -90.0 + (np.arange(n_lat) + 0.5) * 180.0 / n_lat
+        self.lon_c = np.arange(2 * n_lat) * 360.0 / (2 * n_lat)
+        self.down_lat = conservative_matrix(latf, self.lat_c, sine=True)          # (Hc, H)
+        self.down_lon = conservative_matrix(lon, self.lon_c, periodic=True)       # (Wc, W)
+        self.up_lat = linear_matrix(self.lat_c, latf)                              # (H, Hc)
+        self.up_lon = linear_matrix(self.lon_c, lon, periodic=True)                # (W, Wc)
+        self.shape = (n_lat, 2 * n_lat)
+
+    def down(self, x):
+        """(..., H, W) fine -> (..., Hc, Wc)."""
+        x = x[..., ::-1, :] if self.flip else x
+        return np.einsum("ah,...hw,bw->...ab", self.down_lat, x, self.down_lon, optimize=True)
+
+    def up(self, x):
+        """(..., Hc, Wc) coarse -> (..., H, W)."""
+        y = np.einsum("ha,...ab,wb->...hw", self.up_lat, x, self.up_lon, optimize=True)
+        return y[..., ::-1, :] if self.flip else y
+
+
 class DinosaurDay:
     """``__call__(fields)`` -> increments over ``hours`` of the dry primitive equations.
 
@@ -60,7 +147,7 @@ class DinosaurDay:
         # dycore's own lower boundary; "data": ERA5's sp (consistent with the real orography, not the model's: the
         # dycore then adjusts sp over the mountains in the first hours and every level's z gets a fixed offset)
         self.sp_mode = sp_mode
-        assert (H, W) == (32, 64), "the 5.625 deg contract (T21 on the data's own grid)"
+        assert (H, W) in ((32, 64), (64, 128)), "T21 on 64 x 32 or T42 on 128 x 64 (fine grids: DycoreFeatures' CoarseGrid)"
         self.grid = spherical_harmonic.Grid.construct(max_wavenumber, H // 2, latitude_spacing="equiangular")
         assert self.grid.nodal_shape == (W, H), self.grid.nodal_shape
         self.coords = coordinate_systems.CoordinateSystem(self.grid, sigma_coordinates.SigmaCoordinates.equidistant(layers))
@@ -162,15 +249,29 @@ class DycoreFeatures:
 
     x: normalized (B, 66, H, W) dynamic channels; mean, std: (67,) of the full contract. One-entry cache: the
     hint and the increment of the same state tensor come from one integration."""
+    daily = True  # a daily quantity: the core holds it over the day's substeps (DynCore.day_hint)
+
 
     def __init__(self, mean, std, orog_geopot, scale=None, clamp: float = 5.0, inc_clamp: float = 3.0,
-                 layers: int = 12, dt_minutes: float = 90.0, hours: float = 24.0):
+                 layers: int = 12, dt_minutes: Optional[float] = None, hours: float = 24.0, lat=None, lon=None,
+                 coarse: Optional[int] = None):
         import torch
         self.torch = torch
         self.mean = np.asarray(mean, np.float64)
         self.std = np.asarray(std, np.float64) + 1e-12
         self.dyn = np.asarray(contract.DYNAMIC_CHANNELS)
-        self.day = DinosaurDay(np.asarray(orog_geopot, np.float64), layers=layers, dt_minutes=dt_minutes, hours=hours)
+        orog = np.asarray(orog_geopot, np.float64)
+        # another grid than the dycore's own (5.625 deg, 32 x 64): integrated on a coarse grid of ``coarse`` latitudes
+        # (default 32 = T21; 64 = T42) and interpolated back (CoarseGrid)
+        self.cg = None
+        if orog.shape != (32, 64) or (coarse or 32) != 32:
+            assert lat is not None and lon is not None, "a fine grid: the latitudes and longitudes of the data"
+            self.cg = CoarseGrid(lat, lon, coarse or 32)
+            orog = self.cg.down(orog)
+        n_c = orog.shape[0]
+        mw = {32: 21, 64: 42}[n_c]
+        dt = dt_minutes or {32: 90.0, 64: 45.0}[n_c]
+        self.day = DinosaurDay(orog, layers=layers, dt_minutes=dt, hours=hours, max_wavenumber=mw)
         self.scale, self.clamp, self.inc_clamp = scale, clamp, inc_clamp
         self.key, self.val = None, None
         self.store, self.hits, self.pad = {}, 0, 8
@@ -198,13 +299,19 @@ class DycoreFeatures:
         full = np.zeros((B, len(self.mean)) + xn.shape[-2:])
         full[:, self.dyn] = xn
         phys = full * self.std[None, :, None, None] + self.mean[None, :, None, None]
+        if self.cg is not None:   # a fine grid: the state's conservative average on the dycore's grid
+            phys = self.cg.down(phys)
         f = {v: phys[:, self.full_of[v]] for v in self.full_of}
         f["sp"] = phys[:, self.sp]
         r = self.day(f)
+        self.last_raw_c = None
+        if self.cg is not None:   # the day's increment back on the data's grid (a failed state stays non-finite)
+            self.last_raw_c = np.concatenate([r[v] for v in ("u", "v", "t", "q")], 1)
+            r = {k: self.cg.up(v) for k, v in r.items()}
         bad = ~np.all(np.isfinite(np.concatenate([r[k].reshape(B, -1) for k in r], 1)), 1)
         self.n_nan += int(bad.sum())
         self.last_bad = bad
-        inc = np.zeros_like(full)
+        inc = np.zeros((B, len(self.mean)) + xn.shape[-2:])
         for v, sl in self.full_of.items():
             inc[:, sl] = r[v]
         inc[:, self.sp] = r["sp"]
@@ -215,6 +322,9 @@ class DycoreFeatures:
         raw = np.concatenate([r[v] for v in ("u", "v", "t", "q")], 1)
         raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
         raw[bad] = 0.0
+        if self.last_raw_c is not None:
+            self.last_raw_c = np.nan_to_num(self.last_raw_c, nan=0.0, posinf=0.0, neginf=0.0)
+            self.last_raw_c[bad] = 0.0
         return raw, inc[:, self.dyn]
 
     def _get(self, x):
@@ -234,6 +344,8 @@ class DycoreFeatures:
         for i in range(0, states.shape[0], chunk):
             xs = states[i:i + chunk]
             raw, _ = self._integrate(xs)
+            if self.cg is not None:   # a fine grid: the coarse hint is kept (5.6 MB a state at 1.5 deg, 0.4 MB coarse)
+                raw = self.last_raw_c
             for k, r in zip(self._keys(xs), raw):
                 self.store[k] = r.astype(np.float32)
 
@@ -243,12 +355,14 @@ class DycoreFeatures:
         raw = np.zeros((len(keys), 48) + tuple(x.shape[-2:]))
         for i, k in enumerate(keys):
             if k in self.store:
-                raw[i] = self.store[k]
+                raw[i] = self.store[k] if self.cg is None else self.cg.up(self.store[k])
         self.hits += len(keys) - len(miss)
         if miss:
             n, B = len(miss), self.pad
             idx = miss + [miss[-1]] * ((-n) % B)  # fixed batch sizes: every new shape is a new JAX compilation
-            raw[miss] = self._integrate(x[idx])[0][:n]
+            # detached before indexing: an index op on a state with gradient would be recorded (and saved) on a
+            # miss but not on a cache hit, and a checkpointed substep would then save a different number of tensors
+            raw[miss] = self._integrate(x.detach()[idx])[0][:n]
         return raw, None  # no increment from the store: the forecast-base form does not use it
 
     def estimate_scale(self, states, chunk: int = 8):
@@ -261,18 +375,23 @@ class DycoreFeatures:
 
     def __call__(self, x):
         raw, _ = self._get(x)
-        g = self.torch.from_numpy(raw).to(x.dtype) / self.scale.to(x.dtype)
+        g = self.torch.from_numpy(raw).to(device=x.device, dtype=x.dtype) / self.scale.to(device=x.device, dtype=x.dtype)
         return g.clamp(-self.clamp, self.clamp)
 
     def increment(self, x):
         _, inc = self._get(x)
-        return self.torch.from_numpy(inc).to(x.dtype)
+        return self.torch.from_numpy(inc).to(device=x.device, dtype=x.dtype)
 
 
 class ComboFeatures:
     """The core's feature inputs side by side: [G(x) (instantaneous operator, optional), the integrated hint
     (dycore, optional), ``nz`` noise channels]. Noise: white N(0, 1) per channel and grid point, new at every call
     (= every day and member) while ``noise_on``; zeros otherwise (a deterministic run of the same core)."""
+
+    @property
+    def daily(self):
+        """The dycore hint alone (no instantaneous G(x), no noise channels) is a daily quantity."""
+        return self.op is None and self.dy is not None and not self.nz
 
     def __init__(self, op=None, dy=None, nz: int = 0, seed: int = 0, hnz: float = 0.0):
         import torch
